@@ -33,7 +33,20 @@ pub struct CacheRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheIndex {
+    #[serde(default)]
     pub records: BTreeMap<String, CacheRecord>,
+    #[serde(default)]
+    pub paths: BTreeMap<String, PathCacheRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathCacheRecord {
+    pub relative_path: String,
+    pub size: u64,
+    pub mtime_ns: i128,
+    pub permissions: u32,
+    pub content_hash: [u8; 32],
+    pub last_seen_unix_ns: i128,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +80,34 @@ impl CacheStore {
         Ok(Some(fs::read(block_path)?))
     }
 
+    pub fn get_batch(&self, key: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        let key_hex = hex::encode(key);
+        let block_path = self
+            .root
+            .join("blocks")
+            .join(format!("{key_hex}.batch.zst"));
+        if !block_path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read(block_path)?))
+    }
+
+    pub fn get_chunk(&self, hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        let hash_hex = hex::encode(hash);
+        let block_path = self
+            .root
+            .join("blocks")
+            .join(format!("{hash_hex}.chunk.zst"));
+        if !block_path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read(block_path)?))
+    }
+
+    pub fn get_path_record(&self, relative_path: &str) -> Option<&PathCacheRecord> {
+        self.index.paths.get(relative_path)
+    }
+
     pub fn insert(
         &mut self,
         hash: &[u8; 32],
@@ -86,10 +127,39 @@ impl CacheStore {
                 codec: "zstd".to_string(),
             },
         );
-        self.save()
+        Ok(())
     }
 
-    fn save(&self) -> anyhow::Result<()> {
+    pub fn insert_batch(&mut self, key: &[u8; 32], compressed: &[u8]) -> anyhow::Result<()> {
+        let key_hex = hex::encode(key);
+        fs::write(
+            self.root
+                .join("blocks")
+                .join(format!("{key_hex}.batch.zst")),
+            compressed,
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_chunk(&mut self, hash: &[u8; 32], compressed: &[u8]) -> anyhow::Result<()> {
+        let hash_hex = hex::encode(hash);
+        fs::write(
+            self.root
+                .join("blocks")
+                .join(format!("{hash_hex}.chunk.zst")),
+            compressed,
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_path_record(&mut self, record: PathCacheRecord) -> anyhow::Result<()> {
+        self.index
+            .paths
+            .insert(record.relative_path.clone(), record);
+        Ok(())
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
         let bytes = serde_json::to_vec_pretty(&self.index)?;
         fs::write(self.root.join("index.json"), bytes)?;
         Ok(())
@@ -107,7 +177,37 @@ mod tests {
         let mut cache = CacheStore::open(temp.path()).unwrap();
         assert!(cache.get(&hash).unwrap().is_none());
         cache.insert(&hash, 4, b"compressed").unwrap();
+        cache.save().unwrap();
         let reopened = CacheStore::open(temp.path()).unwrap();
         assert_eq!(reopened.get(&hash).unwrap().unwrap(), b"compressed");
+    }
+
+    #[test]
+    fn old_cache_index_without_paths_deserializes() {
+        let index: CacheIndex = serde_json::from_str(r#"{"records":{}}"#).unwrap();
+        assert!(index.records.is_empty());
+        assert!(index.paths.is_empty());
+    }
+
+    #[test]
+    fn path_cache_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let hash = *blake3::hash(b"data").as_bytes();
+        let mut cache = CacheStore::open(temp.path()).unwrap();
+        cache
+            .upsert_path_record(PathCacheRecord {
+                relative_path: "a.txt".to_string(),
+                size: 4,
+                mtime_ns: 123,
+                permissions: 0o644,
+                content_hash: hash,
+                last_seen_unix_ns: 456,
+            })
+            .unwrap();
+        cache.save().unwrap();
+        let reopened = CacheStore::open(temp.path()).unwrap();
+        let record = reopened.get_path_record("a.txt").unwrap();
+        assert_eq!(record.content_hash, hash);
+        assert_eq!(record.mtime_ns, 123);
     }
 }

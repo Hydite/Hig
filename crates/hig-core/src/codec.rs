@@ -12,6 +12,12 @@ pub fn decompress(codec: Compression, input: &[u8], original_size: u64) -> anyho
     }
 }
 
+pub fn decompress_unknown(codec: Compression, input: &[u8]) -> anyhow::Result<Vec<u8>> {
+    match codec {
+        Compression::Zstd => Ok(zstd::stream::decode_all(input)?),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
