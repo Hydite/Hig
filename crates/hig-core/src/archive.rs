@@ -7,8 +7,9 @@ use crate::crypto::{self, KdfParams, NONCE_LEN, SALT_LEN};
 use crate::scan::{ScanOptions, scan_dir, unix_ns};
 use crate::writer::{ArchiveWriter, PayloadSource};
 use crate::{
-    ArchiveFormat, BatchOptions, BlockStats, ChunkOptions, Compression, EncryptionMode, IoOptions,
-    PackOptions, PackReport, PackTimings, SpeedMode, UnpackOptions,
+    ArchiveFormat, ArchiveSizeBreakdown, BatchOptions, BlockStats, ChunkOptions, Compression,
+    EncryptionMode, IoOptions, ManifestFormat, PackCriticalTimings, PackOptions, PackReport,
+    PackTimings, SpeedMode, UnpackOptions,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ const VERSION_V2: u32 = 2;
 const HEADER_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN + 8;
 const HEADER_FLAG_PASSWORD: u32 = SALT_LEN as u32;
 const HEADER_FLAG_NONE: u32 = 0x8000_0000 | SALT_LEN as u32;
+const COMPACT_MANIFEST_MAGIC: &[u8; 4] = b"HCM1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
@@ -126,6 +128,7 @@ impl From<V2FileEntryLegacy> for V2FileEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileLayout {
+    Empty,
     InlineBlock {
         block_id: [u8; 32],
         offset: u64,
@@ -163,6 +166,73 @@ pub enum BlockKind {
     Chunk,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CompactManifestV1 {
+    schema: u16,
+    root_hash: [u8; 32],
+    files: Vec<CompactFileEntry>,
+    blocks: Vec<CompactBlockEntry>,
+    chunk_refs: Vec<CompactChunkRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CompactFileEntry {
+    relative_path: String,
+    size: u64,
+    mtime_ns: i128,
+    permissions: u32,
+    layout: CompactFileLayout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum CompactFileLayout {
+    Empty,
+    Inline {
+        block_index: u32,
+        offset: u64,
+        len: u64,
+    },
+    Chunked {
+        first_chunk_ref: u32,
+        chunk_ref_count: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CompactChunkRef {
+    block_index: u32,
+    file_offset: u64,
+    len: u64,
+    chunk_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CompactBlockEntry {
+    block_id: [u8; 32],
+    raw_size: u64,
+    compressed_size: u64,
+    payload_size: u64,
+    nonce: [u8; NONCE_LEN],
+    codec: CompactCodec,
+    level: i8,
+    kind: BlockKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum CompactCodec {
+    Zstd,
+}
+
+impl BlockKind {
+    fn cache_tag(self) -> u8 {
+        match self {
+            Self::Batch => 1,
+            Self::Single => 2,
+            Self::Chunk => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ArchiveHeader {
     version: u32,
@@ -181,6 +251,7 @@ struct PreparedBlock {
 struct PreparedV2Block {
     entry: V2BlockEntry,
     payload: PayloadSource,
+    compression_level: i32,
 }
 
 struct SealedPayloadMeta {
@@ -201,11 +272,13 @@ enum SealedPayloadSource {
 enum PlannedBlock {
     Single {
         file_index: usize,
+        level: i32,
     },
     Batch {
         file_indices: Vec<usize>,
         raw_size: u64,
         batch_key: [u8; 32],
+        level: i32,
     },
     Chunk {
         file_index: usize,
@@ -213,6 +286,7 @@ enum PlannedBlock {
         len: u64,
         chunk_hash: [u8; 32],
         from_metadata_cache: bool,
+        level: i32,
     },
 }
 
@@ -229,9 +303,21 @@ struct WarmSummary {
 }
 
 enum WarmKind {
-    Single { hash: [u8; 32] },
-    Batch { key: [u8; 32] },
-    Chunk { hash: [u8; 32] },
+    Single {
+        key: [u8; 32],
+        source_hash: [u8; 32],
+        level: i32,
+    },
+    Batch {
+        key: [u8; 32],
+        source_hash: [u8; 32],
+        level: i32,
+    },
+    Chunk {
+        key: [u8; 32],
+        source_hash: [u8; 32],
+        level: i32,
+    },
 }
 
 struct WarmResult {
@@ -260,6 +346,13 @@ pub fn pack(options: PackOptions) -> anyhow::Result<PackReport> {
 
 fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
     let started = Instant::now();
+    let level = options
+        .level
+        .unwrap_or(if options.speed == SpeedMode::Fastest {
+            1
+        } else {
+            5
+        });
     if let Some(threads) = options.threads {
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -306,7 +399,7 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
                 stats.misses += 1;
                 stats.bytes_compressed += file.size;
                 let input = fs::read(&file.absolute_path)?;
-                let bytes = codec::compress(options.compression, &input, options.level)?;
+                let bytes = codec::compress(options.compression, &input, level)?;
                 cache_store.insert(&file.content_hash, file.size, &bytes)?;
                 bytes
             }
@@ -314,7 +407,7 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
             stats.misses += 1;
             stats.bytes_compressed += file.size;
             let input = fs::read(&file.absolute_path)?;
-            codec::compress(options.compression, &input, options.level)?
+            codec::compress(options.compression, &input, level)?
         };
 
         let nonce = crypto::random_bytes::<NONCE_LEN>();
@@ -453,6 +546,16 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
         peak_pipeline_memory_bytes: writer_report
             .peak_pipeline_memory_bytes
             .max(payload_memory_bytes),
+        critical: PackCriticalTimings::default(),
+        metadata: ArchiveSizeBreakdown {
+            header_bytes: HEADER_FIXED_LEN as u64,
+            manifest_plain_bytes: manifest_plain.len() as u64,
+            manifest_compressed_bytes: manifest_plain.len() as u64,
+            manifest_protected_bytes: manifest_ciphertext.len() as u64,
+            payload_bytes: archive_bytes
+                .saturating_sub(HEADER_FIXED_LEN as u64 + manifest_ciphertext.len() as u64),
+            total_archive_bytes: archive_bytes,
+        },
     })
 }
 
@@ -469,6 +572,7 @@ pub fn unpack(options: UnpackOptions) -> anyhow::Result<()> {
 
 fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     let started = Instant::now();
+    let setup_started = Instant::now();
     let fastest = options.speed == SpeedMode::Fastest;
     let trust_metadata = options.trust_metadata || fastest;
     let sealed_enabled = options.use_cache
@@ -486,11 +590,14 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         .cache_dir
         .clone()
         .unwrap_or_else(|| input_dir.join(".hig-cache"));
+    let setup_ms = setup_started.elapsed().as_millis();
+    let cache_open_started = Instant::now();
     let mut cache = if options.use_cache {
         Some(CacheStore::open(&cache_dir)?)
     } else {
         None
     };
+    let cache_open_ms = cache_open_started.elapsed().as_millis();
     let kdf = options.kdf_profile.params();
     let salt = if sealed_enabled {
         cache
@@ -500,6 +607,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     } else {
         crypto::random_bytes::<SALT_LEN>()
     };
+    let scan_kdf_started = Instant::now();
     let kdf_task = match options.encryption {
         EncryptionMode::Password => {
             let password = required_password(&options.password)?.to_owned();
@@ -526,9 +634,6 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     let scan_ms = scan_started.elapsed().as_millis();
     let files = scan.files;
     let input_bytes = files.iter().map(|file| file.size).sum::<u64>();
-    let plan_started = Instant::now();
-    let plans = plan_blocks(&files, options.batch, options.chunk)?;
-    let plan_ms = plan_started.elapsed().as_millis();
     let mut cache_stats = CacheStats::default();
     let mut block_stats = BlockStats::default();
 
@@ -541,10 +646,20 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         }
         None => (None, 0),
     };
+    let scan_kdf_wall_ms = scan_kdf_started.elapsed().as_millis();
+    let plan_started = Instant::now();
+    let plans = plan_blocks(
+        &files,
+        options.batch,
+        options.chunk,
+        options.speed,
+        options.level,
+    )?;
+    let plan_ms = plan_started.elapsed().as_millis();
     if sealed_enabled && let Some(cache_store) = cache.as_mut() {
         cache_store.prepare_sealed_key(kdf.clone(), key.as_ref().expect("password mode key"));
     }
-    let kdf_overlapped_ms = kdf_ms.min(scan_ms.saturating_add(plan_ms));
+    let kdf_overlapped_ms = kdf_ms.min(scan_ms);
     let mut prepared = Vec::with_capacity(plans.len());
     let mut file_entries = Vec::with_capacity(files.len());
     let mut chunk_refs: std::collections::BTreeMap<usize, Vec<ChunkRef>> =
@@ -554,13 +669,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
 
     let pack_blocks_started = Instant::now();
     let warm_summary = if let Some(cache_store) = cache.as_mut() {
-        prewarm_compressed_cache(
-            cache_store,
-            &plans,
-            &files,
-            options.compression,
-            options.level,
-        )?
+        prewarm_compressed_cache(cache_store, &plans, &files, options.compression)?
     } else {
         WarmSummary::default()
     };
@@ -568,12 +677,22 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     let mut crypto_ms = 0_u128;
     for plan in plans {
         match plan {
-            PlannedBlock::Single { file_index } => {
+            PlannedBlock::Single { file_index, level } => {
                 block_stats.single_blocks += 1;
+                *block_stats
+                    .compression_level_counts
+                    .entry(level)
+                    .or_default() += 1;
                 let file = &files[file_index];
+                let object_key = compressed_object_key(
+                    options.compression,
+                    level,
+                    BlockKind::Single,
+                    &file.content_hash,
+                );
                 if sealed_enabled
                     && let Some((mut sealed_entry, payload, source)) =
-                        try_sealed_payload(cache.as_ref(), &file.content_hash)?
+                        try_sealed_payload(cache.as_ref(), &object_key)?
                 {
                     block_stats.sealed_block_hits += 1;
                     block_stats.sealed_bytes_reused += sealed_entry.encrypted_size;
@@ -601,6 +720,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     prepared.push(PreparedV2Block {
                         entry: sealed_entry,
                         payload,
+                        compression_level: level,
                     });
                     upsert_path_cache(cache.as_mut(), file, options.chunk.chunk_size, &[])?;
                     continue;
@@ -610,29 +730,44 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     block_stats.cache_pack_misses += 1;
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
-                    if let Some(bytes) = cache_store.get(&file.content_hash)? {
+                    if let Some(bytes) = cache_store.get(&object_key)? {
                         cache_stats.hits += 1;
+                        block_stats.parameterized_cache_hits += 1;
                         cache_stats.bytes_reused += file.size;
                         if sealed_enabled {
                             block_stats.reencrypted_cache_hits += 1;
                         }
                         bytes
+                    } else if level == 1
+                        && let Some(bytes) = cache_store.get(&file.content_hash)?
+                    {
+                        cache_stats.hits += 1;
+                        cache_stats.bytes_reused += file.size;
+                        block_stats.legacy_cache_hits += 1;
+                        bytes
                     } else {
                         cache_stats.misses += 1;
+                        block_stats.cache_policy_misses += 1;
                         cache_stats.bytes_compressed += file.size;
                         let input = fs::read(&file.absolute_path)?;
-                        let bytes = codec::compress(options.compression, &input, options.level)?;
-                        cache_store.insert(&file.content_hash, file.size, &bytes)?;
+                        let bytes = codec::compress(options.compression, &input, level)?;
+                        cache_store.insert_parameterized(
+                            &object_key,
+                            &file.content_hash,
+                            file.size,
+                            level,
+                            &bytes,
+                        )?;
                         bytes
                     }
                 } else {
                     cache_stats.misses += 1;
                     cache_stats.bytes_compressed += file.size;
                     let input = fs::read(&file.absolute_path)?;
-                    codec::compress(options.compression, &input, options.level)?
+                    codec::compress(options.compression, &input, level)?
                 };
                 let nonce = if sealed_enabled {
-                    sealed_nonce(&file.content_hash)
+                    sealed_nonce(&object_key)
                 } else {
                     crypto::random_bytes::<NONCE_LEN>()
                 };
@@ -651,7 +786,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 if sealed_enabled {
                     write_sealed_payload(
                         cache.as_mut(),
-                        &file.content_hash,
+                        &object_key,
                         SealedPayloadMeta {
                             block_id,
                             nonce,
@@ -691,6 +826,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                         kind: BlockKind::Single,
                     },
                     payload,
+                    compression_level: level,
                 });
                 upsert_path_cache(cache.as_mut(), file, options.chunk.chunk_size, &[])?;
             }
@@ -698,12 +834,19 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 file_indices,
                 raw_size,
                 batch_key,
+                level,
             } => {
                 block_stats.batch_blocks += 1;
+                *block_stats
+                    .compression_level_counts
+                    .entry(level)
+                    .or_default() += 1;
                 block_stats.batched_files += file_indices.len();
+                let object_key =
+                    compressed_object_key(options.compression, level, BlockKind::Batch, &batch_key);
                 if sealed_enabled
                     && let Some((mut sealed_entry, payload, source)) =
-                        try_sealed_payload(cache.as_ref(), &batch_key)?
+                        try_sealed_payload(cache.as_ref(), &object_key)?
                 {
                     block_stats.sealed_block_hits += 1;
                     block_stats.sealed_bytes_reused += sealed_entry.encrypted_size;
@@ -737,6 +880,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     prepared.push(PreparedV2Block {
                         entry: sealed_entry,
                         payload,
+                        compression_level: level,
                     });
                     continue;
                 }
@@ -745,29 +889,45 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     block_stats.cache_pack_misses += 1;
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
-                    if let Some(bytes) = cache_store.get_batch(&batch_key)? {
+                    if let Some(bytes) = cache_store.get_batch(&object_key)? {
                         block_stats.batch_cache_hits += 1;
+                        block_stats.parameterized_cache_hits += 1;
                         cache_stats.bytes_reused += raw_size;
                         if sealed_enabled {
                             block_stats.reencrypted_cache_hits += 1;
                         }
                         bytes
+                    } else if level == 1
+                        && let Some(bytes) = cache_store.get_batch(&batch_key)?
+                    {
+                        block_stats.batch_cache_hits += 1;
+                        block_stats.legacy_cache_hits += 1;
+                        cache_stats.bytes_reused += raw_size;
+                        bytes
                     } else {
                         block_stats.batch_cache_misses += 1;
+                        block_stats.cache_policy_misses += 1;
                         cache_stats.bytes_compressed += raw_size;
                         let raw = build_batch_raw(&files, &file_indices)?;
-                        let bytes = codec::compress(options.compression, &raw, options.level)?;
-                        cache_store.insert_batch(&batch_key, &bytes)?;
+                        let bytes = codec::compress(options.compression, &raw, level)?;
+                        cache_store.insert_batch(&object_key, &bytes)?;
+                        cache_store.record_object(
+                            &object_key,
+                            &batch_key,
+                            level,
+                            "batch",
+                            bytes.len() as u64,
+                        );
                         bytes
                     }
                 } else {
                     block_stats.batch_cache_misses += 1;
                     cache_stats.bytes_compressed += raw_size;
                     let raw = build_batch_raw(&files, &file_indices)?;
-                    codec::compress(options.compression, &raw, options.level)?
+                    codec::compress(options.compression, &raw, level)?
                 };
                 let nonce = if sealed_enabled {
-                    sealed_nonce(&batch_key)
+                    sealed_nonce(&object_key)
                 } else {
                     crypto::random_bytes::<NONCE_LEN>()
                 };
@@ -786,7 +946,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 if sealed_enabled {
                     write_sealed_payload(
                         cache.as_mut(),
-                        &batch_key,
+                        &object_key,
                         SealedPayloadMeta {
                             block_id,
                             nonce,
@@ -832,6 +992,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                         kind: BlockKind::Batch,
                     },
                     payload,
+                    compression_level: level,
                 });
             }
             PlannedBlock::Chunk {
@@ -840,8 +1001,19 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 len,
                 chunk_hash,
                 from_metadata_cache,
+                level,
             } => {
                 block_stats.chunk_blocks += 1;
+                *block_stats
+                    .compression_level_counts
+                    .entry(level)
+                    .or_default() += 1;
+                let object_key = compressed_object_key(
+                    options.compression,
+                    level,
+                    BlockKind::Chunk,
+                    &chunk_hash,
+                );
                 if from_metadata_cache {
                     block_stats.chunk_plan_cache_hits += 1;
                 } else {
@@ -850,7 +1022,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 let file = &files[file_index];
                 if sealed_enabled
                     && let Some((mut sealed_entry, payload, source)) =
-                        try_sealed_payload(cache.as_ref(), &chunk_hash)?
+                        try_sealed_payload(cache.as_ref(), &object_key)?
                 {
                     block_stats.sealed_block_hits += 1;
                     block_stats.sealed_bytes_reused += sealed_entry.encrypted_size;
@@ -877,6 +1049,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     prepared.push(PreparedV2Block {
                         entry: sealed_entry,
                         payload,
+                        compression_level: level,
                     });
                     continue;
                 }
@@ -885,8 +1058,9 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     block_stats.cache_pack_misses += 1;
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
-                    if let Some(bytes) = cache_store.get_chunk(&chunk_hash)? {
+                    if let Some(bytes) = cache_store.get_chunk(&object_key)? {
                         cache_stats.hits += 1;
+                        block_stats.parameterized_cache_hits += 1;
                         cache_stats.bytes_reused += len;
                         block_stats.chunk_cache_hits += 1;
                         block_stats.chunk_bytes_reused += len;
@@ -894,14 +1068,31 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                             block_stats.reencrypted_cache_hits += 1;
                         }
                         bytes
+                    } else if level == 1
+                        && let Some(bytes) = cache_store.get_chunk(&chunk_hash)?
+                    {
+                        cache_stats.hits += 1;
+                        cache_stats.bytes_reused += len;
+                        block_stats.chunk_cache_hits += 1;
+                        block_stats.chunk_bytes_reused += len;
+                        block_stats.legacy_cache_hits += 1;
+                        bytes
                     } else {
                         cache_stats.misses += 1;
+                        block_stats.cache_policy_misses += 1;
                         cache_stats.bytes_compressed += len;
                         block_stats.chunk_cache_misses += 1;
                         block_stats.chunk_bytes_compressed += len;
                         let raw = read_file_slice(file, file_offset, len)?;
-                        let bytes = codec::compress(options.compression, &raw, options.level)?;
-                        cache_store.insert_chunk(&chunk_hash, &bytes)?;
+                        let bytes = codec::compress(options.compression, &raw, level)?;
+                        cache_store.insert_chunk(&object_key, &bytes)?;
+                        cache_store.record_object(
+                            &object_key,
+                            &chunk_hash,
+                            level,
+                            "chunk",
+                            bytes.len() as u64,
+                        );
                         bytes
                     }
                 } else {
@@ -910,10 +1101,10 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     block_stats.chunk_cache_misses += 1;
                     block_stats.chunk_bytes_compressed += len;
                     let raw = read_file_slice(file, file_offset, len)?;
-                    codec::compress(options.compression, &raw, options.level)?
+                    codec::compress(options.compression, &raw, level)?
                 };
                 let nonce = if sealed_enabled {
-                    sealed_nonce(&chunk_hash)
+                    sealed_nonce(&object_key)
                 } else {
                     crypto::random_bytes::<NONCE_LEN>()
                 };
@@ -932,7 +1123,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 if sealed_enabled {
                     write_sealed_payload(
                         cache.as_mut(),
-                        &chunk_hash,
+                        &object_key,
                         SealedPayloadMeta {
                             block_id,
                             nonce,
@@ -971,6 +1162,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                         kind: BlockKind::Chunk,
                     },
                     payload,
+                    compression_level: level,
                 });
             }
         }
@@ -999,6 +1191,12 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     block_stats.reencrypted_cache_hits = block_stats.reencrypted_cache_hits.saturating_sub(
         warm_summary.single_blocks + warm_summary.batch_blocks + warm_summary.chunk_blocks,
     );
+    let warmed_blocks =
+        warm_summary.single_blocks + warm_summary.batch_blocks + warm_summary.chunk_blocks;
+    block_stats.parameterized_cache_hits = block_stats
+        .parameterized_cache_hits
+        .saturating_sub(warmed_blocks);
+    block_stats.cache_policy_misses += warmed_blocks;
     if defer_block_crypto {
         let crypto_started = Instant::now();
         let encryption_key = key.as_ref().expect("password mode key");
@@ -1044,9 +1242,11 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         });
         upsert_path_cache(cache.as_mut(), file, options.chunk.chunk_size, &path_chunks)?;
     }
+    let cache_commit_started = Instant::now();
     if let Some(cache_store) = cache.as_ref() {
         cache_store.save()?;
     }
+    let cache_commit_ms = cache_commit_started.elapsed().as_millis();
 
     let manifest_started = Instant::now();
     file_entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -1063,7 +1263,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     };
 
     let manifest_nonce = crypto::random_bytes::<NONCE_LEN>();
-    let manifest_plain = bincode::serialize(&manifest)?;
+    let manifest_plain = encode_v2_manifest(&manifest, &prepared, options.manifest_format)?;
     let manifest_compressed = codec::compress(Compression::Zstd, &manifest_plain, 1)?;
     let manifest_ciphertext = protect_payload_timed(
         options.encryption,
@@ -1105,6 +1305,15 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         .peak_pipeline_memory_bytes
         .max(block_stats.payload_source_memory_bytes);
 
+    let total_ms = started.elapsed().as_millis();
+    let attributed_ms = setup_ms
+        + cache_open_ms
+        + scan_kdf_wall_ms
+        + plan_ms
+        + pack_blocks_ms
+        + cache_commit_ms
+        + manifest_ms
+        + write_ms;
     Ok(PackReport {
         input_files: files.len(),
         input_bytes,
@@ -1144,6 +1353,27 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         buffered_write_count: writer_report.buffered_write_count,
         preallocation_enabled: writer_report.preallocation_enabled,
         peak_pipeline_memory_bytes,
+        critical: PackCriticalTimings {
+            setup_ms,
+            cache_open_ms,
+            scan_kdf_wall_ms,
+            plan_ms,
+            block_prepare_ms: pack_blocks_ms,
+            cache_commit_ms,
+            manifest_build_ms: manifest_ms,
+            output_write_ms: write_ms,
+            cleanup_ms: 0,
+            unattributed_ms: total_ms.saturating_sub(attributed_ms),
+        },
+        metadata: ArchiveSizeBreakdown {
+            header_bytes: HEADER_FIXED_LEN as u64,
+            manifest_plain_bytes: manifest_plain.len() as u64,
+            manifest_compressed_bytes: manifest_compressed.len() as u64,
+            manifest_protected_bytes: manifest_ciphertext.len() as u64,
+            payload_bytes: archive_bytes
+                .saturating_sub(HEADER_FIXED_LEN as u64 + manifest_ciphertext.len() as u64),
+            total_archive_bytes: archive_bytes,
+        },
     })
 }
 
@@ -1223,6 +1453,10 @@ fn unpack_v2(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
     )?;
     let manifest_plain = codec::decompress_unknown(Compression::Zstd, &manifest_compressed)?;
     let manifest = decode_v2_manifest(&manifest_plain)?;
+    let compact_hashes_omitted = manifest
+        .files
+        .iter()
+        .all(|file| file.content_hash == [0; 32]);
     let computed_root_hash = root_hash(
         &manifest
             .files
@@ -1230,7 +1464,7 @@ fn unpack_v2(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
             .map(|file| (&file.relative_path, file.content_hash))
             .collect::<Vec<_>>(),
     );
-    if computed_root_hash != manifest.root_hash {
+    if !compact_hashes_omitted && computed_root_hash != manifest.root_hash {
         anyhow::bail!("manifest root hash mismatch");
     }
 
@@ -1242,6 +1476,7 @@ fn unpack_v2(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
     }
 
     let mut verified_files = Vec::with_capacity(manifest.files.len());
+    let mut verified_hashes = Vec::with_capacity(manifest.files.len());
     let mut next_block_offset = HEADER_FIXED_LEN as u64 + header.manifest_len;
     let mut raw_blocks = std::collections::BTreeMap::new();
     for block in &manifest.blocks {
@@ -1264,6 +1499,7 @@ fn unpack_v2(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
             anyhow::bail!("refusing to overwrite existing file: {}", target.display());
         }
         let content = match file.layout.as_ref() {
+            Some(FileLayout::Empty) => Vec::new(),
             Some(FileLayout::InlineBlock {
                 block_id,
                 offset,
@@ -1302,10 +1538,16 @@ fn unpack_v2(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
                 slice_block(raw, file.block_offset, file.block_len, &file.relative_path)?.to_vec()
             }
         };
-        if blake3::hash(&content).as_bytes() != &file.content_hash {
+        let content_hash = *blake3::hash(&content).as_bytes();
+        if !compact_hashes_omitted && content_hash != file.content_hash {
             anyhow::bail!("file hash mismatch for {}", file.relative_path);
         }
+        verified_hashes.push((&file.relative_path, content_hash));
         verified_files.push((target, content, file.permissions));
+    }
+
+    if compact_hashes_omitted && root_hash(&verified_hashes) != manifest.root_hash {
+        anyhow::bail!("manifest root hash mismatch");
     }
 
     fs::create_dir_all(&options.output_dir)?;
@@ -1323,6 +1565,8 @@ fn plan_blocks(
     files: &[crate::ScannedFile],
     batch_options: BatchOptions,
     chunk_options: ChunkOptions,
+    speed: SpeedMode,
+    explicit_level: Option<i32>,
 ) -> anyhow::Result<Vec<PlannedBlock>> {
     if chunk_options.enabled && chunk_options.chunk_size == 0 {
         anyhow::bail!("chunk size must be greater than zero");
@@ -1330,39 +1574,75 @@ fn plan_blocks(
     let mut plans = Vec::new();
     let mut current = Vec::new();
     let mut current_size = 0_u64;
+    let inline_level = explicit_level.unwrap_or(if speed == SpeedMode::Fastest { 1 } else { 5 });
     for (index, file) in files.iter().enumerate() {
         if chunk_options.enabled && file.size > 0 && file.size >= chunk_options.chunk_file_threshold
         {
-            flush_batch(files, &mut plans, &mut current, &mut current_size);
+            flush_batch_with_level(
+                files,
+                &mut plans,
+                &mut current,
+                &mut current_size,
+                inline_level,
+            );
             if let Some(chunks) = file.cached_chunks.as_ref() {
-                append_cached_chunk_plans(&mut plans, index, chunks);
+                append_cached_chunk_plans(&mut plans, index, chunks, explicit_level.unwrap_or(1));
             } else {
-                append_chunk_plans(files, &mut plans, index, chunk_options.chunk_size)?;
+                append_chunk_plans(
+                    files,
+                    &mut plans,
+                    index,
+                    chunk_options.chunk_size,
+                    speed,
+                    explicit_level,
+                )?;
             }
             continue;
         }
 
         if !batch_options.enabled || file.size > batch_options.small_file_threshold {
-            flush_batch(files, &mut plans, &mut current, &mut current_size);
-            plans.push(PlannedBlock::Single { file_index: index });
+            flush_batch_with_level(
+                files,
+                &mut plans,
+                &mut current,
+                &mut current_size,
+                inline_level,
+            );
+            plans.push(PlannedBlock::Single {
+                file_index: index,
+                level: inline_level,
+            });
             continue;
         }
 
         if !current.is_empty() && current_size + file.size > batch_options.max_batch_raw_bytes {
-            flush_batch(files, &mut plans, &mut current, &mut current_size);
+            flush_batch_with_level(
+                files,
+                &mut plans,
+                &mut current,
+                &mut current_size,
+                inline_level,
+            );
         }
         current.push(index);
         current_size += file.size;
     }
-    flush_batch(files, &mut plans, &mut current, &mut current_size);
+    flush_batch_with_level(
+        files,
+        &mut plans,
+        &mut current,
+        &mut current_size,
+        inline_level,
+    );
     Ok(plans)
 }
 
-fn flush_batch(
+fn flush_batch_with_level(
     files: &[crate::ScannedFile],
     plans: &mut Vec<PlannedBlock>,
     current: &mut Vec<usize>,
     current_size: &mut u64,
+    level: i32,
 ) {
     if current.is_empty() {
         return;
@@ -1375,6 +1655,7 @@ fn flush_batch(
         file_indices: indices,
         raw_size,
         batch_key,
+        level,
     });
 }
 
@@ -1383,6 +1664,8 @@ fn append_chunk_plans(
     plans: &mut Vec<PlannedBlock>,
     file_index: usize,
     chunk_size: u64,
+    speed: SpeedMode,
+    explicit_level: Option<i32>,
 ) -> anyhow::Result<()> {
     let file = &files[file_index];
     let mut input = fs::File::open(&file.absolute_path)?;
@@ -1392,12 +1675,20 @@ fn append_chunk_plans(
         let mut buffer = vec![0_u8; len as usize];
         input.read_exact(&mut buffer)?;
         let chunk_hash = *blake3::hash(&buffer).as_bytes();
+        let level = explicit_level.unwrap_or_else(|| {
+            if speed == SpeedMode::Fastest {
+                1
+            } else {
+                balanced_chunk_level(&buffer)
+            }
+        });
         plans.push(PlannedBlock::Chunk {
             file_index,
             file_offset: offset,
             len,
             chunk_hash,
             from_metadata_cache: false,
+            level,
         });
         offset += len;
     }
@@ -1408,6 +1699,7 @@ fn append_cached_chunk_plans(
     plans: &mut Vec<PlannedBlock>,
     file_index: usize,
     chunks: &[PathChunkRecord],
+    level: i32,
 ) {
     for chunk in chunks {
         plans.push(PlannedBlock::Chunk {
@@ -1416,8 +1708,37 @@ fn append_cached_chunk_plans(
             len: chunk.len,
             chunk_hash: chunk.chunk_hash,
             from_metadata_cache: true,
+            level,
         });
     }
+}
+
+fn balanced_chunk_level(raw: &[u8]) -> i32 {
+    let probe_len = raw.len().min(64 * 1024);
+    if probe_len == 0 {
+        return 1;
+    }
+    match codec::compress(Compression::Zstd, &raw[..probe_len], 1) {
+        Ok(probe) if probe.len() * 100 <= probe_len * 90 => 3,
+        _ => 1,
+    }
+}
+
+fn compressed_object_key(
+    compression: Compression,
+    level: i32,
+    kind: BlockKind,
+    source_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hig compressed object v2");
+    hasher.update(match compression {
+        Compression::Zstd => b"zstd",
+    });
+    hasher.update(&level.to_le_bytes());
+    hasher.update(&[kind.cache_tag()]);
+    hasher.update(source_hash);
+    *hasher.finalize().as_bytes()
 }
 
 fn batch_key(files: &[crate::ScannedFile], indices: &[usize]) -> [u8; 32] {
@@ -1445,14 +1766,31 @@ fn prewarm_compressed_cache(
     plans: &[PlannedBlock],
     files: &[crate::ScannedFile],
     compression: Compression,
-    level: i32,
 ) -> anyhow::Result<WarmSummary> {
     let missing = plans
         .iter()
         .filter(|plan| match plan {
-            PlannedBlock::Single { file_index } => !cache.has(&files[*file_index].content_hash),
-            PlannedBlock::Batch { batch_key, .. } => !cache.has_batch(batch_key),
-            PlannedBlock::Chunk { chunk_hash, .. } => !cache.has_chunk(chunk_hash),
+            PlannedBlock::Single { file_index, level } => {
+                let source = files[*file_index].content_hash;
+                !(cache.has(&compressed_object_key(
+                    compression,
+                    *level,
+                    BlockKind::Single,
+                    &source,
+                )) || *level == 1 && cache.has(&source))
+            }
+            PlannedBlock::Batch {
+                batch_key, level, ..
+            } => {
+                let key = compressed_object_key(compression, *level, BlockKind::Batch, batch_key);
+                !(cache.has_batch(&key) || *level == 1 && cache.has_batch(batch_key))
+            }
+            PlannedBlock::Chunk {
+                chunk_hash, level, ..
+            } => {
+                let key = compressed_object_key(compression, *level, BlockKind::Chunk, chunk_hash);
+                !(cache.has_chunk(&key) || *level == 1 && cache.has_chunk(chunk_hash))
+            }
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1462,11 +1800,19 @@ fn prewarm_compressed_cache(
         .map(|plan| -> anyhow::Result<WarmResult> {
             let read_started = Instant::now();
             let (kind, raw_size, raw) = match plan {
-                PlannedBlock::Single { file_index } => {
+                PlannedBlock::Single { file_index, level } => {
                     let file = &files[*file_index];
+                    let key = compressed_object_key(
+                        compression,
+                        *level,
+                        BlockKind::Single,
+                        &file.content_hash,
+                    );
                     (
                         WarmKind::Single {
-                            hash: file.content_hash,
+                            key,
+                            source_hash: file.content_hash,
+                            level: *level,
                         },
                         file.size,
                         fs::read(&file.absolute_path)?,
@@ -1476,8 +1822,18 @@ fn prewarm_compressed_cache(
                     file_indices,
                     raw_size,
                     batch_key,
+                    level,
                 } => (
-                    WarmKind::Batch { key: *batch_key },
+                    WarmKind::Batch {
+                        key: compressed_object_key(
+                            compression,
+                            *level,
+                            BlockKind::Batch,
+                            batch_key,
+                        ),
+                        source_hash: *batch_key,
+                        level: *level,
+                    },
                     *raw_size,
                     build_batch_raw(files, file_indices)?,
                 ),
@@ -1486,15 +1842,30 @@ fn prewarm_compressed_cache(
                     file_offset,
                     len,
                     chunk_hash,
+                    level,
                     ..
                 } => (
-                    WarmKind::Chunk { hash: *chunk_hash },
+                    WarmKind::Chunk {
+                        key: compressed_object_key(
+                            compression,
+                            *level,
+                            BlockKind::Chunk,
+                            chunk_hash,
+                        ),
+                        source_hash: *chunk_hash,
+                        level: *level,
+                    },
                     *len,
                     read_file_slice(&files[*file_index], *file_offset, *len)?,
                 ),
             };
             let read_ms = read_started.elapsed().as_millis();
             let compression_started = Instant::now();
+            let level = match plan {
+                PlannedBlock::Single { level, .. }
+                | PlannedBlock::Batch { level, .. }
+                | PlannedBlock::Chunk { level, .. } => *level,
+            };
             let compressed = codec::compress(compression, &raw, level)?;
             Ok(WarmResult {
                 kind,
@@ -1511,18 +1882,50 @@ fn prewarm_compressed_cache(
         summary.read_ms += result.read_ms;
         summary.compression_ms += result.compression_ms;
         match result.kind {
-            WarmKind::Single { hash } => {
-                cache.insert(&hash, result.raw_size, &result.compressed)?;
+            WarmKind::Single {
+                key,
+                source_hash,
+                level,
+            } => {
+                cache.insert_parameterized(
+                    &key,
+                    &source_hash,
+                    result.raw_size,
+                    level,
+                    &result.compressed,
+                )?;
                 summary.single_blocks += 1;
                 summary.single_bytes += result.raw_size;
             }
-            WarmKind::Batch { key } => {
+            WarmKind::Batch {
+                key,
+                source_hash,
+                level,
+            } => {
                 cache.insert_batch(&key, &result.compressed)?;
+                cache.record_object(
+                    &key,
+                    &source_hash,
+                    level,
+                    "batch",
+                    result.compressed.len() as u64,
+                );
                 summary.batch_blocks += 1;
                 summary.batch_bytes += result.raw_size;
             }
-            WarmKind::Chunk { hash } => {
-                cache.insert_chunk(&hash, &result.compressed)?;
+            WarmKind::Chunk {
+                key,
+                source_hash,
+                level,
+            } => {
+                cache.insert_chunk(&key, &result.compressed)?;
+                cache.record_object(
+                    &key,
+                    &source_hash,
+                    level,
+                    "chunk",
+                    result.compressed.len() as u64,
+                );
                 summary.chunk_blocks += 1;
                 summary.chunk_bytes += result.raw_size;
             }
@@ -1720,6 +2123,10 @@ fn slice_block<'a>(
 }
 
 fn decode_v2_manifest(bytes: &[u8]) -> anyhow::Result<V2Manifest> {
+    if let Some(compact) = bytes.strip_prefix(COMPACT_MANIFEST_MAGIC) {
+        let compact: CompactManifestV1 = bincode::deserialize(compact)?;
+        return compact_manifest_to_current(compact);
+    }
     match bincode::deserialize(bytes) {
         Ok(manifest) => Ok(manifest),
         Err(_) => {
@@ -1729,6 +2136,198 @@ fn decode_v2_manifest(bytes: &[u8]) -> anyhow::Result<V2Manifest> {
     }
 }
 
+fn encode_v2_manifest(
+    manifest: &V2Manifest,
+    prepared: &[PreparedV2Block],
+    format: ManifestFormat,
+) -> anyhow::Result<Vec<u8>> {
+    if format == ManifestFormat::Legacy {
+        return Ok(bincode::serialize(manifest)?);
+    }
+    let mut block_indices = std::collections::BTreeMap::new();
+    let blocks = prepared
+        .iter()
+        .enumerate()
+        .map(|(index, block)| -> anyhow::Result<CompactBlockEntry> {
+            block_indices
+                .entry(block.entry.block_id)
+                .or_insert(index as u32);
+            Ok(CompactBlockEntry {
+                block_id: block.entry.block_id,
+                raw_size: block.entry.raw_size,
+                compressed_size: block.entry.compressed_size,
+                payload_size: block.entry.encrypted_size,
+                nonce: block.entry.nonce,
+                codec: CompactCodec::Zstd,
+                level: i8::try_from(block.compression_level).map_err(|_| {
+                    anyhow::anyhow!("compression level does not fit compact manifest")
+                })?,
+                kind: block.entry.kind,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut chunk_refs = Vec::new();
+    let mut files = Vec::with_capacity(manifest.files.len());
+    for file in &manifest.files {
+        let layout = if file.size == 0 {
+            CompactFileLayout::Empty
+        } else {
+            match file.layout.as_ref() {
+                Some(FileLayout::Empty) => CompactFileLayout::Empty,
+                Some(FileLayout::InlineBlock {
+                    block_id,
+                    offset,
+                    len,
+                }) => CompactFileLayout::Inline {
+                    block_index: *block_indices
+                        .get(block_id)
+                        .ok_or_else(|| anyhow::anyhow!("compact manifest missing inline block"))?,
+                    offset: *offset,
+                    len: *len,
+                },
+                Some(FileLayout::Chunked { chunks }) => {
+                    let first_chunk_ref = u32::try_from(chunk_refs.len())?;
+                    for chunk in chunks {
+                        chunk_refs.push(CompactChunkRef {
+                            block_index: *block_indices.get(&chunk.block_id).ok_or_else(|| {
+                                anyhow::anyhow!("compact manifest missing chunk block")
+                            })?,
+                            file_offset: chunk.file_offset,
+                            len: chunk.len,
+                            chunk_hash: chunk.chunk_hash,
+                        });
+                    }
+                    CompactFileLayout::Chunked {
+                        first_chunk_ref,
+                        chunk_ref_count: u32::try_from(chunks.len())?,
+                    }
+                }
+                None => CompactFileLayout::Inline {
+                    block_index: *block_indices
+                        .get(&file.block_id)
+                        .ok_or_else(|| anyhow::anyhow!("compact manifest missing legacy block"))?,
+                    offset: file.block_offset,
+                    len: file.block_len,
+                },
+            }
+        };
+        files.push(CompactFileEntry {
+            relative_path: file.relative_path.clone(),
+            size: file.size,
+            mtime_ns: file.mtime_ns,
+            permissions: file.permissions,
+            layout,
+        });
+    }
+    let compact = CompactManifestV1 {
+        schema: 1,
+        root_hash: manifest.root_hash,
+        files,
+        blocks,
+        chunk_refs,
+    };
+    let mut bytes = COMPACT_MANIFEST_MAGIC.to_vec();
+    bytes.extend(bincode::serialize(&compact)?);
+    Ok(bytes)
+}
+
+fn compact_manifest_to_current(compact: CompactManifestV1) -> anyhow::Result<V2Manifest> {
+    if compact.schema != 1 {
+        anyhow::bail!("unsupported compact manifest schema: {}", compact.schema);
+    }
+    let blocks = compact
+        .blocks
+        .iter()
+        .map(|block| V2BlockEntry {
+            block_id: block.block_id,
+            raw_size: block.raw_size,
+            compressed_size: block.compressed_size,
+            encrypted_size: block.payload_size,
+            archive_offset: 0,
+            nonce: block.nonce,
+            codec: "zstd".to_string(),
+            kind: block.kind,
+        })
+        .collect::<Vec<_>>();
+    let block_id = |index: u32| -> anyhow::Result<[u8; 32]> {
+        blocks
+            .get(index as usize)
+            .map(|block| block.block_id)
+            .ok_or_else(|| anyhow::anyhow!("compact manifest block index out of bounds"))
+    };
+    let mut files = Vec::with_capacity(compact.files.len());
+    for file in compact.files {
+        let (legacy_id, block_offset, block_len, layout) = match file.layout {
+            CompactFileLayout::Empty => ([0; 32], 0, 0, Some(FileLayout::Empty)),
+            CompactFileLayout::Inline {
+                block_index,
+                offset,
+                len,
+            } => {
+                let id = block_id(block_index)?;
+                (
+                    id,
+                    offset,
+                    len,
+                    Some(FileLayout::InlineBlock {
+                        block_id: id,
+                        offset,
+                        len,
+                    }),
+                )
+            }
+            CompactFileLayout::Chunked {
+                first_chunk_ref,
+                chunk_ref_count,
+            } => {
+                let start = first_chunk_ref as usize;
+                let end = start
+                    .checked_add(chunk_ref_count as usize)
+                    .ok_or_else(|| anyhow::anyhow!("compact chunk range overflow"))?;
+                let refs = compact
+                    .chunk_refs
+                    .get(start..end)
+                    .ok_or_else(|| anyhow::anyhow!("compact chunk range out of bounds"))?;
+                let chunks = refs
+                    .iter()
+                    .map(|chunk| {
+                        Ok(ChunkRef {
+                            chunk_hash: chunk.chunk_hash,
+                            block_id: block_id(chunk.block_index)?,
+                            file_offset: chunk.file_offset,
+                            len: chunk.len,
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let id = chunks
+                    .first()
+                    .map(|chunk| chunk.block_id)
+                    .unwrap_or([0; 32]);
+                (id, 0, file.size, Some(FileLayout::Chunked { chunks }))
+            }
+        };
+        files.push(V2FileEntry {
+            relative_path: file.relative_path,
+            size: file.size,
+            mtime_ns: file.mtime_ns,
+            permissions: file.permissions,
+            // Compact manifests commit file hashes through root_hash instead of
+            // repeating every hash in the file table.
+            content_hash: [0; 32],
+            block_id: legacy_id,
+            block_offset,
+            block_len,
+            layout,
+        });
+    }
+    Ok(V2Manifest {
+        version: VERSION_V2,
+        files,
+        blocks,
+        root_hash: compact.root_hash,
+    })
+}
+
 fn upsert_path_cache(
     cache: Option<&mut CacheStore>,
     file: &crate::ScannedFile,
@@ -1736,6 +2335,24 @@ fn upsert_path_cache(
     chunks: &[PathChunkRecord],
 ) -> anyhow::Result<()> {
     if let Some(cache_store) = cache {
+        let chunk_size = if chunks.is_empty() {
+            None
+        } else {
+            Some(chunk_size)
+        };
+        if cache_store
+            .get_path_record(&file.relative_path)
+            .is_some_and(|record| {
+                record.size == file.size
+                    && record.mtime_ns == file.mtime_ns
+                    && record.permissions == file.permissions
+                    && record.content_hash == file.content_hash
+                    && record.chunk_size == chunk_size
+                    && record.chunks == chunks
+            })
+        {
+            return Ok(());
+        }
         cache_store.upsert_path_record(PathCacheRecord {
             relative_path: file.relative_path.clone(),
             size: file.size,
@@ -1743,11 +2360,7 @@ fn upsert_path_cache(
             permissions: file.permissions,
             content_hash: file.content_hash,
             last_seen_unix_ns: unix_ns(SystemTime::now()),
-            chunk_size: if chunks.is_empty() {
-                None
-            } else {
-                Some(chunk_size)
-            },
+            chunk_size,
             chunks: chunks.to_vec(),
         })?;
     }
@@ -1942,6 +2555,100 @@ mod tests {
     }
 
     #[test]
+    fn compact_manifest_roundtrip_uses_block_indices_and_level() {
+        let manifest = V2Manifest {
+            version: VERSION_V2,
+            files: vec![V2FileEntry {
+                relative_path: "a.txt".to_string(),
+                size: 3,
+                mtime_ns: 1,
+                permissions: 0o644,
+                content_hash: [1; 32],
+                block_id: [2; 32],
+                block_offset: 0,
+                block_len: 3,
+                layout: Some(FileLayout::InlineBlock {
+                    block_id: [2; 32],
+                    offset: 0,
+                    len: 3,
+                }),
+            }],
+            blocks: vec![V2BlockEntry {
+                block_id: [2; 32],
+                raw_size: 3,
+                compressed_size: 4,
+                encrypted_size: 20,
+                archive_offset: 0,
+                nonce: [3; NONCE_LEN],
+                codec: "zstd".to_string(),
+                kind: BlockKind::Single,
+            }],
+            root_hash: [4; 32],
+        };
+        let prepared = vec![PreparedV2Block {
+            entry: manifest.blocks[0].clone(),
+            payload: PayloadSource::Memory(Vec::new()),
+            compression_level: 5,
+        }];
+        let bytes = encode_v2_manifest(&manifest, &prepared, ManifestFormat::Compact).unwrap();
+        assert!(bytes.starts_with(COMPACT_MANIFEST_MAGIC));
+        let decoded = decode_v2_manifest(&bytes).unwrap();
+        assert_eq!(decoded.files[0].relative_path, "a.txt");
+        assert_eq!(decoded.files[0].content_hash, [0; 32]);
+        let compact: CompactManifestV1 =
+            bincode::deserialize(&bytes[COMPACT_MANIFEST_MAGIC.len()..]).unwrap();
+        assert_eq!(compact.blocks[0].level, 5);
+    }
+
+    #[test]
+    fn compact_manifest_rejects_invalid_block_index() {
+        let compact = CompactManifestV1 {
+            schema: 1,
+            root_hash: [0; 32],
+            files: vec![CompactFileEntry {
+                relative_path: "bad".to_string(),
+                size: 1,
+                mtime_ns: 0,
+                permissions: 0o644,
+                layout: CompactFileLayout::Inline {
+                    block_index: 9,
+                    offset: 0,
+                    len: 1,
+                },
+            }],
+            blocks: Vec::new(),
+            chunk_refs: Vec::new(),
+        };
+        let mut bytes = COMPACT_MANIFEST_MAGIC.to_vec();
+        bytes.extend(bincode::serialize(&compact).unwrap());
+        assert!(decode_v2_manifest(&bytes).is_err());
+    }
+
+    #[test]
+    fn balanced_policy_and_cache_keys_depend_on_level() {
+        assert_eq!(balanced_chunk_level(&vec![b'a'; 64 * 1024]), 3);
+        let mut state = 0x1234_5678_u32;
+        let randomish = (0..64 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(balanced_chunk_level(&randomish), 3);
+        let source = [7; 32];
+        assert_ne!(
+            compressed_object_key(Compression::Zstd, 1, BlockKind::Chunk, &source),
+            compressed_object_key(Compression::Zstd, 3, BlockKind::Chunk, &source)
+        );
+        assert_ne!(
+            compressed_object_key(Compression::Zstd, 3, BlockKind::Chunk, &source),
+            compressed_object_key(Compression::Zstd, 3, BlockKind::Batch, &source)
+        );
+    }
+
+    #[test]
     fn archive_length_checks_overflow() {
         assert_eq!(
             archive_len(10, [20, 30]).unwrap(),
@@ -1976,7 +2683,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV1,
@@ -1985,6 +2692,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         };
         let first = pack(options.clone()).unwrap();
         let second = pack(PackOptions {
@@ -2024,7 +2732,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV1,
@@ -2033,6 +2741,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert!(
@@ -2064,7 +2773,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV1,
@@ -2073,6 +2782,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
 
@@ -2110,7 +2820,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV1,
@@ -2119,6 +2829,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
 
@@ -2140,7 +2851,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV1,
@@ -2149,6 +2860,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(first.scan.hashed_files, 2);
@@ -2161,7 +2873,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: true,
             format: ArchiveFormat::HigV1,
@@ -2170,6 +2882,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(second.cache.hits, 2);
@@ -2192,7 +2905,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV1,
@@ -2201,6 +2914,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -2214,7 +2928,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: true,
             format: ArchiveFormat::HigV1,
@@ -2223,6 +2937,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(second.scan.metadata_hash_reuses, 1);
@@ -2248,7 +2963,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2257,6 +2972,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 1);
@@ -2291,7 +3007,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2303,6 +3019,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 0);
@@ -2325,7 +3042,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2334,6 +3051,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 1);
@@ -2356,7 +3074,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2365,6 +3083,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         };
         let first = pack(options.clone()).unwrap();
         assert_eq!(first.blocks.batch_cache_misses, 1);
@@ -2394,7 +3113,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2403,6 +3122,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert!(
@@ -2434,7 +3154,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2443,6 +3163,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         let mut bytes = fs::read(&output).unwrap();
@@ -2525,6 +3246,8 @@ mod tests {
                 chunk_file_threshold: 16,
                 chunk_size: 8,
             },
+            SpeedMode::Fastest,
+            Some(1),
         )
         .unwrap();
         assert_eq!(plans.len(), 2);
@@ -2554,7 +3277,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2567,6 +3290,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(report.blocks.chunked_files, 1);
@@ -2602,7 +3326,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2615,6 +3339,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         };
         let first = pack(options.clone()).unwrap();
         assert_eq!(first.blocks.chunk_cache_misses, 4);
@@ -2681,7 +3406,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2694,6 +3419,7 @@ mod tests {
             speed: SpeedMode::Fastest,
             kdf_profile: crate::KdfProfile::FastBench,
             sealed_cache: true,
+            manifest_format: ManifestFormat::Compact,
         };
         let first = pack(options.clone()).unwrap();
         assert_eq!(first.blocks.sealed_block_hits, 0);
@@ -2739,7 +3465,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2752,6 +3478,7 @@ mod tests {
             speed: SpeedMode::Fastest,
             kdf_profile: crate::KdfProfile::FastBench,
             sealed_cache: true,
+            manifest_format: ManifestFormat::Compact,
         };
         pack(options.clone()).unwrap();
         let changed_password = pack(PackOptions {
@@ -2780,7 +3507,7 @@ mod tests {
             cache_dir: Some(cache_dir.clone()),
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: true,
             format: ArchiveFormat::HigV2,
@@ -2789,6 +3516,7 @@ mod tests {
             speed: SpeedMode::Fastest,
             kdf_profile: crate::KdfProfile::FastBench,
             sealed_cache: true,
+            manifest_format: ManifestFormat::Compact,
         };
         pack(options.clone()).unwrap();
         let sealed = fs::read_dir(cache_dir.join("blocks"))
@@ -2846,7 +3574,7 @@ mod tests {
             cache_dir: Some(temp.path().join("cache")),
             threads: Some(4),
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: true,
             format: ArchiveFormat::HigV2,
@@ -2859,6 +3587,7 @@ mod tests {
             speed: SpeedMode::Fastest,
             kdf_profile: crate::KdfProfile::FastBench,
             sealed_cache: true,
+            manifest_format: ManifestFormat::Compact,
         };
         pack(options.clone()).unwrap();
         let second_path = temp.path().join("second.hig");
@@ -2902,7 +3631,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2919,6 +3648,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(report.blocks.chunk_blocks, 0);
@@ -2939,7 +3669,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -2952,6 +3682,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         };
         pack(options.clone()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -2991,7 +3722,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -3008,6 +3739,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 1);
@@ -3050,7 +3782,7 @@ mod tests {
             cache_dir: None,
             threads: Some(2),
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -3059,6 +3791,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         assert_eq!(report.encryption_mode, EncryptionMode::None);
@@ -3100,7 +3833,7 @@ mod tests {
             cache_dir: None,
             threads: None,
             compression: Compression::Zstd,
-            level: 1,
+            level: Some(1),
             use_cache: true,
             trust_metadata: false,
             format: ArchiveFormat::HigV2,
@@ -3109,6 +3842,7 @@ mod tests {
             speed: SpeedMode::Balanced,
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
         })
         .unwrap();
         let mut bytes = fs::read(&archive_path).unwrap();

@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use hig_core::{
     ArchiveFormat, BatchOptions, ChunkOptions, Compression, EncryptionMode, KdfProfile,
-    PackOptions, PackReport, SpeedMode, UnpackOptions, bench, pack, unpack,
+    ManifestFormat, PackOptions, PackReport, SpeedMode, UnpackOptions, bench, pack, unpack,
 };
 use std::ffi::OsStr;
 use std::fs;
@@ -41,12 +41,17 @@ enum Command {
         threads: Option<usize>,
         #[arg(long, default_value = "zstd")]
         compression: Compression,
-        #[arg(long, default_value_t = 1)]
-        level: i32,
+        #[arg(
+            long,
+            help = "Explicit zstd level; balanced otherwise selects level 5 or probes large chunks"
+        )]
+        level: Option<i32>,
         #[arg(long)]
         no_cache: bool,
         #[arg(long, default_value = "higv2")]
         format: ArchiveFormat,
+        #[arg(long, default_value = "compact")]
+        manifest_format: ManifestFormat,
         #[arg(long)]
         no_batch: bool,
         #[arg(long, default_value_t = 65_536)]
@@ -103,12 +108,17 @@ enum Command {
         threads: Option<usize>,
         #[arg(long, default_value = "zstd")]
         compression: Compression,
-        #[arg(long, default_value_t = 1)]
-        level: i32,
+        #[arg(
+            long,
+            help = "Explicit zstd level; balanced otherwise selects level 5 or probes large chunks"
+        )]
+        level: Option<i32>,
         #[arg(long)]
         no_cache: bool,
         #[arg(long, default_value = "higv2")]
         format: ArchiveFormat,
+        #[arg(long, default_value = "compact")]
+        manifest_format: ManifestFormat,
         #[arg(long)]
         no_batch: bool,
         #[arg(long, default_value_t = 65_536)]
@@ -135,7 +145,7 @@ enum Command {
         trust_metadata: bool,
         #[arg(
             long,
-            help = "Compare Hig against zip and tar+zstd, writing artifacts/hig-v1.4.2-benchmark.md"
+            help = "Compare Hig against zip and tar+zstd, writing artifacts/hig-v1.5.0-benchmark.md"
         )]
         compare: bool,
         #[arg(
@@ -160,6 +170,7 @@ fn main() -> anyhow::Result<()> {
             level,
             no_cache,
             format,
+            manifest_format,
             no_batch,
             small_file_threshold,
             max_batch_raw_bytes,
@@ -197,6 +208,7 @@ fn main() -> anyhow::Result<()> {
                 speed,
                 kdf_profile,
                 sealed_cache: speed == SpeedMode::Fastest,
+                manifest_format,
             })?;
             print_report("pack", &report);
         }
@@ -225,6 +237,7 @@ fn main() -> anyhow::Result<()> {
             level,
             no_cache,
             format,
+            manifest_format,
             no_batch,
             small_file_threshold,
             max_batch_raw_bytes,
@@ -263,6 +276,7 @@ fn main() -> anyhow::Result<()> {
                         chunk_size,
                     },
                     bench_dir,
+                    manifest_format,
                 })?;
                 return Ok(());
             }
@@ -291,6 +305,7 @@ fn main() -> anyhow::Result<()> {
                 speed,
                 kdf_profile,
                 sealed_cache: speed == SpeedMode::Fastest,
+                manifest_format,
             })?;
             print_report("bench:first", &report.first);
             print_report("bench:second", &report.second);
@@ -401,6 +416,28 @@ fn print_report(label: &str, report: &PackReport) {
         report.blocks.cache_pack_misses,
         report.blocks.cache_pack_fallbacks
     );
+    println!(
+        "{label}:critical setup_ms={} cache_open_ms={} scan_kdf_wall_ms={} plan_ms={} block_prepare_ms={} cache_commit_ms={} manifest_build_ms={} output_write_ms={} cleanup_ms={} unattributed_ms={} header_bytes={} manifest_plain_bytes={} manifest_compressed_bytes={} manifest_protected_bytes={} payload_bytes={} compression_level_counts={:?} legacy_cache_hits={} parameterized_cache_hits={} cache_policy_misses={}",
+        report.critical.setup_ms,
+        report.critical.cache_open_ms,
+        report.critical.scan_kdf_wall_ms,
+        report.critical.plan_ms,
+        report.critical.block_prepare_ms,
+        report.critical.cache_commit_ms,
+        report.critical.manifest_build_ms,
+        report.critical.output_write_ms,
+        report.critical.cleanup_ms,
+        report.critical.unattributed_ms,
+        report.metadata.header_bytes,
+        report.metadata.manifest_plain_bytes,
+        report.metadata.manifest_compressed_bytes,
+        report.metadata.manifest_protected_bytes,
+        report.metadata.payload_bytes,
+        report.blocks.compression_level_counts,
+        report.blocks.legacy_cache_hits,
+        report.blocks.parameterized_cache_hits,
+        report.blocks.cache_policy_misses,
+    );
 }
 
 #[derive(Debug)]
@@ -469,11 +506,12 @@ struct CompareOptions {
     cache_dir: Option<PathBuf>,
     threads: Option<usize>,
     compression: Compression,
-    level: i32,
+    level: Option<i32>,
     use_cache: bool,
     batch: BatchOptions,
     chunk: ChunkOptions,
     bench_dir: Option<PathBuf>,
+    manifest_format: ManifestFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +553,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Balanced,
         kdf_profile: KdfProfile::Secure,
         sealed_cache: false,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:batch:first", &first);
     rows.push(row_from_report(
@@ -540,6 +579,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Balanced,
         kdf_profile: KdfProfile::Secure,
         sealed_cache: false,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:batch:second", &second);
     rows.push(row_from_report(
@@ -565,6 +605,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Fastest,
         kdf_profile: KdfProfile::Secure,
         sealed_cache: true,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:fastest:secure:warm", &trusted);
     let fastest_secure = pack(PackOptions {
@@ -584,6 +625,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Fastest,
         kdf_profile: KdfProfile::Secure,
         sealed_cache: true,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:fastest:secure", &fastest_secure);
     rows.push(row_from_report(
@@ -609,6 +651,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Fastest,
         kdf_profile: KdfProfile::Interactive,
         sealed_cache: true,
+        manifest_format: options.manifest_format,
     })?;
     print_report(
         "bench:higv2:fastest:interactive:warm",
@@ -633,6 +676,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Fastest,
         kdf_profile: KdfProfile::Interactive,
         sealed_cache: true,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:fastest:interactive", &fastest_interactive);
     rows.push(row_from_report(
@@ -658,6 +702,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Fastest,
         kdf_profile: KdfProfile::FastBench,
         sealed_cache: true,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:fastest:fast-bench", &fastest_bench);
     rows.push(row_from_report(
@@ -686,6 +731,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Balanced,
         kdf_profile: KdfProfile::Secure,
         sealed_cache: false,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:no-batch", &no_batch);
     rows.push(row_from_report(
@@ -715,6 +761,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Balanced,
         kdf_profile: KdfProfile::Secure,
         sealed_cache: false,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:no-chunk", &no_chunk);
     rows.push(row_from_report(
@@ -743,6 +790,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Balanced,
         kdf_profile: KdfProfile::Secure,
         sealed_cache: false,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:no-chunk:second", &no_chunk_second);
     rows.push(row_from_report(
@@ -768,6 +816,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Balanced,
         kdf_profile: KdfProfile::Secure,
         sealed_cache: false,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv2:none", &no_encryption);
     rows.push(row_from_report(
@@ -793,6 +842,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         speed: SpeedMode::Balanced,
         kdf_profile: KdfProfile::Secure,
         sealed_cache: false,
+        manifest_format: options.manifest_format,
     })?;
     print_report("bench:higv1:legacy", &legacy);
     rows.push(row_from_report(
@@ -807,8 +857,8 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
 
     let markdown = render_markdown(&input_dir, &rows, &probe);
     fs::create_dir_all("artifacts")?;
-    fs::write("artifacts/hig-v1.4.2-benchmark.md", markdown)?;
-    println!("benchmark: wrote artifacts/hig-v1.4.2-benchmark.md");
+    fs::write("artifacts/hig-v1.5.0-benchmark.md", markdown)?;
+    println!("benchmark: wrote artifacts/hig-v1.5.0-benchmark.md");
     Ok(())
 }
 
@@ -1118,7 +1168,7 @@ fn skipped_row(tool: &str, input_bytes: u64, notes: &str) -> BenchmarkRow {
 
 fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow], probe: &CopyProbe) -> String {
     let mut output = String::new();
-    output.push_str("# Hig v1.4.2 Benchmark\n\n");
+    output.push_str("# Hig v1.5.0 Benchmark\n\n");
     output.push_str(&format!("Input: `{}`\n\n", input_dir.display()));
     output.push_str("## Environment Qualification\n\n");
     output.push_str(&format!(

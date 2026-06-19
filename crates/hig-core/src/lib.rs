@@ -5,6 +5,7 @@ mod crypto;
 mod scan;
 mod writer;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ pub struct PackOptions {
     pub cache_dir: Option<PathBuf>,
     pub threads: Option<usize>,
     pub compression: Compression,
-    pub level: i32,
+    pub level: Option<i32>,
     pub use_cache: bool,
     pub trust_metadata: bool,
     pub format: ArchiveFormat,
@@ -30,6 +31,7 @@ pub struct PackOptions {
     pub speed: SpeedMode,
     pub kdf_profile: KdfProfile,
     pub sealed_cache: bool,
+    pub manifest_format: ManifestFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +59,25 @@ pub enum SpeedMode {
     #[default]
     Balanced,
     Fastest,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ManifestFormat {
+    #[default]
+    Compact,
+    Legacy,
+}
+
+impl std::str::FromStr for ManifestFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "compact" => Ok(Self::Compact),
+            "legacy" => Ok(Self::Legacy),
+            other => anyhow::bail!("unsupported manifest format: {other}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -219,6 +240,32 @@ pub struct PackReport {
     pub direct_write_count: usize,
     pub buffered_write_count: usize,
     pub preallocation_enabled: bool,
+    pub critical: PackCriticalTimings,
+    pub metadata: ArchiveSizeBreakdown,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PackCriticalTimings {
+    pub setup_ms: u128,
+    pub cache_open_ms: u128,
+    pub scan_kdf_wall_ms: u128,
+    pub plan_ms: u128,
+    pub block_prepare_ms: u128,
+    pub cache_commit_ms: u128,
+    pub manifest_build_ms: u128,
+    pub output_write_ms: u128,
+    pub cleanup_ms: u128,
+    pub unattributed_ms: u128,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveSizeBreakdown {
+    pub header_bytes: u64,
+    pub manifest_plain_bytes: u64,
+    pub manifest_compressed_bytes: u64,
+    pub manifest_protected_bytes: u64,
+    pub payload_bytes: u64,
+    pub total_archive_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -264,6 +311,10 @@ pub struct BlockStats {
     pub cache_pack_hits: usize,
     pub cache_pack_misses: usize,
     pub cache_pack_fallbacks: usize,
+    pub compression_level_counts: BTreeMap<i32, usize>,
+    pub legacy_cache_hits: usize,
+    pub parameterized_cache_hits: usize,
+    pub cache_policy_misses: usize,
 }
 
 #[derive(Debug, Clone)]

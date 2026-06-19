@@ -48,13 +48,19 @@ pub fn reusable_path_chunks(
     Some(record.chunks.clone())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheRecord {
     pub hash_hex: String,
     pub block_file: String,
     pub original_size: u64,
     pub compressed_size: u64,
     pub codec: String,
+    #[serde(default)]
+    pub level: Option<i32>,
+    #[serde(default)]
+    pub policy_version: Option<u16>,
+    #[serde(default)]
+    pub source_hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -71,6 +77,18 @@ pub struct CacheIndex {
     pub sealed_key_id: Option<[u8; 32]>,
     #[serde(default)]
     pub sealed_records: BTreeMap<String, SealedCacheRecord>,
+    #[serde(default)]
+    pub objects: BTreeMap<String, CacheObjectRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheObjectRecord {
+    pub codec: String,
+    pub level: i32,
+    pub policy_version: u16,
+    pub source_hash: [u8; 32],
+    pub compressed_size: u64,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +132,7 @@ pub struct SealedCacheRecord {
 pub struct CacheStore {
     root: PathBuf,
     index: CacheIndex,
+    dirty: bool,
 }
 
 impl CacheStore {
@@ -126,7 +145,11 @@ impl CacheStore {
         } else {
             CacheIndex::default()
         };
-        Ok(Self { root, index })
+        Ok(Self {
+            root,
+            index,
+            dirty: false,
+        })
     }
 
     pub fn get(&self, hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
@@ -193,6 +216,7 @@ impl CacheStore {
         }
         let salt = crate::crypto::random_bytes::<SALT_LEN>();
         self.index.sealed_salt = Some(salt);
+        self.dirty = true;
         salt
     }
 
@@ -201,8 +225,12 @@ impl CacheStore {
         if self.index.sealed_key_id != Some(key_id) {
             self.index.sealed_records.clear();
             self.index.sealed_key_id = Some(key_id);
+            self.dirty = true;
         }
-        self.index.sealed_kdf_params = Some(kdf);
+        if self.index.sealed_kdf_params.as_ref() != Some(&kdf) {
+            self.index.sealed_kdf_params = Some(kdf);
+            self.dirty = true;
+        }
     }
 
     pub fn get_sealed_record(&self, key: &[u8; 32]) -> Option<&SealedCacheRecord> {
@@ -233,17 +261,73 @@ impl CacheStore {
         let hash_hex = hex::encode(hash);
         let block_file = format!("{hash_hex}.zst");
         atomic_write(&self.root.join("blocks").join(&block_file), compressed)?;
-        self.index.records.insert(
-            hash_hex.clone(),
-            CacheRecord {
-                hash_hex,
-                block_file,
-                original_size,
-                compressed_size: compressed.len() as u64,
-                codec: "zstd".to_string(),
-            },
-        );
+        let record = CacheRecord {
+            hash_hex: hash_hex.clone(),
+            block_file,
+            original_size,
+            compressed_size: compressed.len() as u64,
+            codec: "zstd".to_string(),
+            level: None,
+            policy_version: None,
+            source_hash: None,
+        };
+        if self.index.records.get(&hash_hex) != Some(&record) {
+            self.index.records.insert(hash_hex, record);
+            self.dirty = true;
+        }
         Ok(())
+    }
+
+    pub fn insert_parameterized(
+        &mut self,
+        key: &[u8; 32],
+        source_hash: &[u8; 32],
+        original_size: u64,
+        level: i32,
+        compressed: &[u8],
+    ) -> anyhow::Result<()> {
+        let key_hex = hex::encode(key);
+        let block_file = format!("{key_hex}.zst");
+        atomic_write(&self.root.join("blocks").join(&block_file), compressed)?;
+        let record = CacheRecord {
+            hash_hex: key_hex.clone(),
+            block_file,
+            original_size,
+            compressed_size: compressed.len() as u64,
+            codec: "zstd".to_string(),
+            level: Some(level),
+            policy_version: Some(2),
+            source_hash: Some(*source_hash),
+        };
+        if self.index.records.get(&key_hex) != Some(&record) {
+            self.index.records.insert(key_hex, record);
+            self.dirty = true;
+        }
+        self.record_object(key, source_hash, level, "single", compressed.len() as u64);
+        Ok(())
+    }
+
+    pub fn record_object(
+        &mut self,
+        key: &[u8; 32],
+        source_hash: &[u8; 32],
+        level: i32,
+        kind: &str,
+        compressed_size: u64,
+    ) {
+        let key = hex::encode(key);
+        let record = CacheObjectRecord {
+            codec: "zstd".to_string(),
+            level,
+            policy_version: 2,
+            source_hash: *source_hash,
+            compressed_size,
+            kind: kind.to_string(),
+        };
+        if self.index.objects.get(&key) != Some(&record) {
+            self.index.objects.insert(key, record);
+            self.dirty = true;
+        }
     }
 
     pub fn insert_batch(&mut self, key: &[u8; 32], compressed: &[u8]) -> anyhow::Result<()> {
@@ -255,6 +339,7 @@ impl CacheStore {
                 .join(format!("{key_hex}.batch.zst")),
             compressed,
         )?;
+        self.dirty = true;
         Ok(())
     }
 
@@ -267,6 +352,7 @@ impl CacheStore {
                 .join(format!("{hash_hex}.chunk.zst")),
             compressed,
         )?;
+        self.dirty = true;
         Ok(())
     }
 
@@ -283,19 +369,25 @@ impl CacheStore {
             record.pack_offset = Some(offset);
         }
         self.index.sealed_records.insert(hex::encode(key), record);
+        self.dirty = true;
         Ok(())
     }
 
     pub fn upsert_path_record(&mut self, record: PathCacheRecord) -> anyhow::Result<()> {
-        self.index
-            .paths
-            .insert(record.relative_path.clone(), record);
+        let path = record.relative_path.clone();
+        if self.index.paths.get(&path) != Some(&record) {
+            self.index.paths.insert(path, record);
+            self.dirty = true;
+        }
         Ok(())
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
         let bytes = serde_json::to_vec_pretty(&self.index)?;
-        fs::write(self.root.join("index.json"), bytes)?;
+        atomic_write(&self.root.join("index.json"), &bytes)?;
         Ok(())
     }
 
@@ -385,12 +477,20 @@ mod tests {
         let index: CacheIndex = serde_json::from_str(r#"{"records":{}}"#).unwrap();
         assert!(index.records.is_empty());
         assert!(index.paths.is_empty());
+        assert!(index.objects.is_empty());
         let record: PathCacheRecord = serde_json::from_str(
             r#"{"relative_path":"a.txt","size":4,"mtime_ns":1,"permissions":420,"content_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"last_seen_unix_ns":2}"#,
         )
         .unwrap();
         assert_eq!(record.chunk_size, None);
         assert!(record.chunks.is_empty());
+        let cache_record: CacheRecord = serde_json::from_str(
+            r#"{"hash_hex":"00","block_file":"00.zst","original_size":1,"compressed_size":2,"codec":"zstd"}"#,
+        )
+        .unwrap();
+        assert_eq!(cache_record.level, None);
+        assert_eq!(cache_record.policy_version, None);
+        assert_eq!(cache_record.source_hash, None);
     }
 
     #[test]
@@ -415,6 +515,24 @@ mod tests {
         let record = reopened.get_path_record("a.txt").unwrap();
         assert_eq!(record.content_hash, hash);
         assert_eq!(record.mtime_ns, 123);
+    }
+
+    #[test]
+    fn parameterized_object_metadata_roundtrips() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = *blake3::hash(b"source").as_bytes();
+        let key = *blake3::hash(b"parameterized").as_bytes();
+        let mut cache = CacheStore::open(temp.path()).unwrap();
+        cache
+            .insert_parameterized(&key, &source, 6, 5, b"compressed")
+            .unwrap();
+        cache.save().unwrap();
+        let reopened = CacheStore::open(temp.path()).unwrap();
+        let record = reopened.index.objects.get(&hex::encode(key)).unwrap();
+        assert_eq!(record.level, 5);
+        assert_eq!(record.policy_version, 2);
+        assert_eq!(record.source_hash, source);
+        assert_eq!(record.kind, "single");
     }
 
     #[test]
