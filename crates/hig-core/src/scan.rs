@@ -1,4 +1,5 @@
-use crate::cache::CacheStore;
+use crate::ChunkOptions;
+use crate::cache::{CacheStore, PathChunkRecord, reusable_path_chunks};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -16,6 +17,7 @@ pub struct ScannedFile {
     pub permissions: u32,
     pub content_hash: [u8; 32],
     pub hash_source: HashSource,
+    pub cached_chunks: Option<Vec<PathChunkRecord>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +29,7 @@ pub enum HashSource {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanOptions {
     pub trust_metadata: bool,
+    pub chunk: ChunkOptions,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,6 +38,9 @@ pub struct ScanStats {
     pub metadata_hash_reuses: usize,
     pub scan_cache_hits: usize,
     pub scan_cache_misses: usize,
+    pub chunk_metadata_reuses: usize,
+    pub chunk_metadata_misses: usize,
+    pub trusted_bytes_skipped: u64,
 }
 
 impl ScanStats {
@@ -104,6 +110,18 @@ pub fn scan_dir(
                 stats.scan_cache_hits += 1;
             }
         }
+        if options.trust_metadata
+            && options.chunk.enabled
+            && file.size > 0
+            && file.size >= options.chunk.chunk_file_threshold
+        {
+            if file.cached_chunks.is_some() {
+                stats.chunk_metadata_reuses += 1;
+                stats.trusted_bytes_skipped += file.size;
+            } else {
+                stats.chunk_metadata_misses += 1;
+            }
+        }
     }
     Ok(ScanReport { files, stats })
 }
@@ -133,6 +151,12 @@ fn scan_file(
         && record.mtime_ns == mtime_ns
         && record.permissions == permissions
     {
+        let cached_chunks =
+            if options.chunk.enabled && size > 0 && size >= options.chunk.chunk_file_threshold {
+                reusable_path_chunks(record, size, options.chunk.chunk_size)
+            } else {
+                None
+            };
         return Ok(ScannedFile {
             relative_path,
             absolute_path: path,
@@ -142,6 +166,7 @@ fn scan_file(
             permissions,
             content_hash: record.content_hash,
             hash_source: HashSource::MetadataCache,
+            cached_chunks,
         });
     }
     Ok(ScannedFile {
@@ -153,6 +178,7 @@ fn scan_file(
         permissions,
         content_hash: *blake3::hash(&fs::read(path)?).as_bytes(),
         hash_source: HashSource::Computed,
+        cached_chunks: None,
     })
 }
 
@@ -243,6 +269,8 @@ mod tests {
                 permissions: file.permissions,
                 content_hash: file.content_hash,
                 last_seen_unix_ns: 1,
+                chunk_size: None,
+                chunks: Vec::new(),
             })
             .unwrap();
         let second = scan_dir(
@@ -252,11 +280,136 @@ mod tests {
             Some(&cache),
             ScanOptions {
                 trust_metadata: true,
+                chunk: ChunkOptions::default(),
             },
         )
         .unwrap();
         assert_eq!(second.stats.metadata_hash_reuses, 1);
         assert_eq!(second.stats.hashed_files, 0);
         assert_eq!(second.files[0].hash_source, HashSource::MetadataCache);
+    }
+
+    #[test]
+    fn trust_metadata_reuses_cached_chunk_plan_for_large_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.bin");
+        fs::write(&path, b"aaaaaaaabbbbbbbb").unwrap();
+        let chunk = ChunkOptions {
+            enabled: true,
+            chunk_file_threshold: 16,
+            chunk_size: 8,
+        };
+        let first = scan_dir(
+            temp.path(),
+            &temp.path().join(".hig-cache"),
+            &temp.path().join("out.hig"),
+            None,
+            ScanOptions {
+                trust_metadata: false,
+                chunk,
+            },
+        )
+        .unwrap();
+        let file = first.files.first().unwrap();
+        let first_hash = *blake3::hash(b"aaaaaaaa").as_bytes();
+        let second_hash = *blake3::hash(b"bbbbbbbb").as_bytes();
+        let mut cache = CacheStore::open(temp.path().join(".hig-cache")).unwrap();
+        cache
+            .upsert_path_record(crate::cache::PathCacheRecord {
+                relative_path: file.relative_path.clone(),
+                size: file.size,
+                mtime_ns: file.mtime_ns,
+                permissions: file.permissions,
+                content_hash: file.content_hash,
+                last_seen_unix_ns: 1,
+                chunk_size: Some(8),
+                chunks: vec![
+                    PathChunkRecord {
+                        chunk_hash: first_hash,
+                        file_offset: 0,
+                        len: 8,
+                    },
+                    PathChunkRecord {
+                        chunk_hash: second_hash,
+                        file_offset: 8,
+                        len: 8,
+                    },
+                ],
+            })
+            .unwrap();
+
+        let second = scan_dir(
+            temp.path(),
+            &temp.path().join(".hig-cache"),
+            &temp.path().join("out.hig"),
+            Some(&cache),
+            ScanOptions {
+                trust_metadata: true,
+                chunk,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.stats.metadata_hash_reuses, 1);
+        assert_eq!(second.stats.chunk_metadata_reuses, 1);
+        assert_eq!(second.stats.trusted_bytes_skipped, 16);
+        assert_eq!(second.files[0].cached_chunks.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn trust_metadata_chunk_plan_misses_when_chunk_size_differs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.bin");
+        fs::write(&path, b"aaaaaaaabbbbbbbb").unwrap();
+        let chunk = ChunkOptions {
+            enabled: true,
+            chunk_file_threshold: 16,
+            chunk_size: 8,
+        };
+        let first = scan_dir(
+            temp.path(),
+            &temp.path().join(".hig-cache"),
+            &temp.path().join("out.hig"),
+            None,
+            ScanOptions {
+                trust_metadata: false,
+                chunk,
+            },
+        )
+        .unwrap();
+        let file = first.files.first().unwrap();
+        let hash = *blake3::hash(b"aaaaaaaa").as_bytes();
+        let mut cache = CacheStore::open(temp.path().join(".hig-cache")).unwrap();
+        cache
+            .upsert_path_record(crate::cache::PathCacheRecord {
+                relative_path: file.relative_path.clone(),
+                size: file.size,
+                mtime_ns: file.mtime_ns,
+                permissions: file.permissions,
+                content_hash: file.content_hash,
+                last_seen_unix_ns: 1,
+                chunk_size: Some(4),
+                chunks: vec![PathChunkRecord {
+                    chunk_hash: hash,
+                    file_offset: 0,
+                    len: 16,
+                }],
+            })
+            .unwrap();
+
+        let second = scan_dir(
+            temp.path(),
+            &temp.path().join(".hig-cache"),
+            &temp.path().join("out.hig"),
+            Some(&cache),
+            ScanOptions {
+                trust_metadata: true,
+                chunk,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.stats.metadata_hash_reuses, 1);
+        assert_eq!(second.stats.chunk_metadata_reuses, 0);
+        assert_eq!(second.stats.chunk_metadata_misses, 1);
+        assert!(second.files[0].cached_chunks.is_none());
     }
 }

@@ -4,6 +4,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+use crate::KdfProfile;
+
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 pub const SALT_LEN: usize = 16;
@@ -21,6 +23,24 @@ impl Default for KdfParams {
             memory_cost_kib: 19 * 1024,
             time_cost: 2,
             parallelism: 1,
+        }
+    }
+}
+
+impl KdfProfile {
+    pub fn params(self) -> KdfParams {
+        match self {
+            Self::Secure => KdfParams::default(),
+            Self::Interactive => KdfParams {
+                memory_cost_kib: 8 * 1024,
+                time_cost: 1,
+                parallelism: 1,
+            },
+            Self::FastBench => KdfParams {
+                memory_cost_kib: 1024,
+                time_cost: 1,
+                parallelism: 1,
+            },
         }
     }
 }
@@ -90,5 +110,17 @@ mod tests {
         let encrypted = encrypt(&key, &nonce, b"secret").unwrap();
         assert_eq!(decrypt(&key, &nonce, &encrypted).unwrap(), b"secret");
         assert!(decrypt(&wrong_key, &nonce, &encrypted).is_err());
+    }
+
+    #[test]
+    fn kdf_profiles_map_to_expected_strengths() {
+        let secure = KdfProfile::Secure.params();
+        let interactive = KdfProfile::Interactive.params();
+        let fast = KdfProfile::FastBench.params();
+        assert_eq!(secure, KdfParams::default());
+        assert!(interactive.memory_cost_kib < secure.memory_cost_kib);
+        assert!(interactive.time_cost <= secure.time_cost);
+        assert!(fast.memory_cost_kib < interactive.memory_cost_kib);
+        assert!(fast.time_cost <= interactive.time_cost);
     }
 }

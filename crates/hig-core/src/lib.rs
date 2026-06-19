@@ -3,19 +3,21 @@ mod cache;
 mod codec;
 mod crypto;
 mod scan;
+mod writer;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub use archive::{pack, unpack};
-pub use cache::CacheStats;
+pub use cache::{CacheStats, PathChunkRecord};
 pub use scan::{ScanStats, ScannedFile};
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
     pub input_dir: PathBuf,
     pub output_file: PathBuf,
-    pub password: String,
+    pub password: Option<String>,
+    pub encryption: EncryptionMode,
     pub cache_dir: Option<PathBuf>,
     pub threads: Option<usize>,
     pub compression: Compression,
@@ -25,13 +27,16 @@ pub struct PackOptions {
     pub format: ArchiveFormat,
     pub batch: BatchOptions,
     pub chunk: ChunkOptions,
+    pub speed: SpeedMode,
+    pub kdf_profile: KdfProfile,
+    pub sealed_cache: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct UnpackOptions {
     pub archive_file: PathBuf,
     pub output_dir: PathBuf,
-    pub password: String,
+    pub password: Option<String>,
     pub overwrite: bool,
 }
 
@@ -45,6 +50,92 @@ pub enum ArchiveFormat {
     HigV1,
     #[default]
     HigV2,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpeedMode {
+    #[default]
+    Balanced,
+    Fastest,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EncryptionMode {
+    #[default]
+    Password,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WriterStrategy {
+    #[default]
+    Buffered,
+    PrefetchedCachedFiles,
+    OrderedPipeline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoOptions {
+    pub writer_buffer_bytes: usize,
+    pub transfer_chunk_bytes: usize,
+    pub prefetch_depth: usize,
+    pub pipeline_memory_bytes: usize,
+}
+
+impl Default for IoOptions {
+    fn default() -> Self {
+        Self {
+            writer_buffer_bytes: 4 * 1024 * 1024,
+            transfer_chunk_bytes: 1024 * 1024,
+            prefetch_depth: 2,
+            pipeline_memory_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl std::str::FromStr for EncryptionMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "password" => Ok(Self::Password),
+            "none" => Ok(Self::None),
+            other => anyhow::bail!("unsupported encryption mode: {other}"),
+        }
+    }
+}
+
+impl std::str::FromStr for SpeedMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "balanced" => Ok(Self::Balanced),
+            "fastest" => Ok(Self::Fastest),
+            other => anyhow::bail!("unsupported speed mode: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KdfProfile {
+    #[default]
+    Secure,
+    Interactive,
+    FastBench,
+}
+
+impl std::str::FromStr for KdfProfile {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "secure" => Ok(Self::Secure),
+            "interactive" => Ok(Self::Interactive),
+            "fast-bench" => Ok(Self::FastBench),
+            other => anyhow::bail!("unsupported KDF profile: {other}"),
+        }
+    }
 }
 
 impl std::str::FromStr for ArchiveFormat {
@@ -110,9 +201,39 @@ pub struct PackReport {
     pub input_bytes: u64,
     pub archive_bytes: u64,
     pub duration: Duration,
+    pub timings: PackTimings,
     pub cache: CacheStats,
     pub scan: ScanStats,
     pub blocks: BlockStats,
+    pub speed: SpeedMode,
+    pub kdf_profile: KdfProfile,
+    pub encryption_mode: EncryptionMode,
+    pub worker_count: usize,
+    pub writer_strategy: WriterStrategy,
+    pub archive_preallocated_bytes: u64,
+    pub cached_payload_open_count: usize,
+    pub cached_payload_read_bytes: u64,
+    pub prefetched_bytes: u64,
+    pub peak_pipeline_memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PackTimings {
+    pub scan_ms: u128,
+    pub plan_ms: u128,
+    pub kdf_ms: u128,
+    pub pack_blocks_ms: u128,
+    pub manifest_ms: u128,
+    pub write_ms: u128,
+    pub kdf_overlapped_ms: u128,
+    pub crypto_ms: u128,
+    pub compression_ms: u128,
+    pub read_ms: u128,
+    pub payload_write_ms: u128,
+    pub payload_read_ms: u128,
+    pub writer_wait_ms: u128,
+    pub output_flush_ms: u128,
+    pub output_rename_ms: u128,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +249,14 @@ pub struct BlockStats {
     pub chunk_cache_misses: usize,
     pub chunk_bytes_reused: u64,
     pub chunk_bytes_compressed: u64,
+    pub chunk_plan_cache_hits: usize,
+    pub chunk_plan_cache_misses: usize,
+    pub sealed_block_hits: usize,
+    pub sealed_block_misses: usize,
+    pub sealed_bytes_reused: u64,
+    pub reencrypted_cache_hits: usize,
+    pub payload_source_cache_files: usize,
+    pub payload_source_memory_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
