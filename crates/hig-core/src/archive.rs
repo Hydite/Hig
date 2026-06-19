@@ -191,6 +191,12 @@ struct SealedPayloadMeta {
     kind: BlockKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealedPayloadSource {
+    Pack,
+    File,
+}
+
 #[derive(Debug, Clone)]
 enum PlannedBlock {
     Single {
@@ -403,13 +409,13 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
         .iter()
         .filter_map(|payload| match payload {
             PayloadSource::Memory(bytes) => Some(bytes.len() as u64),
-            PayloadSource::CachedFile { .. } => None,
+            PayloadSource::CachedFile { .. } | PayloadSource::CachedRange { .. } => None,
         })
         .sum();
     out.write_payloads(&payloads)?;
     let writer_report = out.finish()?;
     let write_ms = write_started.elapsed().as_millis();
-    let archive_bytes = writer_report.preallocated_bytes;
+    let archive_bytes = expected_len;
 
     Ok(PackReport {
         input_files: files.len(),
@@ -438,8 +444,12 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
         writer_strategy: writer_report.strategy,
         archive_preallocated_bytes: writer_report.preallocated_bytes,
         cached_payload_open_count: writer_report.cached_payload_open_count,
+        cached_range_open_count: writer_report.cached_range_open_count,
         cached_payload_read_bytes: writer_report.cached_payload_read_bytes,
         prefetched_bytes: writer_report.prefetched_bytes,
+        direct_write_count: writer_report.direct_write_count,
+        buffered_write_count: writer_report.buffered_write_count,
+        preallocation_enabled: writer_report.preallocation_enabled,
         peak_pipeline_memory_bytes: writer_report
             .peak_pipeline_memory_bytes
             .max(payload_memory_bytes),
@@ -562,12 +572,16 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 block_stats.single_blocks += 1;
                 let file = &files[file_index];
                 if sealed_enabled
-                    && let Some((mut sealed_entry, payload)) =
+                    && let Some((mut sealed_entry, payload, source)) =
                         try_sealed_payload(cache.as_ref(), &file.content_hash)?
                 {
                     block_stats.sealed_block_hits += 1;
                     block_stats.sealed_bytes_reused += sealed_entry.encrypted_size;
                     block_stats.payload_source_cache_files += 1;
+                    match source {
+                        SealedPayloadSource::Pack => block_stats.cache_pack_hits += 1,
+                        SealedPayloadSource::File => block_stats.cache_pack_fallbacks += 1,
+                    }
                     sealed_entry.kind = BlockKind::Single;
                     file_entries.push(V2FileEntry {
                         relative_path: file.relative_path.clone(),
@@ -593,6 +607,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 }
                 if sealed_enabled {
                     block_stats.sealed_block_misses += 1;
+                    block_stats.cache_pack_misses += 1;
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
                     if let Some(bytes) = cache_store.get(&file.content_hash)? {
@@ -687,12 +702,16 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 block_stats.batch_blocks += 1;
                 block_stats.batched_files += file_indices.len();
                 if sealed_enabled
-                    && let Some((mut sealed_entry, payload)) =
+                    && let Some((mut sealed_entry, payload, source)) =
                         try_sealed_payload(cache.as_ref(), &batch_key)?
                 {
                     block_stats.sealed_block_hits += 1;
                     block_stats.sealed_bytes_reused += sealed_entry.encrypted_size;
                     block_stats.payload_source_cache_files += 1;
+                    match source {
+                        SealedPayloadSource::Pack => block_stats.cache_pack_hits += 1,
+                        SealedPayloadSource::File => block_stats.cache_pack_fallbacks += 1,
+                    }
                     sealed_entry.kind = BlockKind::Batch;
                     let mut block_offset = 0_u64;
                     for index in &file_indices {
@@ -723,6 +742,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 }
                 if sealed_enabled {
                     block_stats.sealed_block_misses += 1;
+                    block_stats.cache_pack_misses += 1;
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
                     if let Some(bytes) = cache_store.get_batch(&batch_key)? {
@@ -829,12 +849,16 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 }
                 let file = &files[file_index];
                 if sealed_enabled
-                    && let Some((mut sealed_entry, payload)) =
+                    && let Some((mut sealed_entry, payload, source)) =
                         try_sealed_payload(cache.as_ref(), &chunk_hash)?
                 {
                     block_stats.sealed_block_hits += 1;
                     block_stats.sealed_bytes_reused += sealed_entry.encrypted_size;
                     block_stats.payload_source_cache_files += 1;
+                    match source {
+                        SealedPayloadSource::Pack => block_stats.cache_pack_hits += 1,
+                        SealedPayloadSource::File => block_stats.cache_pack_fallbacks += 1,
+                    }
                     sealed_entry.kind = BlockKind::Chunk;
                     chunk_refs.entry(file_index).or_default().push(ChunkRef {
                         chunk_hash,
@@ -858,6 +882,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 }
                 if sealed_enabled {
                     block_stats.sealed_block_misses += 1;
+                    block_stats.cache_pack_misses += 1;
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
                     if let Some(bytes) = cache_store.get_chunk(&chunk_hash)? {
@@ -993,7 +1018,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
             .iter()
             .filter_map(|block| match &block.payload {
                 PayloadSource::Memory(bytes) => Some(bytes.len() as u64),
-                PayloadSource::CachedFile { .. } => None,
+                PayloadSource::CachedFile { .. } | PayloadSource::CachedRange { .. } => None,
             })
             .sum();
     }
@@ -1074,7 +1099,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         .collect::<Vec<_>>();
     out.write_payloads(&payloads)?;
     let writer_report = out.finish()?;
-    let archive_bytes = writer_report.preallocated_bytes;
+    let archive_bytes = expected_len;
     let write_ms = write_started.elapsed().as_millis();
     let peak_pipeline_memory_bytes = writer_report
         .peak_pipeline_memory_bytes
@@ -1112,8 +1137,12 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         writer_strategy: writer_report.strategy,
         archive_preallocated_bytes: writer_report.preallocated_bytes,
         cached_payload_open_count: writer_report.cached_payload_open_count,
+        cached_range_open_count: writer_report.cached_range_open_count,
         cached_payload_read_bytes: writer_report.cached_payload_read_bytes,
         prefetched_bytes: writer_report.prefetched_bytes,
+        direct_write_count: writer_report.direct_write_count,
+        buffered_write_count: writer_report.buffered_write_count,
+        preallocation_enabled: writer_report.preallocation_enabled,
         peak_pipeline_memory_bytes,
     })
 }
@@ -1505,17 +1534,48 @@ fn prewarm_compressed_cache(
 fn try_sealed_payload(
     cache: Option<&CacheStore>,
     key: &[u8; 32],
-) -> anyhow::Result<Option<(V2BlockEntry, PayloadSource)>> {
+) -> anyhow::Result<Option<(V2BlockEntry, PayloadSource, SealedPayloadSource)>> {
     let Some(cache_store) = cache else {
         return Ok(None);
     };
     let Some(record) = cache_store.get_sealed_record(key) else {
         return Ok(None);
     };
+    let pack_payload = match (
+        cache_store.sealed_pack_path(record),
+        record.pack_offset,
+        record.pack_file.as_ref(),
+    ) {
+        (Some(path), Some(offset), Some(_)) if path.exists() => {
+            let end = offset
+                .checked_add(record.encrypted_size)
+                .ok_or_else(|| anyhow::anyhow!("sealed pack range overflow"))?;
+            if fs::metadata(&path)?.len() >= end {
+                Some(PayloadSource::CachedRange {
+                    path,
+                    offset,
+                    len: record.encrypted_size,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
     let path = cache_store.sealed_block_path(record);
-    if !path.exists() {
+    let (payload, source) = if let Some(payload) = pack_payload {
+        (payload, SealedPayloadSource::Pack)
+    } else if path.exists() {
+        (
+            PayloadSource::CachedFile {
+                path,
+                len: record.encrypted_size,
+            },
+            SealedPayloadSource::File,
+        )
+    } else {
         return Ok(None);
-    }
+    };
     Ok(Some((
         V2BlockEntry {
             block_id: record.block_id,
@@ -1527,10 +1587,8 @@ fn try_sealed_payload(
             codec: record.codec.clone(),
             kind: sealed_kind(&record.kind)?,
         },
-        PayloadSource::CachedFile {
-            path,
-            len: record.encrypted_size,
-        },
+        payload,
+        source,
     )))
 }
 
@@ -1557,6 +1615,8 @@ fn write_sealed_payload(
                 sealed_file: sealed_cache_file(key),
                 codec: "zstd".to_string(),
                 kind: sealed_kind_name(meta.kind).to_string(),
+                pack_file: None,
+                pack_offset: None,
             },
             ciphertext,
         )?;
@@ -2742,6 +2802,17 @@ mod tests {
             .unwrap()
             .set_len(1)
             .unwrap();
+        let pack_file = fs::read_dir(cache_dir.join("sealed-packs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("pack"))
+            .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(pack_file)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
         fs::write(&target, b"existing archive").unwrap();
 
         let result = pack(PackOptions {
@@ -2759,7 +2830,7 @@ mod tests {
         let restored = temp.path().join("restored");
         fs::create_dir_all(&input).unwrap();
         let mut state = 0x1234_5678_u32;
-        let mut content = vec![0_u8; 5 * 1024 * 1024];
+        let mut content = vec![0_u8; 9 * 1024 * 1024];
         for byte in &mut content {
             state ^= state << 13;
             state ^= state >> 17;
@@ -2800,8 +2871,10 @@ mod tests {
             second.writer_strategy,
             crate::WriterStrategy::PrefetchedCachedFiles
         );
-        assert_eq!(second.blocks.sealed_block_hits, 5);
-        assert!(second.prefetched_bytes >= 5 * 1024 * 1024);
+        assert_eq!(second.blocks.sealed_block_hits, 9);
+        assert_eq!(second.blocks.cache_pack_hits, 9);
+        assert!(second.cached_range_open_count <= 1);
+        assert!(second.prefetched_bytes >= 9 * 1024 * 1024);
         assert!(second.peak_pipeline_memory_bytes <= 64 * 1024 * 1024);
 
         unpack(UnpackOptions {

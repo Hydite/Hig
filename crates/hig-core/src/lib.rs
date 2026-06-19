@@ -212,9 +212,13 @@ pub struct PackReport {
     pub writer_strategy: WriterStrategy,
     pub archive_preallocated_bytes: u64,
     pub cached_payload_open_count: usize,
+    pub cached_range_open_count: usize,
     pub cached_payload_read_bytes: u64,
     pub prefetched_bytes: u64,
     pub peak_pipeline_memory_bytes: u64,
+    pub direct_write_count: usize,
+    pub buffered_write_count: usize,
+    pub preallocation_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -257,6 +261,9 @@ pub struct BlockStats {
     pub reencrypted_cache_hits: usize,
     pub payload_source_cache_files: usize,
     pub payload_source_memory_bytes: u64,
+    pub cache_pack_hits: usize,
+    pub cache_pack_misses: usize,
+    pub cache_pack_fallbacks: usize,
 }
 
 #[derive(Debug, Clone)]

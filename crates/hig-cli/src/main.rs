@@ -5,6 +5,7 @@ use hig_core::{
 };
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -134,9 +135,14 @@ enum Command {
         trust_metadata: bool,
         #[arg(
             long,
-            help = "Compare Hig against zip and tar+zstd, writing artifacts/hig-v1.4.1-benchmark.md"
+            help = "Compare Hig against zip and tar+zstd, writing artifacts/hig-v1.4.2-benchmark.md"
         )]
         compare: bool,
+        #[arg(
+            long,
+            help = "Directory used for benchmark temporary files and copy baseline qualification"
+        )]
+        bench_dir: Option<PathBuf>,
     },
 }
 
@@ -229,6 +235,7 @@ fn main() -> anyhow::Result<()> {
             kdf_profile,
             trust_metadata,
             compare,
+            bench_dir,
         } => {
             validate_encryption_args(encryption, password.as_deref())?;
             let kdf_profile = effective_kdf_profile(speed, kdf_profile);
@@ -255,6 +262,7 @@ fn main() -> anyhow::Result<()> {
                         chunk_file_threshold,
                         chunk_size,
                     },
+                    bench_dir,
                 })?;
                 return Ok(());
             }
@@ -324,7 +332,7 @@ fn print_report(label: &str, report: &PackReport) {
     let seconds = report.duration.as_secs_f64().max(0.000_001);
     let mib = report.input_bytes as f64 / 1024.0 / 1024.0;
     println!(
-        "{label}: files={} input_bytes={} archive_bytes={} duration_ms={} throughput_mib_s={:.2} encryption={:?} speed={:?} kdf_profile={:?} workers={} writer_strategy={:?} preallocated_bytes={} cached_payload_opens={} cached_payload_read_bytes={} prefetched_bytes={} peak_pipeline_memory_bytes={} scan_ms={} plan_ms={} kdf_ms={} kdf_overlapped_ms={} read_ms={} compression_ms={} crypto_ms={} pack_blocks_ms={} manifest_ms={} write_ms={} payload_read_ms={} payload_write_ms={} writer_wait_ms={} output_flush_ms={} output_rename_ms={} cache_hits={} cache_misses={} cache_hit_rate={:.2}% hashed_files={} metadata_hash_reuses={} scan_cache_hits={} scan_cache_misses={} scan_cache_hit_rate={:.2}% chunk_metadata_reuses={} chunk_metadata_misses={} trusted_bytes_skipped={} batch_blocks={} single_blocks={} batched_files={} batch_cache_hits={} batch_cache_misses={} chunked_files={} chunk_blocks={} chunk_cache_hits={} chunk_cache_misses={} chunk_bytes_reused={} chunk_bytes_compressed={} chunk_plan_cache_hits={} chunk_plan_cache_misses={} sealed_block_hits={} sealed_block_misses={} sealed_bytes_reused={} reencrypted_cache_hits={} payload_source_cache_files={} payload_source_memory_bytes={}",
+        "{label}: files={} input_bytes={} archive_bytes={} duration_ms={} throughput_mib_s={:.2} encryption={:?} speed={:?} kdf_profile={:?} workers={} writer_strategy={:?} preallocated_bytes={} preallocation_enabled={} cached_payload_opens={} cached_range_opens={} cached_payload_read_bytes={} prefetched_bytes={} direct_writes={} buffered_writes={} peak_pipeline_memory_bytes={} scan_ms={} plan_ms={} kdf_ms={} kdf_overlapped_ms={} read_ms={} compression_ms={} crypto_ms={} pack_blocks_ms={} manifest_ms={} write_ms={} payload_read_ms={} payload_write_ms={} writer_wait_ms={} output_flush_ms={} output_rename_ms={} cache_hits={} cache_misses={} cache_hit_rate={:.2}% hashed_files={} metadata_hash_reuses={} scan_cache_hits={} scan_cache_misses={} scan_cache_hit_rate={:.2}% chunk_metadata_reuses={} chunk_metadata_misses={} trusted_bytes_skipped={} batch_blocks={} single_blocks={} batched_files={} batch_cache_hits={} batch_cache_misses={} chunked_files={} chunk_blocks={} chunk_cache_hits={} chunk_cache_misses={} chunk_bytes_reused={} chunk_bytes_compressed={} chunk_plan_cache_hits={} chunk_plan_cache_misses={} sealed_block_hits={} sealed_block_misses={} sealed_bytes_reused={} reencrypted_cache_hits={} payload_source_cache_files={} payload_source_memory_bytes={} cache_pack_hits={} cache_pack_misses={} cache_pack_fallbacks={}",
         report.input_files,
         report.input_bytes,
         report.archive_bytes,
@@ -336,9 +344,13 @@ fn print_report(label: &str, report: &PackReport) {
         report.worker_count,
         report.writer_strategy,
         report.archive_preallocated_bytes,
+        report.preallocation_enabled,
         report.cached_payload_open_count,
+        report.cached_range_open_count,
         report.cached_payload_read_bytes,
         report.prefetched_bytes,
+        report.direct_write_count,
+        report.buffered_write_count,
         report.peak_pipeline_memory_bytes,
         report.timings.scan_ms,
         report.timings.plan_ms,
@@ -384,7 +396,10 @@ fn print_report(label: &str, report: &PackReport) {
         report.blocks.sealed_bytes_reused,
         report.blocks.reencrypted_cache_hits,
         report.blocks.payload_source_cache_files,
-        report.blocks.payload_source_memory_bytes
+        report.blocks.payload_source_memory_bytes,
+        report.blocks.cache_pack_hits,
+        report.blocks.cache_pack_misses,
+        report.blocks.cache_pack_fallbacks
     );
 }
 
@@ -413,9 +428,13 @@ struct BenchmarkRow {
     payload_write_ms: Option<u128>,
     writer_strategy: Option<String>,
     archive_preallocated_bytes: Option<u64>,
+    preallocation_enabled: Option<bool>,
     cached_payload_open_count: Option<usize>,
+    cached_range_open_count: Option<usize>,
     cached_payload_read_bytes: Option<u64>,
     prefetched_bytes: Option<u64>,
+    direct_write_count: Option<usize>,
+    buffered_write_count: Option<usize>,
     peak_pipeline_memory_bytes: Option<u64>,
     payload_read_ms: Option<u128>,
     writer_wait_ms: Option<u128>,
@@ -436,6 +455,9 @@ struct BenchmarkRow {
     reencrypted_cache_hits: Option<usize>,
     payload_source_cache_files: Option<usize>,
     payload_source_memory_bytes: Option<u64>,
+    cache_pack_hits: Option<usize>,
+    cache_pack_misses: Option<usize>,
+    cache_pack_fallbacks: Option<usize>,
     notes: String,
 }
 
@@ -451,12 +473,26 @@ struct CompareOptions {
     use_cache: bool,
     batch: BatchOptions,
     chunk: ChunkOptions,
+    bench_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct CopyProbe {
+    path: PathBuf,
+    free_bytes: u64,
+    used_percent: f64,
+    copy_32_mib_median: f64,
+    copy_32_mib_p95: f64,
+    copy_256_mib_median: f64,
+    copy_256_mib_p95: f64,
+    qualified: bool,
 }
 
 fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
     let input_dir = options.input_dir.canonicalize()?;
     let input_bytes = dir_size(&input_dir)?;
-    let work_dir = benchmark_work_dir()?;
+    let probe = select_benchmark_volume(options.bench_dir.as_deref(), options.output.parent())?;
+    let work_dir = benchmark_work_dir(Some(&probe.path))?;
     let cache_dir = options
         .cache_dir
         .unwrap_or_else(|| work_dir.join("hig-cache"));
@@ -769,10 +805,10 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
     rows.push(run_tar_zstd_benchmark(&input_dir, &work_dir, input_bytes)?);
     rows.push(run_7z_benchmark(&input_dir, input_bytes));
 
-    let markdown = render_markdown(&input_dir, &rows);
+    let markdown = render_markdown(&input_dir, &rows, &probe);
     fs::create_dir_all("artifacts")?;
-    fs::write("artifacts/hig-v1.4.1-benchmark.md", markdown)?;
-    println!("benchmark: wrote artifacts/hig-v1.4.1-benchmark.md");
+    fs::write("artifacts/hig-v1.4.2-benchmark.md", markdown)?;
+    println!("benchmark: wrote artifacts/hig-v1.4.2-benchmark.md");
     Ok(())
 }
 
@@ -801,9 +837,13 @@ fn row_from_report(tool: &str, report: &PackReport, notes: &str) -> BenchmarkRow
         payload_write_ms: Some(report.timings.payload_write_ms),
         writer_strategy: Some(format!("{:?}", report.writer_strategy)),
         archive_preallocated_bytes: Some(report.archive_preallocated_bytes),
+        preallocation_enabled: Some(report.preallocation_enabled),
         cached_payload_open_count: Some(report.cached_payload_open_count),
+        cached_range_open_count: Some(report.cached_range_open_count),
         cached_payload_read_bytes: Some(report.cached_payload_read_bytes),
         prefetched_bytes: Some(report.prefetched_bytes),
+        direct_write_count: Some(report.direct_write_count),
+        buffered_write_count: Some(report.buffered_write_count),
         peak_pipeline_memory_bytes: Some(report.peak_pipeline_memory_bytes),
         payload_read_ms: Some(report.timings.payload_read_ms),
         writer_wait_ms: Some(report.timings.writer_wait_ms),
@@ -824,6 +864,9 @@ fn row_from_report(tool: &str, report: &PackReport, notes: &str) -> BenchmarkRow
         reencrypted_cache_hits: Some(report.blocks.reencrypted_cache_hits),
         payload_source_cache_files: Some(report.blocks.payload_source_cache_files),
         payload_source_memory_bytes: Some(report.blocks.payload_source_memory_bytes),
+        cache_pack_hits: Some(report.blocks.cache_pack_hits),
+        cache_pack_misses: Some(report.blocks.cache_pack_misses),
+        cache_pack_fallbacks: Some(report.blocks.cache_pack_fallbacks),
         notes: notes.to_string(),
     }
 }
@@ -873,9 +916,13 @@ fn run_zip_benchmark(
         payload_write_ms: None,
         writer_strategy: None,
         archive_preallocated_bytes: None,
+        preallocation_enabled: None,
         cached_payload_open_count: None,
+        cached_range_open_count: None,
         cached_payload_read_bytes: None,
         prefetched_bytes: None,
+        direct_write_count: None,
+        buffered_write_count: None,
         peak_pipeline_memory_bytes: None,
         payload_read_ms: None,
         writer_wait_ms: None,
@@ -896,6 +943,9 @@ fn run_zip_benchmark(
         reencrypted_cache_hits: None,
         payload_source_cache_files: None,
         payload_source_memory_bytes: None,
+        cache_pack_hits: None,
+        cache_pack_misses: None,
+        cache_pack_fallbacks: None,
         notes: "zip -qr".to_string(),
     })
 }
@@ -962,9 +1012,13 @@ fn run_tar_zstd_benchmark(
         payload_write_ms: None,
         writer_strategy: None,
         archive_preallocated_bytes: None,
+        preallocation_enabled: None,
         cached_payload_open_count: None,
+        cached_range_open_count: None,
         cached_payload_read_bytes: None,
         prefetched_bytes: None,
+        direct_write_count: None,
+        buffered_write_count: None,
         peak_pipeline_memory_bytes: None,
         payload_read_ms: None,
         writer_wait_ms: None,
@@ -985,6 +1039,9 @@ fn run_tar_zstd_benchmark(
         reencrypted_cache_hits: None,
         payload_source_cache_files: None,
         payload_source_memory_bytes: None,
+        cache_pack_hits: None,
+        cache_pack_misses: None,
+        cache_pack_fallbacks: None,
         notes: "tar -cf + zstd -1".to_string(),
     })
 }
@@ -1025,9 +1082,13 @@ fn skipped_row(tool: &str, input_bytes: u64, notes: &str) -> BenchmarkRow {
         payload_write_ms: None,
         writer_strategy: None,
         archive_preallocated_bytes: None,
+        preallocation_enabled: None,
         cached_payload_open_count: None,
+        cached_range_open_count: None,
         cached_payload_read_bytes: None,
         prefetched_bytes: None,
+        direct_write_count: None,
+        buffered_write_count: None,
         peak_pipeline_memory_bytes: None,
         payload_read_ms: None,
         writer_wait_ms: None,
@@ -1048,14 +1109,38 @@ fn skipped_row(tool: &str, input_bytes: u64, notes: &str) -> BenchmarkRow {
         reencrypted_cache_hits: None,
         payload_source_cache_files: None,
         payload_source_memory_bytes: None,
+        cache_pack_hits: None,
+        cache_pack_misses: None,
+        cache_pack_fallbacks: None,
         notes: notes.to_string(),
     }
 }
 
-fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow]) -> String {
+fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow], probe: &CopyProbe) -> String {
     let mut output = String::new();
-    output.push_str("# Hig v1.4.1 Benchmark\n\n");
+    output.push_str("# Hig v1.4.2 Benchmark\n\n");
     output.push_str(&format!("Input: `{}`\n\n", input_dir.display()));
+    output.push_str("## Environment Qualification\n\n");
+    output.push_str(&format!(
+        "Status: `{}`\n\n",
+        if probe.qualified {
+            "QUALIFIED"
+        } else {
+            "ENVIRONMENT_NOT_QUALIFIED"
+        }
+    ));
+    output.push_str("| path | free bytes | used % | 32MiB cp median MiB/s | 32MiB cp p95 MiB/s | 256MiB cp median MiB/s | 256MiB cp p95 MiB/s |\n");
+    output.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+    output.push_str(&format!(
+        "| `{}` | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |\n\n",
+        probe.path.display(),
+        probe.free_bytes,
+        probe.used_percent,
+        probe.copy_32_mib_median,
+        probe.copy_32_mib_p95,
+        probe.copy_256_mib_median,
+        probe.copy_256_mib_p95
+    ));
     let headers = [
         "tool",
         "encryption",
@@ -1064,9 +1149,13 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow]) -> String {
         "workers",
         "writer",
         "preallocated bytes",
+        "preallocation",
         "cached opens",
+        "cached range opens",
         "cached read bytes",
         "prefetched bytes",
+        "direct writes",
+        "buffered writes",
         "peak pipeline bytes",
         "input bytes",
         "archive bytes",
@@ -1092,6 +1181,9 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow]) -> String {
         "reencrypted cache hits",
         "payload cache files",
         "payload memory bytes",
+        "cache pack hits",
+        "cache pack misses",
+        "cache pack fallbacks",
         "cache hit rate",
         "scan cache hit rate",
         "chunk metadata reuses",
@@ -1158,9 +1250,13 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow]) -> String {
         let payload_write_ms = optional_to_string(row.payload_write_ms);
         let writer_strategy = optional_to_string(row.writer_strategy.as_ref());
         let preallocated = optional_to_string(row.archive_preallocated_bytes);
+        let preallocation = optional_to_string(row.preallocation_enabled);
         let cached_opens = optional_to_string(row.cached_payload_open_count);
+        let cached_range_opens = optional_to_string(row.cached_range_open_count);
         let cached_read_bytes = optional_to_string(row.cached_payload_read_bytes);
         let prefetched_bytes = optional_to_string(row.prefetched_bytes);
+        let direct_writes = optional_to_string(row.direct_write_count);
+        let buffered_writes = optional_to_string(row.buffered_write_count);
         let peak_pipeline_bytes = optional_to_string(row.peak_pipeline_memory_bytes);
         let payload_read_ms = optional_to_string(row.payload_read_ms);
         let writer_wait_ms = optional_to_string(row.writer_wait_ms);
@@ -1172,6 +1268,9 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow]) -> String {
         let reencrypted = optional_to_string(row.reencrypted_cache_hits);
         let payload_files = optional_to_string(row.payload_source_cache_files);
         let payload_memory = optional_to_string(row.payload_source_memory_bytes);
+        let cache_pack_hits = optional_to_string(row.cache_pack_hits);
+        let cache_pack_misses = optional_to_string(row.cache_pack_misses);
+        let cache_pack_fallbacks = optional_to_string(row.cache_pack_fallbacks);
         let chunk_metadata_reuses = optional_to_string(row.chunk_metadata_reuses);
         let trusted_bytes_skipped = optional_to_string(row.trusted_bytes_skipped);
         let batch_blocks = row
@@ -1212,9 +1311,13 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow]) -> String {
             workers,
             writer_strategy,
             preallocated,
+            preallocation,
             cached_opens,
+            cached_range_opens,
             cached_read_bytes,
             prefetched_bytes,
+            direct_writes,
+            buffered_writes,
             peak_pipeline_bytes,
             row.input_bytes.to_string(),
             archive_bytes,
@@ -1240,6 +1343,9 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow]) -> String {
             reencrypted,
             payload_files,
             payload_memory,
+            cache_pack_hits,
+            cache_pack_misses,
+            cache_pack_fallbacks,
             cache_hit_rate,
             scan_cache_hit_rate,
             chunk_metadata_reuses,
@@ -1294,12 +1400,153 @@ fn dir_size(path: &Path) -> anyhow::Result<u64> {
     Ok(total)
 }
 
-fn benchmark_work_dir() -> anyhow::Result<PathBuf> {
+fn select_benchmark_volume(
+    requested: Option<&Path>,
+    output_parent: Option<&Path>,
+) -> anyhow::Result<CopyProbe> {
+    let mut candidates = Vec::new();
+    if let Some(path) = requested {
+        candidates.push(path.to_path_buf());
+    }
+    if let Some(path) = output_parent {
+        candidates.push(path.to_path_buf());
+    }
+    candidates.push(std::env::temp_dir());
+    candidates.push(PathBuf::from("/tmp"));
+    candidates.push(PathBuf::from("/private/tmp"));
+    candidates.sort();
+    candidates.dedup();
+
+    let mut probes = Vec::new();
+    for candidate in candidates {
+        if fs::create_dir_all(&candidate).is_err() {
+            continue;
+        }
+        if let Ok(probe) = copy_probe(&candidate) {
+            if probe.qualified {
+                return Ok(probe);
+            }
+            probes.push(probe);
+        }
+    }
+    probes
+        .into_iter()
+        .max_by(|left, right| {
+            left.copy_256_mib_median
+                .partial_cmp(&right.copy_256_mib_median)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no usable benchmark directory found"))
+}
+
+fn copy_probe(path: &Path) -> anyhow::Result<CopyProbe> {
+    let probe_dir = benchmark_work_dir(Some(path))?;
+    let copy_32 = copy_speed_samples(&probe_dir, 32 * 1024 * 1024, 3)?;
+    let copy_256 = copy_speed_samples(&probe_dir, 256 * 1024 * 1024, 3)?;
+    let (free_bytes, used_percent) = volume_stats(path)?;
+    let probe = CopyProbe {
+        path: path.to_path_buf(),
+        free_bytes,
+        used_percent,
+        copy_32_mib_median: median(&copy_32),
+        copy_32_mib_p95: p95(&copy_32),
+        copy_256_mib_median: median(&copy_256),
+        copy_256_mib_p95: p95(&copy_256),
+        qualified: median(&copy_256) >= 650.0
+            && p95(&copy_256) >= 500.0
+            && free_bytes >= 20 * 1024 * 1024 * 1024
+            && used_percent < 90.0,
+    };
+    let _ = fs::remove_dir_all(probe_dir);
+    Ok(probe)
+}
+
+fn copy_speed_samples(dir: &Path, bytes: usize, runs: usize) -> anyhow::Result<Vec<f64>> {
+    let source = dir.join(format!("copy-source-{bytes}.bin"));
+    let mut file = fs::File::create(&source)?;
+    let chunk = vec![0xA5_u8; 1024 * 1024];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let len = remaining.min(chunk.len());
+        file.write_all(&chunk[..len])?;
+        remaining -= len;
+    }
+    drop(file);
+
+    let mut speeds = Vec::with_capacity(runs);
+    for run in 0..runs {
+        let target = dir.join(format!("copy-target-{bytes}-{run}.bin"));
+        let started = Instant::now();
+        copy_file_buffered(&source, &target)?;
+        let seconds = started.elapsed().as_secs_f64().max(0.000_001);
+        speeds.push(bytes as f64 / 1024.0 / 1024.0 / seconds);
+        let _ = fs::remove_file(target);
+    }
+    let _ = fs::remove_file(source);
+    Ok(speeds)
+}
+
+fn copy_file_buffered(source: &Path, target: &Path) -> anyhow::Result<()> {
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::File::create(target)?;
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn volume_stats(path: &Path) -> anyhow::Result<(u64, f64)> {
+    let output = ProcessCommand::new("df").arg("-k").arg(path).output()?;
+    if !output.status.success() {
+        anyhow::bail!("df failed for {}", path.display());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("df output missing data line"))?;
+    let columns = line.split_whitespace().collect::<Vec<_>>();
+    if columns.len() < 5 {
+        anyhow::bail!("unexpected df output: {line}");
+    }
+    let free_kib = columns[3].parse::<u64>()?;
+    let used_percent = columns[4].trim_end_matches('%').parse::<f64>()?;
+    Ok((free_kib * 1024, used_percent))
+}
+
+fn median(values: &[f64]) -> f64 {
+    percentile(values, 0.5)
+}
+
+fn p95(values: &[f64]) -> f64 {
+    percentile(values, 0.95)
+}
+
+fn percentile(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut values = values.to_vec();
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let index = ((values.len() - 1) as f64 * percentile).ceil() as usize;
+    values[index]
+}
+
+fn benchmark_work_dir(base: Option<&Path>) -> anyhow::Result<PathBuf> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("hig-bench-{}-{nanos}", std::process::id()));
+    let root = base
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = root.join(format!("hig-bench-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&path)?;
     Ok(path)
 }

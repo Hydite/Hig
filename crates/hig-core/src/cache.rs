@@ -1,7 +1,8 @@
 use crate::crypto::{KdfParams, NONCE_LEN, SALT_LEN};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
@@ -103,6 +104,10 @@ pub struct SealedCacheRecord {
     pub sealed_file: String,
     pub codec: String,
     pub kind: String,
+    #[serde(default)]
+    pub pack_file: Option<String>,
+    #[serde(default)]
+    pub pack_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +213,13 @@ impl CacheStore {
         self.root.join("blocks").join(&record.sealed_file)
     }
 
+    pub fn sealed_pack_path(&self, record: &SealedCacheRecord) -> Option<PathBuf> {
+        record
+            .pack_file
+            .as_ref()
+            .map(|file| self.root.join("sealed-packs").join(file))
+    }
+
     pub fn get_path_record(&self, relative_path: &str) -> Option<&PathCacheRecord> {
         self.index.paths.get(relative_path)
     }
@@ -261,11 +273,15 @@ impl CacheStore {
     pub fn insert_sealed(
         &mut self,
         key: &[u8; 32],
-        record: SealedCacheRecord,
+        mut record: SealedCacheRecord,
         ciphertext: &[u8],
     ) -> anyhow::Result<()> {
         let block_path = self.root.join("blocks").join(&record.sealed_file);
         atomic_write(&block_path, ciphertext)?;
+        if let Some((pack_file, offset)) = self.append_sealed_pack(ciphertext)? {
+            record.pack_file = Some(pack_file);
+            record.pack_offset = Some(offset);
+        }
         self.index.sealed_records.insert(hex::encode(key), record);
         Ok(())
     }
@@ -281,6 +297,24 @@ impl CacheStore {
         let bytes = serde_json::to_vec_pretty(&self.index)?;
         fs::write(self.root.join("index.json"), bytes)?;
         Ok(())
+    }
+
+    fn append_sealed_pack(&self, ciphertext: &[u8]) -> anyhow::Result<Option<(String, u64)>> {
+        let Some(key_id) = self.index.sealed_key_id else {
+            return Ok(None);
+        };
+        let pack_file = format!("{}.pack", hex::encode(key_id));
+        let pack_dir = self.root.join("sealed-packs");
+        fs::create_dir_all(&pack_dir)?;
+        let pack_path = pack_dir.join(&pack_file);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&pack_path)?;
+        let offset = file.seek(SeekFrom::End(0))?;
+        file.write_all(ciphertext)?;
+        Ok(Some((pack_file, offset)))
     }
 }
 
@@ -448,6 +482,8 @@ mod tests {
                                 sealed_file: sealed_cache_file(&key),
                                 codec: "zstd".to_string(),
                                 kind: "chunk".to_string(),
+                                pack_file: None,
+                                pack_offset: None,
                             },
                             &ciphertext,
                         )
@@ -481,6 +517,8 @@ mod tests {
                     sealed_file: sealed_cache_file(&block_key),
                     codec: "zstd".to_string(),
                     kind: "chunk".to_string(),
+                    pack_file: None,
+                    pack_offset: None,
                 },
                 b"sealed",
             )
@@ -490,9 +528,52 @@ mod tests {
         let record = reopened.get_sealed_record(&block_key).unwrap();
         assert_eq!(record.encrypted_size, 6);
         assert!(reopened.sealed_block_path(record).exists());
+        assert!(record.pack_file.is_some());
+        assert!(reopened.sealed_pack_path(record).unwrap().exists());
 
         let mut reopened = CacheStore::open(temp.path()).unwrap();
         reopened.prepare_sealed_key(kdf, &[8_u8; 32]);
         assert!(reopened.get_sealed_record(&block_key).is_none());
+    }
+
+    #[test]
+    fn old_sealed_cache_record_without_pack_fields_deserializes() {
+        let record: SealedCacheRecord = serde_json::from_str(
+            r#"{"block_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"nonce":[2,2,2,2,2,2,2,2,2,2,2,2],"raw_size":3,"compressed_size":4,"encrypted_size":6,"sealed_file":"a.sealed","codec":"zstd","kind":"chunk"}"#,
+        )
+        .unwrap();
+        assert!(record.pack_file.is_none());
+        assert!(record.pack_offset.is_none());
+    }
+
+    #[test]
+    fn sealed_pack_record_points_to_appended_ciphertext() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = CacheStore::open(temp.path()).unwrap();
+        cache.prepare_sealed_key(KdfParams::default(), &[7_u8; 32]);
+        let key = *blake3::hash(b"block").as_bytes();
+        cache
+            .insert_sealed(
+                &key,
+                SealedCacheRecord {
+                    block_id: [1; 32],
+                    nonce: [2; NONCE_LEN],
+                    raw_size: 3,
+                    compressed_size: 4,
+                    encrypted_size: 6,
+                    sealed_file: sealed_cache_file(&key),
+                    codec: "zstd".to_string(),
+                    kind: "chunk".to_string(),
+                    pack_file: None,
+                    pack_offset: None,
+                },
+                b"sealed",
+            )
+            .unwrap();
+        let record = cache.get_sealed_record(&key).unwrap();
+        let pack = cache.sealed_pack_path(record).unwrap();
+        let offset = record.pack_offset.unwrap();
+        let bytes = fs::read(pack).unwrap();
+        assert_eq!(&bytes[offset as usize..offset as usize + 6], b"sealed");
     }
 }
