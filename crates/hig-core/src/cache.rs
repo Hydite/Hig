@@ -1,9 +1,24 @@
 use crate::crypto::{KdfParams, NONCE_LEN, SALT_LEN};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheSignature(Vec<(String, u64, u128)>);
+
+#[derive(Debug, Clone)]
+struct L1IndexEntry {
+    signature: CacheSignature,
+    index: CacheIndex,
+    index_format: String,
+    shards_read: usize,
+}
+
+static L1_INDEX_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, L1IndexEntry>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub struct CacheStats {
@@ -133,22 +148,62 @@ pub struct CacheStore {
     root: PathBuf,
     index: CacheIndex,
     dirty: bool,
+    index_format: String,
+    shards_read: usize,
+    shards_written: usize,
+    dirty_shards: BTreeSet<String>,
+    l1_index_hit: bool,
 }
 
 impl CacheStore {
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("blocks"))?;
+        fs::create_dir_all(root.join("index-v2"))?;
+        let root = root.canonicalize().unwrap_or(root);
         let index_path = root.join("index.json");
-        let index = if index_path.exists() {
-            serde_json::from_slice(&fs::read(index_path)?)?
+        let signature = cache_signature(&root)?;
+        let cached = L1_INDEX_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow::anyhow!("L1 cache index lock poisoned"))?
+            .get(&root)
+            .filter(|entry| entry.signature == signature)
+            .cloned();
+        let l1_index_hit = cached.is_some();
+        let migration_complete = root.join("index-v2").join(".complete").exists();
+        let (index, index_format, shards_read) = if let Some(cached) = cached {
+            (cached.index, cached.index_format, cached.shards_read)
+        } else if has_v2_shards(&root)? {
+            let (sharded, count) = read_v2_shards(&root)?;
+            if index_path.exists() && !migration_complete {
+                let mut legacy: CacheIndex = serde_json::from_slice(&fs::read(&index_path)?)?;
+                merge_cache_index(&mut legacy, sharded);
+                (legacy, "hybrid".to_string(), count)
+            } else {
+                (sharded, "index-v2".to_string(), count)
+            }
+        } else if index_path.exists() {
+            (
+                serde_json::from_slice(&fs::read(index_path)?)?,
+                "json".to_string(),
+                0,
+            )
         } else {
-            CacheIndex::default()
+            (CacheIndex::default(), "empty".to_string(), 0)
         };
+        if !l1_index_hit {
+            update_l1_index(&root, signature, &index, &index_format, shards_read)?;
+        }
         Ok(Self {
             root,
             index,
             dirty: false,
+            index_format,
+            shards_read,
+            shards_written: 0,
+            dirty_shards: BTreeSet::new(),
+            l1_index_hit,
         })
     }
 
@@ -217,6 +272,7 @@ impl CacheStore {
         let salt = crate::crypto::random_bytes::<SALT_LEN>();
         self.index.sealed_salt = Some(salt);
         self.dirty = true;
+        self.dirty_shards.insert("meta".to_string());
         salt
     }
 
@@ -224,12 +280,16 @@ impl CacheStore {
         let key_id = sealed_key_id(key);
         if self.index.sealed_key_id != Some(key_id) {
             self.index.sealed_records.clear();
+            let _ = fs::remove_dir_all(self.root.join("index-v2"));
+            let _ = fs::create_dir_all(self.root.join("index-v2"));
             self.index.sealed_key_id = Some(key_id);
             self.dirty = true;
+            self.dirty_shards.insert("meta".to_string());
         }
         if self.index.sealed_kdf_params.as_ref() != Some(&kdf) {
             self.index.sealed_kdf_params = Some(kdf);
             self.dirty = true;
+            self.dirty_shards.insert("meta".to_string());
         }
     }
 
@@ -274,6 +334,7 @@ impl CacheStore {
         if self.index.records.get(&hash_hex) != Some(&record) {
             self.index.records.insert(hash_hex, record);
             self.dirty = true;
+            self.mark_dirty_key(hash);
         }
         Ok(())
     }
@@ -302,6 +363,7 @@ impl CacheStore {
         if self.index.records.get(&key_hex) != Some(&record) {
             self.index.records.insert(key_hex, record);
             self.dirty = true;
+            self.mark_dirty_key(key);
         }
         self.record_object(key, source_hash, level, "single", compressed.len() as u64);
         Ok(())
@@ -325,8 +387,9 @@ impl CacheStore {
             kind: kind.to_string(),
         };
         if self.index.objects.get(&key) != Some(&record) {
-            self.index.objects.insert(key, record);
+            self.index.objects.insert(key.clone(), record);
             self.dirty = true;
+            self.mark_dirty_hex(&key);
         }
     }
 
@@ -340,6 +403,7 @@ impl CacheStore {
             compressed,
         )?;
         self.dirty = true;
+        self.mark_dirty_key(key);
         Ok(())
     }
 
@@ -353,6 +417,7 @@ impl CacheStore {
             compressed,
         )?;
         self.dirty = true;
+        self.mark_dirty_key(hash);
         Ok(())
     }
 
@@ -370,25 +435,162 @@ impl CacheStore {
         }
         self.index.sealed_records.insert(hex::encode(key), record);
         self.dirty = true;
+        self.mark_dirty_key(key);
         Ok(())
     }
 
     pub fn upsert_path_record(&mut self, record: PathCacheRecord) -> anyhow::Result<()> {
         let path = record.relative_path.clone();
         if self.index.paths.get(&path) != Some(&record) {
+            self.mark_dirty_path(&path);
             self.index.paths.insert(path, record);
             self.dirty = true;
         }
         Ok(())
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
+    pub fn save(&mut self) -> anyhow::Result<()> {
         if !self.dirty {
             return Ok(());
         }
+        let completing_migration = matches!(self.index_format.as_str(), "json" | "hybrid");
+        if completing_migration {
+            self.mark_all_shards_dirty();
+        }
         let bytes = serde_json::to_vec_pretty(&self.index)?;
         atomic_write(&self.root.join("index.json"), &bytes)?;
+        self.write_v2_dirty_shards()?;
+        if completing_migration {
+            atomic_write(&self.root.join("index-v2").join(".complete"), b"v1\n")?;
+        }
+        self.index_format = "index-v2".to_string();
+        self.dirty = false;
+        update_l1_index(
+            &self.root,
+            cache_signature(&self.root)?,
+            &self.index,
+            &self.index_format,
+            self.shards_read.max(self.shards_written),
+        )?;
         Ok(())
+    }
+
+    pub fn index_format(&self) -> &str {
+        &self.index_format
+    }
+
+    pub fn shards_read(&self) -> usize {
+        self.shards_read
+    }
+
+    pub fn shards_written(&self) -> usize {
+        self.shards_written
+    }
+
+    pub fn dirty_shard_count(&self) -> usize {
+        self.dirty_shards.len()
+    }
+
+    pub fn l1_index_hit(&self) -> bool {
+        self.l1_index_hit
+    }
+
+    fn mark_dirty_key(&mut self, key: &[u8; 32]) {
+        self.dirty_shards.insert(hex::encode(&key[..2]));
+    }
+
+    fn mark_dirty_hex(&mut self, key_hex: &str) {
+        self.dirty_shards
+            .insert(key_hex.chars().take(4).collect::<String>());
+    }
+
+    fn mark_dirty_path(&mut self, path: &str) {
+        self.dirty_shards.insert(path_shard(path));
+    }
+
+    fn mark_all_shards_dirty(&mut self) {
+        let record_shards = self
+            .index
+            .records
+            .keys()
+            .map(|key| key[..4].to_string())
+            .collect::<Vec<_>>();
+        let object_shards = self
+            .index
+            .objects
+            .keys()
+            .map(|key| key[..4].to_string())
+            .collect::<Vec<_>>();
+        let sealed_shards = self
+            .index
+            .sealed_records
+            .keys()
+            .map(|key| key[..4].to_string())
+            .collect::<Vec<_>>();
+        let path_shards = self
+            .index
+            .paths
+            .keys()
+            .map(|path| path_shard(path))
+            .collect::<Vec<_>>();
+        self.dirty_shards.extend(record_shards);
+        self.dirty_shards.extend(object_shards);
+        self.dirty_shards.extend(sealed_shards);
+        self.dirty_shards.extend(path_shards);
+        if self.dirty_shards.is_empty() {
+            self.dirty_shards.insert("meta".to_string());
+        }
+    }
+
+    fn write_v2_dirty_shards(&mut self) -> anyhow::Result<()> {
+        let shards = self.dirty_shards.iter().cloned().collect::<Vec<_>>();
+        for shard in shards {
+            let index = self.shard_index(&shard);
+            let bytes = bincode::serialize(&index)?;
+            atomic_write(
+                &self.root.join("index-v2").join(format!("{shard}.bin")),
+                &bytes,
+            )?;
+            self.shards_written += 1;
+        }
+        self.dirty_shards.clear();
+        Ok(())
+    }
+
+    fn shard_index(&self, shard: &str) -> CacheIndex {
+        CacheIndex {
+            records: self
+                .index
+                .records
+                .iter()
+                .filter(|(key, _)| key.starts_with(shard))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            paths: self
+                .index
+                .paths
+                .iter()
+                .filter(|(path, _)| path_shard(path) == shard)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            sealed_salt: self.index.sealed_salt,
+            sealed_kdf_params: self.index.sealed_kdf_params.clone(),
+            sealed_key_id: self.index.sealed_key_id,
+            sealed_records: self
+                .index
+                .sealed_records
+                .iter()
+                .filter(|(key, _)| key.starts_with(shard))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            objects: self
+                .index
+                .objects
+                .iter()
+                .filter(|(key, _)| key.starts_with(shard))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        }
     }
 
     fn append_sealed_pack(&self, ciphertext: &[u8]) -> anyhow::Result<Option<(String, u64)>> {
@@ -408,6 +610,82 @@ impl CacheStore {
         file.write_all(ciphertext)?;
         Ok(Some((pack_file, offset)))
     }
+}
+
+fn update_l1_index(
+    root: &Path,
+    signature: CacheSignature,
+    index: &CacheIndex,
+    index_format: &str,
+    shards_read: usize,
+) -> anyhow::Result<()> {
+    L1_INDEX_CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow::anyhow!("L1 cache index lock poisoned"))?
+        .insert(
+            root.to_path_buf(),
+            L1IndexEntry {
+                signature,
+                index: index.clone(),
+                index_format: index_format.to_string(),
+                shards_read,
+            },
+        );
+    Ok(())
+}
+
+fn cache_signature(root: &Path) -> anyhow::Result<CacheSignature> {
+    let mut entries = Vec::new();
+    let json = root.join("index.json");
+    if let Ok(metadata) = fs::metadata(&json) {
+        entries.push(signature_entry("index.json".to_string(), &metadata));
+    }
+    let shard_dir = root.join("index-v2");
+    if shard_dir.exists() {
+        let complete = shard_dir.join(".complete");
+        if let Ok(metadata) = fs::metadata(&complete) {
+            entries.push(signature_entry(".complete".to_string(), &metadata));
+        }
+        for entry in fs::read_dir(shard_dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("bin") {
+                continue;
+            }
+            entries.push(signature_entry(
+                entry.file_name().to_string_lossy().to_string(),
+                &entry.metadata()?,
+            ));
+        }
+    }
+    entries.sort_unstable();
+    Ok(CacheSignature(entries))
+}
+
+fn merge_cache_index(base: &mut CacheIndex, newer: CacheIndex) {
+    base.records.extend(newer.records);
+    base.paths.extend(newer.paths);
+    base.sealed_records.extend(newer.sealed_records);
+    base.objects.extend(newer.objects);
+    if newer.sealed_salt.is_some() {
+        base.sealed_salt = newer.sealed_salt;
+    }
+    if newer.sealed_kdf_params.is_some() {
+        base.sealed_kdf_params = newer.sealed_kdf_params;
+    }
+    if newer.sealed_key_id.is_some() {
+        base.sealed_key_id = newer.sealed_key_id;
+    }
+}
+
+fn signature_entry(name: String, metadata: &fs::Metadata) -> (String, u64, u128) {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    (name, metadata.len(), modified)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -433,6 +711,52 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             Err(error.into())
         }
     }
+}
+
+fn has_v2_shards(root: &Path) -> anyhow::Result<bool> {
+    let dir = root.join("index-v2");
+    if !dir.exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) == Some("bin") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_v2_shards(root: &Path) -> anyhow::Result<(CacheIndex, usize)> {
+    let mut merged = CacheIndex::default();
+    let mut count = 0;
+    for entry in fs::read_dir(root.join("index-v2"))? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("bin") {
+            continue;
+        }
+        let shard: CacheIndex = bincode::deserialize(&fs::read(entry.path())?)?;
+        merged.records.extend(shard.records);
+        merged.paths.extend(shard.paths);
+        merged.sealed_records.extend(shard.sealed_records);
+        merged.objects.extend(shard.objects);
+        if shard.sealed_salt.is_some() {
+            merged.sealed_salt = shard.sealed_salt;
+        }
+        if shard.sealed_kdf_params.is_some() {
+            merged.sealed_kdf_params = shard.sealed_kdf_params;
+        }
+        if shard.sealed_key_id.is_some() {
+            merged.sealed_key_id = shard.sealed_key_id;
+        }
+        count += 1;
+    }
+    Ok((merged, count))
+}
+
+fn path_shard(path: &str) -> String {
+    let hash = blake3::hash(path.as_bytes());
+    hex::encode(&hash.as_bytes()[..2])
 }
 
 pub fn sealed_cache_file(key: &[u8; 32]) -> String {
@@ -515,6 +839,91 @@ mod tests {
         let record = reopened.get_path_record("a.txt").unwrap();
         assert_eq!(record.content_hash, hash);
         assert_eq!(record.mtime_ns, 123);
+    }
+
+    #[test]
+    fn binary_shard_index_is_preferred_after_first_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let hash = *blake3::hash(b"data").as_bytes();
+        let mut cache = CacheStore::open(temp.path()).unwrap();
+        cache.insert(&hash, 4, b"zstd").unwrap();
+        cache.save().unwrap();
+
+        let reopened = CacheStore::open(temp.path()).unwrap();
+        assert_eq!(reopened.index_format(), "index-v2");
+        assert_eq!(reopened.shards_read(), 1);
+        assert_eq!(reopened.get(&hash).unwrap().unwrap(), b"zstd");
+    }
+
+    #[test]
+    fn corrupted_binary_shard_fails_fast() {
+        let temp = tempfile::tempdir().unwrap();
+        let shard_dir = temp.path().join("index-v2");
+        fs::create_dir_all(&shard_dir).unwrap();
+        fs::write(shard_dir.join("0000.bin"), b"not a cache shard").unwrap();
+        assert!(CacheStore::open(temp.path()).is_err());
+    }
+
+    #[test]
+    fn partial_v2_migration_keeps_legacy_records_until_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = *blake3::hash(b"first").as_bytes();
+        let second = *blake3::hash(b"second").as_bytes();
+        fs::create_dir_all(temp.path().join("blocks")).unwrap();
+        fs::create_dir_all(temp.path().join("index-v2")).unwrap();
+        let record = |hash: [u8; 32]| CacheRecord {
+            hash_hex: hex::encode(hash),
+            block_file: format!("{}.zst", hex::encode(hash)),
+            original_size: 1,
+            compressed_size: 1,
+            codec: "zstd".to_string(),
+            level: Some(1),
+            policy_version: Some(1),
+            source_hash: Some(hash),
+        };
+        let mut legacy = CacheIndex::default();
+        legacy.records.insert(hex::encode(first), record(first));
+        legacy.records.insert(hex::encode(second), record(second));
+        fs::write(
+            temp.path()
+                .join("blocks")
+                .join(format!("{}.zst", hex::encode(first))),
+            b"a",
+        )
+        .unwrap();
+        fs::write(
+            temp.path()
+                .join("blocks")
+                .join(format!("{}.zst", hex::encode(second))),
+            b"b",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("index.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let mut partial = CacheIndex::default();
+        partial.records.insert(hex::encode(first), record(first));
+        fs::write(
+            temp.path()
+                .join("index-v2")
+                .join(format!("{}.bin", hex::encode(&first[..2]))),
+            bincode::serialize(&partial).unwrap(),
+        )
+        .unwrap();
+
+        let mut cache = CacheStore::open(temp.path()).unwrap();
+        assert_eq!(cache.index_format(), "hybrid");
+        assert!(cache.has(&first));
+        assert!(cache.has(&second));
+        cache.dirty = true;
+        cache.save().unwrap();
+
+        let reopened = CacheStore::open(temp.path()).unwrap();
+        assert_eq!(reopened.index_format(), "index-v2");
+        assert!(reopened.has(&first));
+        assert!(reopened.has(&second));
     }
 
     #[test]

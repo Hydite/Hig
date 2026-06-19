@@ -5,11 +5,12 @@ use crate::cache::{
 use crate::codec;
 use crate::crypto::{self, KdfParams, NONCE_LEN, SALT_LEN};
 use crate::scan::{ScanOptions, scan_dir, unix_ns};
+use crate::session::{derive_session_binding, lookup_session};
 use crate::writer::{ArchiveWriter, PayloadSource};
 use crate::{
     ArchiveFormat, ArchiveSizeBreakdown, BatchOptions, BlockStats, ChunkOptions, Compression,
-    EncryptionMode, IoOptions, ManifestFormat, PackCriticalTimings, PackOptions, PackReport,
-    PackTimings, SpeedMode, UnpackOptions,
+    EncryptionMode, IoOptions, L1CacheReport, L2CacheReport, ManifestFormat, PackCriticalTimings,
+    PackOptions, PackReport, PackTimings, SessionReport, SolidMode, SpeedMode, UnpackOptions,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -164,6 +165,7 @@ pub enum BlockKind {
     Batch,
     Single,
     Chunk,
+    Solid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +231,7 @@ impl BlockKind {
             Self::Batch => 1,
             Self::Single => 2,
             Self::Chunk => 3,
+            Self::Solid => 4,
         }
     }
 }
@@ -279,6 +282,7 @@ enum PlannedBlock {
         raw_size: u64,
         batch_key: [u8; 32],
         level: i32,
+        kind: BlockKind,
     },
     Chunk {
         file_index: usize,
@@ -294,6 +298,7 @@ enum PlannedBlock {
 struct WarmSummary {
     single_blocks: usize,
     batch_blocks: usize,
+    solid_blocks: usize,
     chunk_blocks: usize,
     single_bytes: u64,
     batch_bytes: u64,
@@ -312,6 +317,7 @@ enum WarmKind {
         key: [u8; 32],
         source_hash: [u8; 32],
         level: i32,
+        kind: BlockKind,
     },
     Chunk {
         key: [u8; 32],
@@ -332,8 +338,14 @@ pub fn pack(options: PackOptions) -> anyhow::Result<PackReport> {
     if options.format == ArchiveFormat::HigV1 && options.encryption != EncryptionMode::Password {
         anyhow::bail!("HIGV1 only supports password encryption");
     }
-    if options.encryption == EncryptionMode::Password && options.password.is_none() {
+    if options.encryption == EncryptionMode::Password
+        && options.password.is_none()
+        && !options.use_session
+    {
         anyhow::bail!("password encryption requires a password");
+    }
+    if options.format == ArchiveFormat::HigV1 && options.use_session {
+        anyhow::bail!("HIGV1 does not support session keys; use HIGV2 or provide --password");
     }
     if options.encryption == EncryptionMode::None && options.password.is_some() {
         anyhow::bail!("--password cannot be used with encryption mode none");
@@ -447,7 +459,7 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
             })?;
         }
     }
-    if let Some(cache_store) = cache.as_ref() {
+    if let Some(cache_store) = cache.as_mut() {
         cache_store.save()?;
     }
 
@@ -556,6 +568,16 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
                 .saturating_sub(HEADER_FIXED_LEN as u64 + manifest_ciphertext.len() as u64),
             total_archive_bytes: archive_bytes,
         },
+        session: SessionReport::default(),
+        l1: L1CacheReport::default(),
+        l2: L2CacheReport {
+            cache_index_format: "json".to_string(),
+            cache_index_open_ms: 0,
+            cache_index_commit_ms: 0,
+            cache_shards_read: 0,
+            cache_shards_written: 0,
+            cache_shard_dirty_count: 0,
+        },
     })
 }
 
@@ -599,7 +621,29 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     };
     let cache_open_ms = cache_open_started.elapsed().as_millis();
     let kdf = options.kdf_profile.params();
-    let salt = if sealed_enabled {
+    let session_binding =
+        derive_session_binding(&cache_dir, options.kdf_profile, &kdf, options.encryption);
+    let session_lookup_started = Instant::now();
+    let session_lookup = if options.encryption == EncryptionMode::Password
+        && options.use_cache
+        && options.use_session
+    {
+        lookup_session(&cache_dir, &session_binding)?
+    } else {
+        None
+    };
+    let session_lookup_ms = session_lookup_started.elapsed().as_millis();
+    if options.session_required && session_lookup.is_none() {
+        anyhow::bail!("no valid Hig session found; run `hig session unlock` first");
+    }
+    let session_used = session_lookup.is_some();
+    let session_key_age_secs = session_lookup
+        .as_ref()
+        .map(|session| session.age_secs)
+        .unwrap_or(0);
+    let salt = if let Some(session) = session_lookup.as_ref() {
+        session.salt
+    } else if sealed_enabled {
         cache
             .as_mut()
             .map(CacheStore::sealed_salt_or_create)
@@ -609,7 +653,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     };
     let scan_kdf_started = Instant::now();
     let kdf_task = match options.encryption {
-        EncryptionMode::Password => {
+        EncryptionMode::Password if session_lookup.is_none() => {
             let password = required_password(&options.password)?.to_owned();
             let task_kdf = kdf.clone();
             Some(std::thread::spawn(move || {
@@ -618,6 +662,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 Ok::<_, anyhow::Error>((key, started.elapsed().as_millis()))
             }))
         }
+        EncryptionMode::Password => None,
         EncryptionMode::None => None,
     };
     let scan_started = Instant::now();
@@ -637,14 +682,15 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     let mut cache_stats = CacheStats::default();
     let mut block_stats = BlockStats::default();
 
-    let (key, kdf_ms) = match kdf_task {
-        Some(task) => {
+    let (key, kdf_ms) = match (session_lookup, kdf_task) {
+        (Some(session), _) => (Some(session.key), 0),
+        (None, Some(task)) => {
             let (key, elapsed) = task
                 .join()
                 .map_err(|_| anyhow::anyhow!("KDF worker panicked"))??;
             (Some(key), elapsed)
         }
-        None => (None, 0),
+        (None, None) => (None, 0),
     };
     let scan_kdf_wall_ms = scan_kdf_started.elapsed().as_millis();
     let plan_started = Instant::now();
@@ -654,6 +700,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         options.chunk,
         options.speed,
         options.level,
+        options.solid,
     )?;
     let plan_ms = plan_started.elapsed().as_millis();
     if sealed_enabled && let Some(cache_store) = cache.as_mut() {
@@ -835,15 +882,22 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 raw_size,
                 batch_key,
                 level,
+                kind,
             } => {
-                block_stats.batch_blocks += 1;
+                if kind == BlockKind::Solid {
+                    block_stats.solid_groups += 1;
+                    block_stats.solid_files += file_indices.len();
+                    block_stats.solid_group_bytes += raw_size;
+                } else {
+                    block_stats.batch_blocks += 1;
+                    block_stats.batched_files += file_indices.len();
+                }
                 *block_stats
                     .compression_level_counts
                     .entry(level)
                     .or_default() += 1;
-                block_stats.batched_files += file_indices.len();
                 let object_key =
-                    compressed_object_key(options.compression, level, BlockKind::Batch, &batch_key);
+                    compressed_object_key(options.compression, level, kind, &batch_key);
                 if sealed_enabled
                     && let Some((mut sealed_entry, payload, source)) =
                         try_sealed_payload(cache.as_ref(), &object_key)?
@@ -855,7 +909,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                         SealedPayloadSource::Pack => block_stats.cache_pack_hits += 1,
                         SealedPayloadSource::File => block_stats.cache_pack_fallbacks += 1,
                     }
-                    sealed_entry.kind = BlockKind::Batch;
+                    sealed_entry.kind = kind;
                     let mut block_offset = 0_u64;
                     for index in &file_indices {
                         let file = &files[*index];
@@ -890,7 +944,11 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
                     if let Some(bytes) = cache_store.get_batch(&object_key)? {
-                        block_stats.batch_cache_hits += 1;
+                        if kind == BlockKind::Solid {
+                            block_stats.solid_cache_hits += 1;
+                        } else {
+                            block_stats.batch_cache_hits += 1;
+                        }
                         block_stats.parameterized_cache_hits += 1;
                         cache_stats.bytes_reused += raw_size;
                         if sealed_enabled {
@@ -900,12 +958,20 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     } else if level == 1
                         && let Some(bytes) = cache_store.get_batch(&batch_key)?
                     {
-                        block_stats.batch_cache_hits += 1;
+                        if kind == BlockKind::Solid {
+                            block_stats.solid_cache_hits += 1;
+                        } else {
+                            block_stats.batch_cache_hits += 1;
+                        }
                         block_stats.legacy_cache_hits += 1;
                         cache_stats.bytes_reused += raw_size;
                         bytes
                     } else {
-                        block_stats.batch_cache_misses += 1;
+                        if kind == BlockKind::Solid {
+                            block_stats.solid_cache_misses += 1;
+                        } else {
+                            block_stats.batch_cache_misses += 1;
+                        }
                         block_stats.cache_policy_misses += 1;
                         cache_stats.bytes_compressed += raw_size;
                         let raw = build_batch_raw(&files, &file_indices)?;
@@ -915,13 +981,17 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                             &object_key,
                             &batch_key,
                             level,
-                            "batch",
+                            block_kind_name(kind),
                             bytes.len() as u64,
                         );
                         bytes
                     }
                 } else {
-                    block_stats.batch_cache_misses += 1;
+                    if kind == BlockKind::Solid {
+                        block_stats.solid_cache_misses += 1;
+                    } else {
+                        block_stats.batch_cache_misses += 1;
+                    }
                     cache_stats.bytes_compressed += raw_size;
                     let raw = build_batch_raw(&files, &file_indices)?;
                     codec::compress(options.compression, &raw, level)?
@@ -952,7 +1022,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                             nonce,
                             raw_size,
                             compressed_size: compressed.len() as u64,
-                            kind: BlockKind::Batch,
+                            kind,
                         },
                         &ciphertext,
                     )?;
@@ -989,7 +1059,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                         archive_offset: 0,
                         nonce,
                         codec: "zstd".to_string(),
-                        kind: BlockKind::Batch,
+                        kind,
                     },
                     payload,
                     compression_level: level,
@@ -1180,6 +1250,10 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         .batch_cache_hits
         .saturating_sub(warm_summary.batch_blocks);
     block_stats.batch_cache_misses += warm_summary.batch_blocks;
+    block_stats.solid_cache_hits = block_stats
+        .solid_cache_hits
+        .saturating_sub(warm_summary.solid_blocks);
+    block_stats.solid_cache_misses += warm_summary.solid_blocks;
     block_stats.chunk_cache_hits = block_stats
         .chunk_cache_hits
         .saturating_sub(warm_summary.chunk_blocks);
@@ -1189,10 +1263,15 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         .saturating_sub(warm_summary.chunk_bytes);
     block_stats.chunk_bytes_compressed += warm_summary.chunk_bytes;
     block_stats.reencrypted_cache_hits = block_stats.reencrypted_cache_hits.saturating_sub(
-        warm_summary.single_blocks + warm_summary.batch_blocks + warm_summary.chunk_blocks,
+        warm_summary.single_blocks
+            + warm_summary.batch_blocks
+            + warm_summary.solid_blocks
+            + warm_summary.chunk_blocks,
     );
-    let warmed_blocks =
-        warm_summary.single_blocks + warm_summary.batch_blocks + warm_summary.chunk_blocks;
+    let warmed_blocks = warm_summary.single_blocks
+        + warm_summary.batch_blocks
+        + warm_summary.solid_blocks
+        + warm_summary.chunk_blocks;
     block_stats.parameterized_cache_hits = block_stats
         .parameterized_cache_hits
         .saturating_sub(warmed_blocks);
@@ -1243,10 +1322,26 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         upsert_path_cache(cache.as_mut(), file, options.chunk.chunk_size, &path_chunks)?;
     }
     let cache_commit_started = Instant::now();
-    if let Some(cache_store) = cache.as_ref() {
+    let cache_dirty_shard_count = cache
+        .as_ref()
+        .map(CacheStore::dirty_shard_count)
+        .unwrap_or(0);
+    if let Some(cache_store) = cache.as_mut() {
         cache_store.save()?;
     }
     let cache_commit_ms = cache_commit_started.elapsed().as_millis();
+    let cache_index_format = cache
+        .as_ref()
+        .map(|store| store.index_format().to_string())
+        .unwrap_or_else(|| "disabled".to_string());
+    let cache_shards_read = cache.as_ref().map(CacheStore::shards_read).unwrap_or(0);
+    let cache_shards_written = cache.as_ref().map(CacheStore::shards_written).unwrap_or(0);
+    let l1_index_hits = usize::from(
+        cache
+            .as_ref()
+            .map(CacheStore::l1_index_hit)
+            .unwrap_or(false),
+    );
 
     let manifest_started = Instant::now();
     file_entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -1373,6 +1468,26 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
             payload_bytes: archive_bytes
                 .saturating_sub(HEADER_FIXED_LEN as u64 + manifest_ciphertext.len() as u64),
             total_archive_bytes: archive_bytes,
+        },
+        session: SessionReport {
+            session_used,
+            session_lookup_ms,
+            session_key_age_secs,
+            kdf_skipped_by_session: session_used,
+        },
+        l1: L1CacheReport {
+            l1_index_hits,
+            l1_metadata_hits: 0,
+            l1_scratch_reuses: 0,
+            rayon_pool_reused: options.threads.is_none(),
+        },
+        l2: L2CacheReport {
+            cache_index_format,
+            cache_index_open_ms: cache_open_ms,
+            cache_index_commit_ms: cache_commit_ms,
+            cache_shards_read,
+            cache_shards_written,
+            cache_shard_dirty_count: cache_dirty_shard_count,
         },
     })
 }
@@ -1567,6 +1682,7 @@ fn plan_blocks(
     chunk_options: ChunkOptions,
     speed: SpeedMode,
     explicit_level: Option<i32>,
+    solid: SolidMode,
 ) -> anyhow::Result<Vec<PlannedBlock>> {
     if chunk_options.enabled && chunk_options.chunk_size == 0 {
         anyhow::bail!("chunk size must be greater than zero");
@@ -1574,6 +1690,8 @@ fn plan_blocks(
     let mut plans = Vec::new();
     let mut current = Vec::new();
     let mut current_size = 0_u64;
+    let mut solid_current = Vec::new();
+    let mut solid_current_size = 0_u64;
     let inline_level = explicit_level.unwrap_or(if speed == SpeedMode::Fastest { 1 } else { 5 });
     for (index, file) in files.iter().enumerate() {
         if chunk_options.enabled && file.size > 0 && file.size >= chunk_options.chunk_file_threshold
@@ -1584,6 +1702,15 @@ fn plan_blocks(
                 &mut current,
                 &mut current_size,
                 inline_level,
+                BlockKind::Batch,
+            );
+            flush_batch_with_level(
+                files,
+                &mut plans,
+                &mut solid_current,
+                &mut solid_current_size,
+                inline_level,
+                BlockKind::Solid,
             );
             if let Some(chunks) = file.cached_chunks.as_ref() {
                 append_cached_chunk_plans(&mut plans, index, chunks, explicit_level.unwrap_or(1));
@@ -1607,6 +1734,15 @@ fn plan_blocks(
                 &mut current,
                 &mut current_size,
                 inline_level,
+                BlockKind::Batch,
+            );
+            flush_batch_with_level(
+                files,
+                &mut plans,
+                &mut solid_current,
+                &mut solid_current_size,
+                inline_level,
+                BlockKind::Solid,
             );
             plans.push(PlannedBlock::Single {
                 file_index: index,
@@ -1615,17 +1751,28 @@ fn plan_blocks(
             continue;
         }
 
-        if !current.is_empty() && current_size + file.size > batch_options.max_batch_raw_bytes {
-            flush_batch_with_level(
-                files,
-                &mut plans,
+        let use_solid =
+            speed == SpeedMode::Balanced && solid == SolidMode::Auto && is_solid_candidate(file);
+        let (target, target_size, kind, max_raw) = if use_solid {
+            (
+                &mut solid_current,
+                &mut solid_current_size,
+                BlockKind::Solid,
+                8 * 1024 * 1024,
+            )
+        } else {
+            (
                 &mut current,
                 &mut current_size,
-                inline_level,
-            );
+                BlockKind::Batch,
+                batch_options.max_batch_raw_bytes,
+            )
+        };
+        if !target.is_empty() && *target_size + file.size > max_raw {
+            flush_batch_with_level(files, &mut plans, target, target_size, inline_level, kind);
         }
-        current.push(index);
-        current_size += file.size;
+        target.push(index);
+        *target_size += file.size;
     }
     flush_batch_with_level(
         files,
@@ -1633,6 +1780,15 @@ fn plan_blocks(
         &mut current,
         &mut current_size,
         inline_level,
+        BlockKind::Batch,
+    );
+    flush_batch_with_level(
+        files,
+        &mut plans,
+        &mut solid_current,
+        &mut solid_current_size,
+        inline_level,
+        BlockKind::Solid,
     );
     Ok(plans)
 }
@@ -1643,6 +1799,7 @@ fn flush_batch_with_level(
     current: &mut Vec<usize>,
     current_size: &mut u64,
     level: i32,
+    kind: BlockKind,
 ) {
     if current.is_empty() {
         return;
@@ -1656,7 +1813,41 @@ fn flush_batch_with_level(
         raw_size,
         batch_key,
         level,
+        kind,
     });
+}
+
+fn is_solid_candidate(file: &crate::ScannedFile) -> bool {
+    if file.size == 0 || file.size > 256 * 1024 {
+        return false;
+    }
+    let path = file.relative_path.to_ascii_lowercase();
+    matches!(
+        Path::new(&path)
+            .extension()
+            .and_then(|value| value.to_str()),
+        Some(
+            "rs" | "toml"
+                | "md"
+                | "json"
+                | "txt"
+                | "yaml"
+                | "yml"
+                | "c"
+                | "h"
+                | "cpp"
+                | "hpp"
+                | "js"
+                | "ts"
+                | "tsx"
+                | "jsx"
+                | "py"
+                | "go"
+                | "java"
+                | "html"
+                | "css"
+        )
+    )
 }
 
 fn append_chunk_plans(
@@ -1780,9 +1971,12 @@ fn prewarm_compressed_cache(
                 )) || *level == 1 && cache.has(&source))
             }
             PlannedBlock::Batch {
-                batch_key, level, ..
+                batch_key,
+                level,
+                kind,
+                ..
             } => {
-                let key = compressed_object_key(compression, *level, BlockKind::Batch, batch_key);
+                let key = compressed_object_key(compression, *level, *kind, batch_key);
                 !(cache.has_batch(&key) || *level == 1 && cache.has_batch(batch_key))
             }
             PlannedBlock::Chunk {
@@ -1823,16 +2017,13 @@ fn prewarm_compressed_cache(
                     raw_size,
                     batch_key,
                     level,
+                    kind,
                 } => (
                     WarmKind::Batch {
-                        key: compressed_object_key(
-                            compression,
-                            *level,
-                            BlockKind::Batch,
-                            batch_key,
-                        ),
+                        key: compressed_object_key(compression, *level, *kind, batch_key),
                         source_hash: *batch_key,
                         level: *level,
+                        kind: *kind,
                     },
                     *raw_size,
                     build_batch_raw(files, file_indices)?,
@@ -1901,16 +2092,21 @@ fn prewarm_compressed_cache(
                 key,
                 source_hash,
                 level,
+                kind,
             } => {
                 cache.insert_batch(&key, &result.compressed)?;
                 cache.record_object(
                     &key,
                     &source_hash,
                     level,
-                    "batch",
+                    block_kind_name(kind),
                     result.compressed.len() as u64,
                 );
-                summary.batch_blocks += 1;
+                if kind == BlockKind::Solid {
+                    summary.solid_blocks += 1;
+                } else {
+                    summary.batch_blocks += 1;
+                }
                 summary.batch_bytes += result.raw_size;
             }
             WarmKind::Chunk {
@@ -2032,15 +2228,21 @@ fn sealed_kind(name: &str) -> anyhow::Result<BlockKind> {
         "batch" => Ok(BlockKind::Batch),
         "single" => Ok(BlockKind::Single),
         "chunk" => Ok(BlockKind::Chunk),
+        "solid" => Ok(BlockKind::Solid),
         other => anyhow::bail!("unsupported sealed block kind: {other}"),
     }
 }
 
 fn sealed_kind_name(kind: BlockKind) -> &'static str {
+    block_kind_name(kind)
+}
+
+fn block_kind_name(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::Batch => "batch",
         BlockKind::Single => "single",
         BlockKind::Chunk => "chunk",
+        BlockKind::Solid => "solid",
     }
 }
 
@@ -2693,6 +2895,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         };
         let first = pack(options.clone()).unwrap();
         let second = pack(PackOptions {
@@ -2742,6 +2948,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert!(
@@ -2783,6 +2993,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
 
@@ -2830,6 +3044,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
 
@@ -2861,6 +3079,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(first.scan.hashed_files, 2);
@@ -2883,6 +3105,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(second.cache.hits, 2);
@@ -2915,6 +3141,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -2938,6 +3168,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(second.scan.metadata_hash_reuses, 1);
@@ -2973,6 +3207,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 1);
@@ -2989,6 +3227,65 @@ mod tests {
         assert_eq!(fs::read(restored.join("a.txt")).unwrap(), b"alpha");
         assert_eq!(fs::read(restored.join("b.txt")).unwrap(), b"beta");
         assert_eq!(fs::read(restored.join("empty.txt")).unwrap(), b"");
+    }
+
+    #[test]
+    fn higv2_solid_groups_text_files_and_roundtrips() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        let output = temp.path().join("solid.hig");
+        let restored = temp.path().join("restored");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("a.rs"), b"fn a() {}\n").unwrap();
+        fs::write(input.join("b.toml"), b"[package]\nname='b'\n").unwrap();
+        fs::write(input.join("image.bin"), vec![1_u8; 128]).unwrap();
+
+        let report = pack(PackOptions {
+            input_dir: input.clone(),
+            output_file: output.clone(),
+            password: Some("pw".to_string()),
+            encryption: EncryptionMode::Password,
+            cache_dir: None,
+            threads: None,
+            compression: Compression::Zstd,
+            level: Some(1),
+            use_cache: true,
+            trust_metadata: false,
+            format: ArchiveFormat::HigV2,
+            batch: BatchOptions::default(),
+            chunk: ChunkOptions::default(),
+            speed: SpeedMode::Balanced,
+            kdf_profile: crate::KdfProfile::Secure,
+            sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Auto,
+        })
+        .unwrap();
+        assert_eq!(report.blocks.solid_groups, 1);
+        assert_eq!(report.blocks.solid_files, 2);
+        assert_eq!(report.blocks.solid_cache_hits, 0);
+        assert_eq!(report.blocks.solid_cache_misses, 1);
+        assert_eq!(report.blocks.batch_blocks, 1);
+
+        unpack(UnpackOptions {
+            archive_file: output,
+            output_dir: restored.clone(),
+            password: Some("pw".to_string()),
+            overwrite: false,
+        })
+        .unwrap();
+        assert_eq!(fs::read(restored.join("a.rs")).unwrap(), b"fn a() {}\n");
+        assert_eq!(
+            fs::read(restored.join("b.toml")).unwrap(),
+            b"[package]\nname='b'\n"
+        );
+        assert_eq!(
+            fs::read(restored.join("image.bin")).unwrap(),
+            vec![1_u8; 128]
+        );
     }
 
     #[test]
@@ -3020,6 +3317,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 0);
@@ -3052,6 +3353,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 1);
@@ -3084,6 +3389,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         };
         let first = pack(options.clone()).unwrap();
         assert_eq!(first.blocks.batch_cache_misses, 1);
@@ -3123,6 +3432,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert!(
@@ -3164,6 +3477,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         let mut bytes = fs::read(&output).unwrap();
@@ -3248,6 +3565,7 @@ mod tests {
             },
             SpeedMode::Fastest,
             Some(1),
+            SolidMode::Off,
         )
         .unwrap();
         assert_eq!(plans.len(), 2);
@@ -3291,6 +3609,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(report.blocks.chunked_files, 1);
@@ -3340,6 +3662,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         };
         let first = pack(options.clone()).unwrap();
         assert_eq!(first.blocks.chunk_cache_misses, 4);
@@ -3420,6 +3746,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::FastBench,
             sealed_cache: true,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         };
         let first = pack(options.clone()).unwrap();
         assert_eq!(first.blocks.sealed_block_hits, 0);
@@ -3479,6 +3809,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::FastBench,
             sealed_cache: true,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         };
         pack(options.clone()).unwrap();
         let changed_password = pack(PackOptions {
@@ -3517,6 +3851,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::FastBench,
             sealed_cache: true,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         };
         pack(options.clone()).unwrap();
         let sealed = fs::read_dir(cache_dir.join("blocks"))
@@ -3588,6 +3926,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::FastBench,
             sealed_cache: true,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         };
         pack(options.clone()).unwrap();
         let second_path = temp.path().join("second.hig");
@@ -3649,6 +3991,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(report.blocks.chunk_blocks, 0);
@@ -3683,6 +4029,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         };
         pack(options.clone()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -3740,6 +4090,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 1);
@@ -3792,6 +4146,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         assert_eq!(report.encryption_mode, EncryptionMode::None);
@@ -3843,6 +4201,10 @@ mod tests {
             kdf_profile: crate::KdfProfile::Secure,
             sealed_cache: false,
             manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
         })
         .unwrap();
         let mut bytes = fs::read(&archive_path).unwrap();

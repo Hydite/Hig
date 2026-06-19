@@ -3,15 +3,23 @@ mod cache;
 mod codec;
 mod crypto;
 mod scan;
+mod session;
 mod writer;
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub use archive::{pack, unpack};
 pub use cache::{CacheStats, PathChunkRecord};
+pub use crypto::{derive_key, random_bytes};
 pub use scan::{ScanStats, ScannedFile};
+pub use session::{
+    SessionBinding, SessionLookup, SessionMaterial, clear_session, default_session_ttl,
+    derive_session_binding, lookup_session, run_session_server, session_socket_path,
+    session_status,
+};
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
@@ -32,6 +40,10 @@ pub struct PackOptions {
     pub kdf_profile: KdfProfile,
     pub sealed_cache: bool,
     pub manifest_format: ManifestFormat,
+    pub use_session: bool,
+    pub session_required: bool,
+    pub session_ttl_secs: Option<u64>,
+    pub solid: SolidMode,
 }
 
 #[derive(Debug, Clone)]
@@ -54,18 +66,37 @@ pub enum ArchiveFormat {
     HigV2,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpeedMode {
     #[default]
     Balanced,
     Fastest,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManifestFormat {
     #[default]
     Compact,
     Legacy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SolidMode {
+    #[default]
+    Auto,
+    Off,
+}
+
+impl std::str::FromStr for SolidMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            other => anyhow::bail!("unsupported solid mode: {other}"),
+        }
+    }
 }
 
 impl std::str::FromStr for ManifestFormat {
@@ -80,14 +111,14 @@ impl std::str::FromStr for ManifestFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EncryptionMode {
     #[default]
     Password,
     None,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriterStrategy {
     #[default]
     Buffered,
@@ -138,7 +169,7 @@ impl std::str::FromStr for SpeedMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KdfProfile {
     #[default]
     Secure,
@@ -242,6 +273,35 @@ pub struct PackReport {
     pub preallocation_enabled: bool,
     pub critical: PackCriticalTimings,
     pub metadata: ArchiveSizeBreakdown,
+    pub session: SessionReport,
+    pub l1: L1CacheReport,
+    pub l2: L2CacheReport,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionReport {
+    pub session_used: bool,
+    pub session_lookup_ms: u128,
+    pub session_key_age_secs: u64,
+    pub kdf_skipped_by_session: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct L1CacheReport {
+    pub l1_index_hits: usize,
+    pub l1_metadata_hits: usize,
+    pub l1_scratch_reuses: usize,
+    pub rayon_pool_reused: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct L2CacheReport {
+    pub cache_index_format: String,
+    pub cache_index_open_ms: u128,
+    pub cache_index_commit_ms: u128,
+    pub cache_shards_read: usize,
+    pub cache_shards_written: usize,
+    pub cache_shard_dirty_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -315,6 +375,11 @@ pub struct BlockStats {
     pub legacy_cache_hits: usize,
     pub parameterized_cache_hits: usize,
     pub cache_policy_misses: usize,
+    pub solid_groups: usize,
+    pub solid_files: usize,
+    pub solid_cache_hits: usize,
+    pub solid_cache_misses: usize,
+    pub solid_group_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
