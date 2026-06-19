@@ -20,7 +20,7 @@ struct L1IndexEntry {
 
 static L1_INDEX_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, L1IndexEntry>>> = OnceLock::new();
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheStats {
     pub hits: usize,
     pub misses: usize,
@@ -94,6 +94,8 @@ pub struct CacheIndex {
     pub sealed_records: BTreeMap<String, SealedCacheRecord>,
     #[serde(default)]
     pub objects: BTreeMap<String, CacheObjectRecord>,
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,6 +155,18 @@ pub struct CacheStore {
     shards_written: usize,
     dirty_shards: BTreeSet<String>,
     l1_index_hit: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheMaintenanceReport {
+    pub total_bytes: u64,
+    pub budget_bytes: u64,
+    pub files: usize,
+    pub removable_bytes: u64,
+    pub removed_bytes: u64,
+    pub compacted_bytes: u64,
+    pub generation: u64,
+    pub dry_run: bool,
 }
 
 impl CacheStore {
@@ -475,6 +489,145 @@ impl CacheStore {
         Ok(())
     }
 
+    pub fn maintenance_status(&self) -> anyhow::Result<CacheMaintenanceReport> {
+        let (total_bytes, files) = directory_usage(&self.root)?;
+        Ok(CacheMaintenanceReport {
+            total_bytes,
+            budget_bytes: cache_budget(&self.root)?,
+            files,
+            generation: self.index.generation,
+            ..CacheMaintenanceReport::default()
+        })
+    }
+
+    pub fn gc(&mut self, dry_run: bool) -> anyhow::Result<CacheMaintenanceReport> {
+        let mut report = self.maintenance_status()?;
+        report.dry_run = dry_run;
+        if report.total_bytes <= report.budget_bytes {
+            return Ok(report);
+        }
+        let mut candidates = fs::read_dir(self.root.join("blocks"))?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let metadata = entry.metadata().ok()?;
+                if !metadata.is_file()
+                    || entry.path().extension().and_then(|value| value.to_str()) == Some("sealed")
+                {
+                    return None;
+                }
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                Some((modified, metadata.len(), entry.path()))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| candidate.0);
+        for (_, len, path) in candidates {
+            if report.total_bytes.saturating_sub(report.removed_bytes) <= report.budget_bytes {
+                break;
+            }
+            report.removable_bytes += len;
+            if !dry_run {
+                fs::remove_file(&path)?;
+                report.removed_bytes += len;
+                self.remove_index_for_block(&path);
+            }
+        }
+        if !dry_run && report.removed_bytes > 0 {
+            self.save()?;
+        }
+        Ok(report)
+    }
+
+    pub fn compact_sealed(&mut self, dry_run: bool) -> anyhow::Result<CacheMaintenanceReport> {
+        let mut report = self.maintenance_status()?;
+        report.dry_run = dry_run;
+        let records = self
+            .index
+            .sealed_records
+            .iter()
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect::<Vec<_>>();
+        report.compacted_bytes = records
+            .iter()
+            .map(|(_, record)| record.encrypted_size)
+            .sum();
+        if dry_run || records.is_empty() {
+            return Ok(report);
+        }
+        let next_generation = self.index.generation.saturating_add(1);
+        let pack_dir = self.root.join("sealed-packs");
+        fs::create_dir_all(&pack_dir)?;
+        let pack_file = format!("generation-{next_generation}.pack");
+        let temp = pack_dir.join(format!(".{pack_file}.tmp-{}", std::process::id()));
+        let final_path = pack_dir.join(&pack_file);
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        let mut offset = 0_u64;
+        for (key, record) in records {
+            let ciphertext = self.read_sealed_ciphertext(&record)?;
+            anyhow::ensure!(
+                ciphertext.len() as u64 == record.encrypted_size,
+                "sealed cache record length mismatch during compaction"
+            );
+            output.write_all(&ciphertext)?;
+            let updated = self
+                .index
+                .sealed_records
+                .get_mut(&key)
+                .expect("record exists");
+            updated.pack_file = Some(pack_file.clone());
+            updated.pack_offset = Some(offset);
+            offset += ciphertext.len() as u64;
+        }
+        output.sync_all()?;
+        fs::rename(&temp, &final_path)?;
+        self.index.generation = next_generation;
+        self.dirty = true;
+        self.dirty_shards.insert("meta".to_string());
+        self.mark_all_shards_dirty();
+        self.save()?;
+        for entry in fs::read_dir(&pack_dir)? {
+            let entry = entry?;
+            if entry.path() != final_path
+                && entry.path().extension().and_then(|v| v.to_str()) == Some("pack")
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        report.generation = next_generation;
+        Ok(report)
+    }
+
+    fn read_sealed_ciphertext(&self, record: &SealedCacheRecord) -> anyhow::Result<Vec<u8>> {
+        if let (Some(path), Some(offset)) = (self.sealed_pack_path(record), record.pack_offset)
+            && path.exists()
+        {
+            let mut file = fs::File::open(path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut bytes = vec![0_u8; record.encrypted_size as usize];
+            std::io::Read::read_exact(&mut file, &mut bytes)?;
+            return Ok(bytes);
+        }
+        Ok(fs::read(self.sealed_block_path(record))?)
+    }
+
+    fn remove_index_for_block(&mut self, path: &Path) {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            return;
+        };
+        let key = name.split('.').next().unwrap_or_default().to_string();
+        self.index.records.remove(&key);
+        self.index.objects.remove(&key);
+        self.dirty = true;
+        self.mark_dirty_hex(&key);
+    }
+
     pub fn index_format(&self) -> &str {
         &self.index_format
     }
@@ -590,6 +743,7 @@ impl CacheStore {
                 .filter(|(key, _)| key.starts_with(shard))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
+            generation: self.index.generation,
         }
     }
 
@@ -663,6 +817,7 @@ fn cache_signature(root: &Path) -> anyhow::Result<CacheSignature> {
 }
 
 fn merge_cache_index(base: &mut CacheIndex, newer: CacheIndex) {
+    base.generation = base.generation.max(newer.generation);
     base.records.extend(newer.records);
     base.paths.extend(newer.paths);
     base.sealed_records.extend(newer.sealed_records);
@@ -736,6 +891,7 @@ fn read_v2_shards(root: &Path) -> anyhow::Result<(CacheIndex, usize)> {
             continue;
         }
         let shard: CacheIndex = bincode::deserialize(&fs::read(entry.path())?)?;
+        merged.generation = merged.generation.max(shard.generation);
         merged.records.extend(shard.records);
         merged.paths.extend(shard.paths);
         merged.sealed_records.extend(shard.sealed_records);
@@ -752,6 +908,39 @@ fn read_v2_shards(root: &Path) -> anyhow::Result<(CacheIndex, usize)> {
         count += 1;
     }
     Ok((merged, count))
+}
+
+fn directory_usage(root: &Path) -> anyhow::Result<(u64, usize)> {
+    fn visit(path: &Path, bytes: &mut u64, files: &mut usize) -> anyhow::Result<()> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                visit(&entry.path(), bytes, files)?;
+            } else if metadata.is_file() {
+                *bytes = bytes.saturating_add(metadata.len());
+                *files += 1;
+            }
+        }
+        Ok(())
+    }
+
+    let mut bytes = 0_u64;
+    let mut files = 0_usize;
+    visit(root, &mut bytes, &mut files)?;
+    Ok((bytes, files))
+}
+
+fn cache_budget(root: &Path) -> anyhow::Result<u64> {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let available = fs2::available_space(root)?;
+    let proportional = available / 10;
+    let normal = proportional.clamp(5 * GIB, 50 * GIB);
+    if available < 10 * GIB {
+        Ok(normal.min(available.saturating_sub(2 * GIB)))
+    } else {
+        Ok(normal)
+    }
 }
 
 fn path_shard(path: &str) -> String {
@@ -1102,5 +1291,47 @@ mod tests {
         let offset = record.pack_offset.unwrap();
         let bytes = fs::read(pack).unwrap();
         assert_eq!(&bytes[offset as usize..offset as usize + 6], b"sealed");
+    }
+
+    #[test]
+    fn cache_maintenance_dry_run_does_not_modify_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = CacheStore::open(temp.path()).unwrap();
+        let before = cache.maintenance_status().unwrap();
+        let gc = cache.gc(true).unwrap();
+        let compact = cache.compact_sealed(true).unwrap();
+        assert!(gc.dry_run);
+        assert!(compact.dry_run);
+        assert_eq!(before.generation, cache.index.generation);
+    }
+
+    #[test]
+    fn sealed_compaction_switches_generation_and_preserves_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = CacheStore::open(temp.path()).unwrap();
+        cache.prepare_sealed_key(KdfParams::default(), &[9_u8; 32]);
+        let key = *blake3::hash(b"compact-block").as_bytes();
+        cache
+            .insert_sealed(
+                &key,
+                SealedCacheRecord {
+                    block_id: [3; 32],
+                    nonce: [4; NONCE_LEN],
+                    raw_size: 7,
+                    compressed_size: 7,
+                    encrypted_size: 7,
+                    sealed_file: sealed_cache_file(&key),
+                    codec: "zstd".to_string(),
+                    kind: "chunk".to_string(),
+                    pack_file: None,
+                    pack_offset: None,
+                },
+                b"payload",
+            )
+            .unwrap();
+        let report = cache.compact_sealed(false).unwrap();
+        assert_eq!(report.generation, 1);
+        let record = cache.get_sealed_record(&key).unwrap();
+        assert_eq!(cache.read_sealed_ciphertext(record).unwrap(), b"payload");
     }
 }

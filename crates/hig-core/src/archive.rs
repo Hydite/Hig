@@ -6,13 +6,12 @@ use crate::codec;
 use crate::crypto::{self, KdfParams, NONCE_LEN, SALT_LEN};
 use crate::pipeline::{BufferPool, PipelineScheduler, PipelineTask, PipelineTaskClass};
 use crate::scan::{ScanOptions, scan_dir, unix_ns};
-use crate::session::{derive_session_binding, lookup_session};
 use crate::writer::{ArchiveWriter, PayloadSource};
 use crate::{
     ArchiveFormat, ArchiveSizeBreakdown, BatchOptions, BlockStats, ChunkOptions, Compression,
     DaemonMode, EncryptionMode, IoOptions, L1CacheReport, L2CacheReport, ManifestFormat,
-    PackCriticalTimings, PackOptions, PackReport, PackTimings, PipelineReport, SessionReport,
-    SolidMode, SpeedMode, UnpackOptions,
+    PackCriticalTimings, PackOptions, PackReport, PackTimings, PackTimingsUs, PipelineReport,
+    SessionReport, SolidMode, SpeedMode, UnpackOptions,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -307,6 +306,8 @@ struct WarmSummary {
     chunk_bytes: u64,
     read_ms: u128,
     compression_ms: u128,
+    read_us: u64,
+    compression_us: u64,
     scheduler_queue_ms: u128,
     buffer_pool_hits: u64,
     buffer_pool_misses: u64,
@@ -338,6 +339,8 @@ struct WarmResult {
     compressed: Vec<u8>,
     read_ms: u128,
     compression_ms: u128,
+    read_us: u64,
+    compression_us: u64,
 }
 
 pub fn pack(options: PackOptions) -> anyhow::Result<PackReport> {
@@ -360,6 +363,26 @@ pub fn pack(options: PackOptions) -> anyhow::Result<PackReport> {
         ArchiveFormat::HigV1 => pack_v1(options),
         ArchiveFormat::HigV2 => pack_v2(options),
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PackKeyOverride {
+    pub key: [u8; 32],
+    pub salt: [u8; SALT_LEN],
+    pub age_secs: u64,
+    pub session: bool,
+}
+
+pub(crate) fn pack_with_engine_cache(
+    options: PackOptions,
+    cache: &mut CacheStore,
+    key_override: Option<PackKeyOverride>,
+) -> anyhow::Result<PackReport> {
+    anyhow::ensure!(
+        options.format == ArchiveFormat::HigV2,
+        "daemon PackEngine only supports HIGV2"
+    );
+    pack_v2_with_context(options, Some(cache), key_override)
 }
 
 fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
@@ -585,6 +608,10 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
             cache_shard_dirty_count: 0,
         },
         pipeline: PipelineReport::default(),
+        timings_us: PackTimingsUs {
+            total_us: started.elapsed().as_micros() as u64,
+            ..PackTimingsUs::default()
+        },
     })
 }
 
@@ -600,6 +627,14 @@ pub fn unpack(options: UnpackOptions) -> anyhow::Result<()> {
 }
 
 fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
+    pack_v2_with_context(options, None, None)
+}
+
+fn pack_v2_with_context(
+    options: PackOptions,
+    persistent_cache: Option<&mut CacheStore>,
+    key_override: Option<PackKeyOverride>,
+) -> anyhow::Result<PackReport> {
     let started = Instant::now();
     let setup_started = Instant::now();
     let fastest = options.speed == SpeedMode::Fastest;
@@ -619,19 +654,26 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         .cache_dir
         .clone()
         .unwrap_or_else(|| input_dir.join(".hig-cache"));
-    let setup_ms = setup_started.elapsed().as_millis();
+    let setup_us = setup_started.elapsed().as_micros() as u64;
+    let setup_ms = (setup_us / 1000) as u128;
     let cache_open_started = Instant::now();
-    let mut cache = if options.use_cache {
+    let mut owned_cache = if options.use_cache && persistent_cache.is_none() {
         Some(CacheStore::open(&cache_dir)?)
     } else {
         None
     };
-    let cache_open_ms = cache_open_started.elapsed().as_millis();
+    let mut cache = if options.use_cache {
+        persistent_cache.or(owned_cache.as_mut())
+    } else {
+        None
+    };
+    let cache_open_us = cache_open_started.elapsed().as_micros() as u64;
+    let cache_open_ms = (cache_open_us / 1000) as u128;
     let kdf = options.kdf_profile.params();
-    let session_binding =
-        derive_session_binding(&cache_dir, options.kdf_profile, &kdf, options.encryption);
     let daemon_lookup_started = Instant::now();
-    let daemon_active = if options.encryption == EncryptionMode::Password
+    let daemon_active = if key_override.is_some() {
+        true
+    } else if options.encryption == EncryptionMode::Password
         && options.use_cache
         && options.use_session
         && options.pipeline.daemon_mode != DaemonMode::Off
@@ -640,35 +682,29 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     } else {
         false
     };
-    let daemon_lookup_ms = daemon_lookup_started.elapsed().as_millis();
+    let daemon_lookup_us = daemon_lookup_started.elapsed().as_micros() as u64;
+    let daemon_lookup_ms = (daemon_lookup_us / 1000) as u128;
     if options.pipeline.daemon_mode == DaemonMode::Required && !daemon_active {
         anyhow::bail!(
             "no active Hig daemon found; run `hig daemon start` and `hig session unlock` first"
         );
     }
     let session_lookup_started = Instant::now();
-    let session_lookup = if options.encryption == EncryptionMode::Password
-        && options.use_cache
-        && options.use_session
-    {
-        lookup_session(&cache_dir, &session_binding)?
-    } else {
-        None
-    };
-    let session_lookup_ms = session_lookup_started.elapsed().as_millis();
-    if options.session_required && session_lookup.is_none() {
+    if key_override.is_none() && options.use_session {
+        anyhow::bail!("session keys are daemon-owned in v1.8; use --daemon auto or required");
+    }
+    let session_lookup_us = session_lookup_started.elapsed().as_micros() as u64;
+    let session_lookup_ms = (session_lookup_us / 1000) as u128;
+    if options.session_required && key_override.is_none() {
         anyhow::bail!("no valid Hig session found; run `hig session unlock` first");
     }
-    let session_used = session_lookup.is_some();
-    let session_key_age_secs = session_lookup
-        .as_ref()
-        .map(|session| session.age_secs)
-        .unwrap_or(0);
-    let salt = if let Some(session) = session_lookup.as_ref() {
-        session.salt
+    let session_used = key_override.as_ref().is_some_and(|key| key.session);
+    let session_key_age_secs = key_override.as_ref().map(|key| key.age_secs).unwrap_or(0);
+    let salt = if let Some(key) = key_override.as_ref() {
+        key.salt
     } else if sealed_enabled {
         cache
-            .as_mut()
+            .as_deref_mut()
             .map(CacheStore::sealed_salt_or_create)
             .unwrap_or_else(crypto::random_bytes::<SALT_LEN>)
     } else {
@@ -676,16 +712,16 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     };
     let scan_kdf_started = Instant::now();
     let kdf_task = match options.encryption {
-        EncryptionMode::Password if session_lookup.is_none() => {
+        EncryptionMode::Password if key_override.is_some() => None,
+        EncryptionMode::Password => {
             let password = required_password(&options.password)?.to_owned();
             let task_kdf = kdf.clone();
             Some(std::thread::spawn(move || {
                 let started = Instant::now();
                 let key = crypto::derive_key(&password, &salt, &task_kdf)?;
-                Ok::<_, anyhow::Error>((key, started.elapsed().as_millis()))
+                Ok::<_, anyhow::Error>((key, started.elapsed().as_micros() as u64))
             }))
         }
-        EncryptionMode::Password => None,
         EncryptionMode::None => None,
     };
     let scan_started = Instant::now();
@@ -693,20 +729,21 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         &input_dir,
         &cache_dir,
         &options.output_file,
-        cache.as_ref(),
+        cache.as_deref(),
         ScanOptions {
             trust_metadata,
             chunk: options.chunk,
         },
     )?;
-    let scan_ms = scan_started.elapsed().as_millis();
+    let scan_us = scan_started.elapsed().as_micros() as u64;
+    let scan_ms = (scan_us / 1000) as u128;
     let files = scan.files;
     let input_bytes = files.iter().map(|file| file.size).sum::<u64>();
     let mut cache_stats = CacheStats::default();
     let mut block_stats = BlockStats::default();
 
-    let (key, kdf_ms) = match (session_lookup, kdf_task) {
-        (Some(session), _) => (Some(session.key), 0),
+    let (key, kdf_us) = match (key_override, kdf_task) {
+        (Some(override_key), _) => (Some(override_key.key), 0),
         (None, Some(task)) => {
             let (key, elapsed) = task
                 .join()
@@ -715,7 +752,9 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         }
         (None, None) => (None, 0),
     };
-    let scan_kdf_wall_ms = scan_kdf_started.elapsed().as_millis();
+    let kdf_ms = (kdf_us / 1000) as u128;
+    let scan_kdf_wall_us = scan_kdf_started.elapsed().as_micros() as u64;
+    let scan_kdf_wall_ms = (scan_kdf_wall_us / 1000) as u128;
     let plan_started = Instant::now();
     let plans = plan_blocks(
         &files,
@@ -725,7 +764,8 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         options.level,
         options.solid,
     )?;
-    let plan_ms = plan_started.elapsed().as_millis();
+    let plan_us = plan_started.elapsed().as_micros() as u64;
+    let plan_ms = (plan_us / 1000) as u128;
     if sealed_enabled && let Some(cache_store) = cache.as_mut() {
         cache_store.prepare_sealed_key(kdf.clone(), key.as_ref().expect("password mode key"));
     }
@@ -751,6 +791,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     };
     let defer_block_crypto = options.encryption == EncryptionMode::Password && !sealed_enabled;
     let mut crypto_ms = 0_u128;
+    let mut crypto_us = 0_u64;
     for plan in plans {
         match plan {
             PlannedBlock::Single { file_index, level } => {
@@ -768,7 +809,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 );
                 if sealed_enabled
                     && let Some((mut sealed_entry, payload, source)) =
-                        try_sealed_payload(cache.as_ref(), &object_key)?
+                        try_sealed_payload(cache.as_deref(), &object_key)?
                 {
                     block_stats.sealed_block_hits += 1;
                     block_stats.sealed_bytes_reused += sealed_entry.encrypted_size;
@@ -798,7 +839,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                         payload,
                         compression_level: level,
                     });
-                    upsert_path_cache(cache.as_mut(), file, options.chunk.chunk_size, &[])?;
+                    upsert_path_cache(cache.as_deref_mut(), file, options.chunk.chunk_size, &[])?;
                     continue;
                 }
                 if sealed_enabled {
@@ -861,7 +902,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 let block_id = *blake3::hash(&compressed).as_bytes();
                 if sealed_enabled {
                     write_sealed_payload(
-                        cache.as_mut(),
+                        cache.as_deref_mut(),
                         &object_key,
                         SealedPayloadMeta {
                             block_id,
@@ -904,7 +945,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     payload,
                     compression_level: level,
                 });
-                upsert_path_cache(cache.as_mut(), file, options.chunk.chunk_size, &[])?;
+                upsert_path_cache(cache.as_deref_mut(), file, options.chunk.chunk_size, &[])?;
             }
             PlannedBlock::Batch {
                 file_indices,
@@ -929,7 +970,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                     compressed_object_key(options.compression, level, kind, &batch_key);
                 if sealed_enabled
                     && let Some((mut sealed_entry, payload, source)) =
-                        try_sealed_payload(cache.as_ref(), &object_key)?
+                        try_sealed_payload(cache.as_deref(), &object_key)?
                 {
                     block_stats.sealed_block_hits += 1;
                     block_stats.sealed_bytes_reused += sealed_entry.encrypted_size;
@@ -958,7 +999,12 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                             }),
                         });
                         block_offset += file.size;
-                        upsert_path_cache(cache.as_mut(), file, options.chunk.chunk_size, &[])?;
+                        upsert_path_cache(
+                            cache.as_deref_mut(),
+                            file,
+                            options.chunk.chunk_size,
+                            &[],
+                        )?;
                     }
                     prepared.push(PreparedV2Block {
                         entry: sealed_entry,
@@ -1044,7 +1090,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 let block_id = *blake3::hash(&compressed).as_bytes();
                 if sealed_enabled {
                     write_sealed_payload(
-                        cache.as_mut(),
+                        cache.as_deref_mut(),
                         &object_key,
                         SealedPayloadMeta {
                             block_id,
@@ -1077,7 +1123,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                         }),
                     });
                     block_offset += file.size;
-                    upsert_path_cache(cache.as_mut(), file, options.chunk.chunk_size, &[])?;
+                    upsert_path_cache(cache.as_deref_mut(), file, options.chunk.chunk_size, &[])?;
                 }
                 prepared.push(PreparedV2Block {
                     entry: V2BlockEntry {
@@ -1121,7 +1167,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 let file = &files[file_index];
                 if sealed_enabled
                     && let Some((mut sealed_entry, payload, source)) =
-                        try_sealed_payload(cache.as_ref(), &object_key)?
+                        try_sealed_payload(cache.as_deref(), &object_key)?
                 {
                     block_stats.sealed_block_hits += 1;
                     block_stats.sealed_bytes_reused += sealed_entry.encrypted_size;
@@ -1221,7 +1267,7 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 let block_id = *blake3::hash(&compressed).as_bytes();
                 if sealed_enabled {
                     write_sealed_payload(
-                        cache.as_mut(),
+                        cache.as_deref_mut(),
                         &object_key,
                         SealedPayloadMeta {
                             block_id,
@@ -1319,7 +1365,8 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
                 *plaintext = ciphertext;
                 Ok(())
             })?;
-        crypto_ms += crypto_started.elapsed().as_millis();
+        crypto_us += crypto_started.elapsed().as_micros() as u64;
+        crypto_ms = (crypto_us / 1000) as u128;
         block_stats.payload_source_memory_bytes = prepared
             .iter()
             .filter_map(|block| match &block.payload {
@@ -1328,7 +1375,8 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
             })
             .sum();
     }
-    let pack_blocks_ms = pack_blocks_started.elapsed().as_millis();
+    let pack_blocks_us = pack_blocks_started.elapsed().as_micros() as u64;
+    let pack_blocks_ms = (pack_blocks_us / 1000) as u128;
     for (file_index, chunks) in chunk_refs {
         block_stats.chunked_files += 1;
         let file = &files[file_index];
@@ -1348,26 +1396,35 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
             block_len: file.size,
             layout: Some(FileLayout::Chunked { chunks }),
         });
-        upsert_path_cache(cache.as_mut(), file, options.chunk.chunk_size, &path_chunks)?;
+        upsert_path_cache(
+            cache.as_deref_mut(),
+            file,
+            options.chunk.chunk_size,
+            &path_chunks,
+        )?;
     }
     let cache_commit_started = Instant::now();
     let cache_dirty_shard_count = cache
-        .as_ref()
+        .as_deref()
         .map(CacheStore::dirty_shard_count)
         .unwrap_or(0);
     if let Some(cache_store) = cache.as_mut() {
         cache_store.save()?;
     }
-    let cache_commit_ms = cache_commit_started.elapsed().as_millis();
+    let cache_commit_us = cache_commit_started.elapsed().as_micros() as u64;
+    let cache_commit_ms = (cache_commit_us / 1000) as u128;
     let cache_index_format = cache
         .as_ref()
         .map(|store| store.index_format().to_string())
         .unwrap_or_else(|| "disabled".to_string());
-    let cache_shards_read = cache.as_ref().map(CacheStore::shards_read).unwrap_or(0);
-    let cache_shards_written = cache.as_ref().map(CacheStore::shards_written).unwrap_or(0);
+    let cache_shards_read = cache.as_deref().map(CacheStore::shards_read).unwrap_or(0);
+    let cache_shards_written = cache
+        .as_deref()
+        .map(CacheStore::shards_written)
+        .unwrap_or(0);
     let l1_index_hits = usize::from(
         cache
-            .as_ref()
+            .as_deref()
             .map(CacheStore::l1_index_hit)
             .unwrap_or(false),
     );
@@ -1387,8 +1444,13 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     };
 
     let manifest_nonce = crypto::random_bytes::<NONCE_LEN>();
+    let manifest_serialize_started = Instant::now();
     let manifest_plain = encode_v2_manifest(&manifest, &prepared, options.manifest_format)?;
+    let manifest_serialize_us = manifest_serialize_started.elapsed().as_micros() as u64;
+    let manifest_compress_started = Instant::now();
     let manifest_compressed = codec::compress(Compression::Zstd, &manifest_plain, 1)?;
+    let manifest_compress_us = manifest_compress_started.elapsed().as_micros() as u64;
+    let manifest_encrypt_started = Instant::now();
     let manifest_ciphertext = protect_payload_timed(
         options.encryption,
         key.as_ref(),
@@ -1396,14 +1458,18 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         &manifest_compressed,
         &mut crypto_ms,
     )?;
-    let manifest_ms = manifest_started.elapsed().as_millis();
+    let manifest_encrypt_us = manifest_encrypt_started.elapsed().as_micros() as u64;
+    let manifest_us = manifest_started.elapsed().as_micros() as u64;
+    let manifest_ms = (manifest_us / 1000) as u128;
 
     let write_started = Instant::now();
     let expected_len = archive_len(
         manifest_ciphertext.len() as u64,
         prepared.iter().map(|block| block.entry.encrypted_size),
     )?;
+    let output_create_started = Instant::now();
     let mut out = ArchiveWriter::create(&options.output_file, expected_len, IoOptions::default())?;
+    let output_create_us = output_create_started.elapsed().as_micros() as u64;
     write_header(
         &mut out,
         MAGIC_V2,
@@ -1424,7 +1490,8 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     out.write_payloads(&payloads)?;
     let writer_report = out.finish()?;
     let archive_bytes = expected_len;
-    let write_ms = write_started.elapsed().as_millis();
+    let write_us = write_started.elapsed().as_micros() as u64;
+    let write_ms = (write_us / 1000) as u128;
     let peak_pipeline_memory_bytes = writer_report
         .peak_pipeline_memory_bytes
         .max(block_stats.payload_source_memory_bytes);
@@ -1441,6 +1508,9 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     let cache_pack_range_hits = block_stats.cache_pack_hits as u64;
     let cache_pack_open_count = writer_report.cached_range_open_count as u64;
     let pipeline_peak_memory_bytes = peak_pipeline_memory_bytes;
+    let scan_walk_us = scan.stats.walk_us;
+    let scan_metadata_us = scan.stats.metadata_us;
+    let scan_hash_us = scan.stats.hash_us;
     Ok(PackReport {
         input_files: files.len(),
         input_bytes,
@@ -1534,6 +1604,38 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
             hot_metadata_reuses: 0,
             pipeline_peak_memory_bytes: pipeline_peak_memory_bytes
                 .max(warm_summary.peak_buffer_pool_bytes),
+        },
+        timings_us: PackTimingsUs {
+            total_us: started.elapsed().as_micros() as u64,
+            daemon_connect_us: (daemon_lookup_ms * 1000) as u64,
+            socket_request_us: (session_lookup_ms * 1000) as u64,
+            walk_us: scan_walk_us,
+            metadata_us: scan_metadata_us,
+            hash_us: scan_hash_us,
+            plan_us,
+            read_us: warm_summary.read_us,
+            compression_us: warm_summary.compression_us,
+            crypto_us,
+            cache_commit_us,
+            cache_hot_lookup_us: cache_open_us,
+            manifest_serialize_us,
+            manifest_compress_us,
+            manifest_encrypt_us,
+            output_create_us,
+            output_write_us: write_us,
+            output_flush_us: writer_report.flush_us,
+            output_rename_us: writer_report.rename_us,
+            unattributed_us: started.elapsed().as_micros().saturating_sub(
+                setup_us as u128
+                    + cache_open_us as u128
+                    + scan_kdf_wall_us as u128
+                    + plan_us as u128
+                    + pack_blocks_us as u128
+                    + cache_commit_us as u128
+                    + manifest_us as u128
+                    + write_us as u128,
+            ) as u64,
+            ..PackTimingsUs::default()
         },
     })
 }
@@ -2171,7 +2273,8 @@ fn prewarm_compressed_cache(
             };
             let mut raw = buffer_pool.get(raw_size as usize);
             fill_planned_raw(plan, files, raw.bytes_mut())?;
-            let read_ms = read_started.elapsed().as_millis();
+            let read_us = read_started.elapsed().as_micros() as u64;
+            let read_ms = (read_us / 1000) as u128;
             let compression_started = Instant::now();
             let level = match plan {
                 PlannedBlock::Single { level, .. }
@@ -2179,12 +2282,15 @@ fn prewarm_compressed_cache(
                 | PlannedBlock::Chunk { level, .. } => *level,
             };
             let compressed = codec::compress(compression, raw.bytes(), level)?;
+            let compression_us = compression_started.elapsed().as_micros() as u64;
             Ok(WarmResult {
                 kind,
                 raw_size,
                 compressed,
                 read_ms,
-                compression_ms: compression_started.elapsed().as_millis(),
+                compression_ms: (compression_us / 1000) as u128,
+                read_us,
+                compression_us,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -2199,6 +2305,8 @@ fn prewarm_compressed_cache(
     for result in results {
         summary.read_ms += result.read_ms;
         summary.compression_ms += result.compression_ms;
+        summary.read_us += result.read_us;
+        summary.compression_us += result.compression_us;
         match result.kind {
             WarmKind::Single {
                 key,

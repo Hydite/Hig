@@ -84,6 +84,8 @@ pub(crate) struct WriterReport {
     pub writer_wait_ms: u128,
     pub flush_ms: u128,
     pub rename_ms: u128,
+    pub flush_us: u64,
+    pub rename_us: u64,
     pub direct_write_count: usize,
     pub buffered_write_count: usize,
     pub preallocation_enabled: bool,
@@ -182,12 +184,14 @@ impl ArchiveWriter {
         let file = writer
             .into_inner()
             .map_err(|error| anyhow::anyhow!("archive flush failed: {}", error.error()))?;
-        self.report.flush_ms = flush_started.elapsed().as_millis();
+        self.report.flush_us = flush_started.elapsed().as_micros() as u64;
+        self.report.flush_ms = (self.report.flush_us / 1000) as u128;
         drop(file);
 
         let rename_started = Instant::now();
         fs::rename(&self.temp_path, &self.final_path)?;
-        self.report.rename_ms = rename_started.elapsed().as_millis();
+        self.report.rename_us = rename_started.elapsed().as_micros() as u64;
+        self.report.rename_ms = (self.report.rename_us / 1000) as u128;
         self.committed = true;
         Ok(self.report.clone())
     }

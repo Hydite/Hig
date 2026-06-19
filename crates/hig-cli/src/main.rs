@@ -1,10 +1,11 @@
 use clap::{Parser, Subcommand};
 use hig_core::{
-    ArchiveFormat, BatchOptions, ChunkOptions, Compression, DaemonMode, EncryptionMode, KdfProfile,
-    ManifestFormat, PackOptions, PackReport, PipelineOptions, SessionMaterial, SolidMode,
-    SpeedMode, UnpackOptions, bench, clear_session, daemon_status, default_session_ttl, derive_key,
-    derive_session_binding, pack, random_bytes, run_session_server, session_socket_path,
-    session_status, stop_daemon, unpack,
+    ArchiveFormat, BatchOptions, ChunkOptions, Compression, DaemonMode, DaemonRequest,
+    DaemonResponse, EncryptionMode, JobKeyMaterial, KdfProfile, ManifestFormat, PackJobRequest,
+    PackOptions, PackReport, PipelineOptions, SerializablePackOptions, SolidMode, SpeedMode,
+    UnpackOptions, bench, cache_writer_available, daemon_socket_path, daemon_status,
+    default_session_ttl, derive_key, derive_session_binding, pack, random_bytes, request_daemon,
+    run_daemon_server, stop_daemon, unpack,
 };
 use std::ffi::OsStr;
 use std::fs;
@@ -174,7 +175,7 @@ enum Command {
         solid: SolidMode,
         #[arg(
             long,
-            help = "Compare Hig against zip, tar+gzip, and tar+zstd, writing artifacts/hig-v1.7.0-benchmark.md"
+            help = "Compare Hig against zip, tar+gzip, and tar+zstd, writing artifacts/hig-v1.8.0-benchmark.md"
         )]
         compare: bool,
         #[arg(
@@ -190,6 +191,10 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
     },
 }
 
@@ -213,11 +218,6 @@ enum SessionCommand {
         #[arg(long)]
         cache_dir: Option<PathBuf>,
     },
-    #[command(hide = true)]
-    Serve {
-        #[arg(long)]
-        socket: PathBuf,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -235,6 +235,33 @@ enum DaemonCommand {
     Stop {
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+    },
+    #[command(hide = true)]
+    Serve {
+        #[arg(long)]
+        cache_dir: PathBuf,
+        #[arg(long)]
+        ttl_secs: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    Status {
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+    Gc {
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Compact {
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -269,7 +296,7 @@ fn main() -> anyhow::Result<()> {
             validate_pack_encryption_args(encryption, password.as_deref(), use_session)?;
             let kdf_profile = effective_kdf_profile(speed, kdf_profile);
             let solid = effective_solid(speed, solid);
-            let report = pack(PackOptions {
+            let options = PackOptions {
                 input_dir,
                 output_file: output,
                 password,
@@ -303,7 +330,8 @@ fn main() -> anyhow::Result<()> {
                     daemon_mode: daemon,
                     ..PipelineOptions::default()
                 },
-            })?;
+            };
+            let report = pack_with_daemon_policy(options)?;
             print_report("pack", &report);
         }
         Command::Unpack {
@@ -427,8 +455,45 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Session { command } => handle_session(command)?,
         Command::Daemon { command } => handle_daemon(command)?,
+        Command::Cache { command } => handle_cache(command)?,
     }
     Ok(())
+}
+
+fn handle_cache(command: CacheCommand) -> anyhow::Result<()> {
+    let (cache_dir, request) = match command {
+        CacheCommand::Status { cache_dir } => (
+            cache_dir.unwrap_or_else(default_cache_dir),
+            DaemonRequest::CacheStatus,
+        ),
+        CacheCommand::Gc { cache_dir, dry_run } => (
+            cache_dir.unwrap_or_else(default_cache_dir),
+            DaemonRequest::CacheGc { dry_run },
+        ),
+        CacheCommand::Compact { cache_dir, dry_run } => (
+            cache_dir.unwrap_or_else(default_cache_dir),
+            DaemonRequest::CacheCompact { dry_run },
+        ),
+    };
+    ensure_daemon(&cache_dir, default_session_ttl(None))?;
+    match request_daemon(&cache_dir, request)? {
+        Some(DaemonResponse::CacheMaintenance(report)) => {
+            println!(
+                "cache: total_bytes={} budget_bytes={} files={} removable_bytes={} removed_bytes={} compacted_bytes={} generation={} dry_run={}",
+                report.total_bytes,
+                report.budget_bytes,
+                report.files,
+                report.removable_bytes,
+                report.removed_bytes,
+                report.compacted_bytes,
+                report.generation,
+                report.dry_run
+            );
+            Ok(())
+        }
+        Some(DaemonResponse::Error { message }) => anyhow::bail!(message),
+        _ => anyhow::bail!("daemon did not return cache maintenance status"),
+    }
 }
 
 fn validate_pack_encryption_args(
@@ -446,6 +511,73 @@ fn validate_pack_encryption_args(
         (EncryptionMode::None, _, _) => {
             anyhow::bail!("--password and --use-session cannot be used with --encryption none")
         }
+    }
+}
+
+fn pack_with_daemon_policy(options: PackOptions) -> anyhow::Result<PackReport> {
+    if options.format == ArchiveFormat::HigV1
+        || options.pipeline.daemon_mode == DaemonMode::Off
+        || !options.use_cache
+    {
+        return pack(options);
+    }
+    let cache_dir = options
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| options.input_dir.join(".hig-cache"));
+    fs::create_dir_all(&cache_dir)?;
+    let connect_started = Instant::now();
+    let daemon_ready = ensure_daemon(&cache_dir, default_session_ttl(None));
+    if let Err(error) = daemon_ready {
+        if options.pipeline.daemon_mode == DaemonMode::Required || options.use_session {
+            return Err(error);
+        }
+        return pack(options);
+    }
+    let daemon_connect_us = connect_started.elapsed().as_micros() as u64;
+    let kdf = options.kdf_profile.params();
+    let binding = derive_session_binding(&cache_dir, options.kdf_profile, &kdf, options.encryption);
+    let socket_probe_started = Instant::now();
+    let status = daemon_status(&cache_dir)?;
+    let socket_probe_us = socket_probe_started.elapsed().as_micros() as u64;
+    let mut ephemeral_key = None;
+    if options.encryption == EncryptionMode::Password
+        && !options.use_session
+        && status.session_binding_fingerprint != Some(binding.fingerprint)
+    {
+        let salt = random_bytes::<16>();
+        let password = options
+            .password
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("password encryption requires a password"))?;
+        let key = derive_key(password, &salt, &kdf)?;
+        ephemeral_key = Some(JobKeyMaterial { key, salt });
+    }
+    let request = DaemonRequest::Pack(PackJobRequest {
+        options: SerializablePackOptions::from_pack(&options),
+        binding_fingerprint: Some(binding.fingerprint),
+        ephemeral_key,
+    });
+    let socket_started = Instant::now();
+    let response = request_daemon(&cache_dir, request);
+    let _pack_roundtrip_us = socket_started.elapsed().as_micros() as u64;
+    match response {
+        Ok(Some(DaemonResponse::PackComplete(mut report))) => {
+            report.timings_us.daemon_connect_us = daemon_connect_us;
+            report.timings_us.socket_request_us = socket_probe_us;
+            Ok(*report)
+        }
+        Err(error) if options.pipeline.daemon_mode == DaemonMode::Auto && !options.use_session => {
+            if cache_writer_available(&cache_dir)? {
+                eprintln!("hig: daemon exited, falling back to standalone: {error}");
+                pack(options)
+            } else {
+                Err(error)
+            }
+        }
+        Ok(Some(DaemonResponse::Error { message })) => anyhow::bail!(message),
+        Ok(_) => anyhow::bail!("daemon returned an unexpected pack response"),
+        Err(error) => Err(error),
     }
 }
 
@@ -475,25 +607,27 @@ fn handle_session(command: SessionCommand) -> anyhow::Result<()> {
             fs::create_dir_all(&cache_dir)?;
             let ttl_secs = default_session_ttl(ttl_secs);
             let started = Instant::now();
+            ensure_daemon(&cache_dir, ttl_secs)?;
             unlock_session_for_cache(&cache_dir, &password, kdf_profile, ttl_secs)?;
-            let (age, ttl) = session_status(&cache_dir)?.unwrap_or((0, ttl_secs));
+            let status = daemon_status(&cache_dir)?;
             println!(
                 "session: unlocked cache_dir={} ttl_secs={} age_secs={} kdf_ms={}",
                 cache_dir.display(),
-                ttl,
-                age,
+                ttl_secs,
+                status.session_age_secs,
                 started.elapsed().as_millis()
             );
             Ok(())
         }
         SessionCommand::Status { cache_dir } => {
             let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
-            if let Some((age, ttl)) = session_status(&cache_dir)? {
+            let status = daemon_status(&cache_dir)?;
+            if status.session_active {
                 println!(
                     "session: active cache_dir={} age_secs={} ttl_secs={}",
                     cache_dir.display(),
-                    age,
-                    ttl
+                    status.session_age_secs,
+                    status.ttl_secs
                 );
             } else {
                 println!("session: inactive cache_dir={}", cache_dir.display());
@@ -502,19 +636,16 @@ fn handle_session(command: SessionCommand) -> anyhow::Result<()> {
         }
         SessionCommand::Clear { cache_dir } => {
             let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
-            let cleared = clear_session(&cache_dir)?;
+            let cleared = matches!(
+                request_daemon(&cache_dir, DaemonRequest::ClearSession)?,
+                Some(DaemonResponse::SessionCleared)
+            );
             println!(
                 "session: {} cache_dir={}",
                 if cleared { "cleared" } else { "inactive" },
                 cache_dir.display()
             );
             Ok(())
-        }
-        SessionCommand::Serve { socket } => {
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line)?;
-            let material: SessionMaterial = serde_json::from_str(line.trim())?;
-            run_session_server(&socket, material)
         }
     }
 }
@@ -528,7 +659,7 @@ fn handle_daemon(command: DaemonCommand) -> anyhow::Result<()> {
             let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
             fs::create_dir_all(&cache_dir)?;
             let ttl_secs = default_session_ttl(ttl_secs);
-            start_empty_daemon_for_cache(&cache_dir, ttl_secs)?;
+            ensure_daemon(&cache_dir, ttl_secs)?;
             let status = daemon_status(&cache_dir)?;
             println!(
                 "daemon: started cache_dir={} active={} ttl_secs={}",
@@ -543,10 +674,12 @@ fn handle_daemon(command: DaemonCommand) -> anyhow::Result<()> {
             let status = daemon_status(&cache_dir)?;
             if status.active {
                 println!(
-                    "daemon: active cache_dir={} age_secs={} ttl_secs={}",
+                    "daemon: active cache_dir={} age_secs={} ttl_secs={} jobs_completed={} cache_open_count={}",
                     cache_dir.display(),
                     status.age_secs,
-                    status.ttl_secs
+                    status.ttl_secs,
+                    status.jobs_completed,
+                    status.cache_open_count
                 );
             } else {
                 println!("daemon: inactive cache_dir={}", cache_dir.display());
@@ -563,26 +696,39 @@ fn handle_daemon(command: DaemonCommand) -> anyhow::Result<()> {
             );
             Ok(())
         }
+        DaemonCommand::Serve {
+            cache_dir,
+            ttl_secs,
+        } => run_daemon_server(&cache_dir, ttl_secs),
     }
 }
 
-fn start_empty_daemon_for_cache(cache_dir: &Path, ttl_secs: u64) -> anyhow::Result<()> {
-    let _ = stop_daemon(cache_dir);
-    let kdf_profile = KdfProfile::FastBench;
-    let kdf = kdf_profile.params();
-    let material = SessionMaterial {
-        binding: derive_session_binding(cache_dir, kdf_profile, &kdf, EncryptionMode::Password),
-        key: random_bytes::<32>(),
-        salt: random_bytes::<16>(),
-        created_unix_secs: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        ttl_secs,
-    };
-    let socket = session_socket_path(cache_dir);
-    spawn_session_server(&socket, &material)?;
-    Ok(())
+fn ensure_daemon(cache_dir: &Path, ttl_secs: u64) -> anyhow::Result<()> {
+    if daemon_status(cache_dir)?.active {
+        return Ok(());
+    }
+    fs::create_dir_all(cache_dir)?;
+    let mut child = ProcessCommand::new(std::env::current_exe()?)
+        .arg("daemon")
+        .arg("serve")
+        .arg("--cache-dir")
+        .arg(cache_dir)
+        .arg("--ttl-secs")
+        .arg(ttl_secs.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    for _ in 0..100 {
+        if daemon_socket_path(cache_dir).exists() && daemon_status(cache_dir)?.active {
+            return Ok(());
+        }
+        if child.try_wait()?.is_some() {
+            anyhow::bail!("Hig daemon exited during startup");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    anyhow::bail!("Hig daemon did not create its socket")
 }
 
 fn unlock_session_for_cache(
@@ -592,49 +738,36 @@ fn unlock_session_for_cache(
     ttl_secs: u64,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(cache_dir)?;
+    ensure_daemon(cache_dir, ttl_secs)?;
     let kdf = kdf_profile.params();
-    let salt = random_bytes::<16>();
-    let key = derive_key(password, &salt, &kdf)?;
-    let material = SessionMaterial {
-        binding: derive_session_binding(cache_dir, kdf_profile, &kdf, EncryptionMode::Password),
-        key,
-        salt,
-        created_unix_secs: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        ttl_secs,
+    let binding = derive_session_binding(cache_dir, kdf_profile, &kdf, EncryptionMode::Password);
+    let salt = match request_daemon(
+        cache_dir,
+        DaemonRequest::UnlockChallenge {
+            binding: binding.clone(),
+        },
+    )? {
+        Some(DaemonResponse::UnlockChallenge { salt }) => salt,
+        Some(DaemonResponse::Error { message }) => anyhow::bail!(message),
+        _ => anyhow::bail!("daemon did not provide an unlock challenge"),
     };
-    let socket = session_socket_path(cache_dir);
-    let _ = clear_session(cache_dir);
-    spawn_session_server(&socket, &material)?;
-    Ok(())
-}
-
-fn spawn_session_server(socket: &Path, material: &SessionMaterial) -> anyhow::Result<()> {
-    let mut child = ProcessCommand::new(std::env::current_exe()?)
-        .arg("session")
-        .arg("serve")
-        .arg("--socket")
-        .arg(socket)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("failed to open session server stdin"))?;
-        writeln!(stdin, "{}", serde_json::to_string(material)?)?;
+    let mut key = derive_key(password, &salt, &kdf)?;
+    let response = request_daemon(
+        cache_dir,
+        DaemonRequest::InstallSessionKey {
+            binding,
+            key,
+            salt,
+            ttl_secs,
+        },
+    );
+    use zeroize::Zeroize;
+    key.zeroize();
+    match response? {
+        Some(DaemonResponse::SessionInstalled) => Ok(()),
+        Some(DaemonResponse::Error { message }) => anyhow::bail!(message),
+        _ => anyhow::bail!("daemon did not install the session key"),
     }
-    for _ in 0..100 {
-        if socket.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    anyhow::bail!("session server did not create socket")
 }
 
 fn default_cache_dir() -> PathBuf {
@@ -722,6 +855,32 @@ fn print_report(label: &str, report: &PackReport) {
         report.blocks.cache_pack_hits,
         report.blocks.cache_pack_misses,
         report.blocks.cache_pack_fallbacks
+    );
+    println!(
+        "{label}:us total_us={} daemon_connect_us={} socket_request_us={} queue_wait_us={} cache_hot_lookup_us={} walk_us={} metadata_us={} hash_us={} plan_us={} read_us={} compression_us={} crypto_us={} cache_commit_wait_us={} cache_commit_us={} manifest_serialize_us={} manifest_compress_us={} manifest_encrypt_us={} output_create_us={} output_write_us={} output_flush_us={} output_rename_us={} response_serialize_us={} unattributed_us={}",
+        report.timings_us.total_us,
+        report.timings_us.daemon_connect_us,
+        report.timings_us.socket_request_us,
+        report.timings_us.queue_wait_us,
+        report.timings_us.cache_hot_lookup_us,
+        report.timings_us.walk_us,
+        report.timings_us.metadata_us,
+        report.timings_us.hash_us,
+        report.timings_us.plan_us,
+        report.timings_us.read_us,
+        report.timings_us.compression_us,
+        report.timings_us.crypto_us,
+        report.timings_us.cache_commit_wait_us,
+        report.timings_us.cache_commit_us,
+        report.timings_us.manifest_serialize_us,
+        report.timings_us.manifest_compress_us,
+        report.timings_us.manifest_encrypt_us,
+        report.timings_us.output_create_us,
+        report.timings_us.output_write_us,
+        report.timings_us.output_flush_us,
+        report.timings_us.output_rename_us,
+        report.timings_us.response_serialize_us,
+        report.timings_us.unattributed_us,
     );
     println!(
         "{label}:critical setup_ms={} cache_open_ms={} scan_kdf_wall_ms={} plan_ms={} block_prepare_ms={} cache_commit_ms={} manifest_build_ms={} output_write_ms={} cleanup_ms={} unattributed_ms={} cache_index_format={} cache_index_open_ms={} cache_index_commit_ms={} cache_shards_read={} cache_shards_written={} cache_shard_dirty_count={} l1_index_hits={} l1_metadata_hits={} l1_scratch_reuses={} rayon_pool_reused={} daemon_used={} daemon_lookup_ms={} scheduler_queue_ms={} cpu_worker_wait_ms={} buffer_pool_hits={} buffer_pool_misses={} cache_pack_range_hits={} cache_pack_open_count={} hot_index_reuses={} hot_metadata_reuses={} pipeline_peak_memory_bytes={} header_bytes={} manifest_plain_bytes={} manifest_compressed_bytes={} manifest_protected_bytes={} payload_bytes={} compression_level_counts={:?} legacy_cache_hits={} parameterized_cache_hits={} cache_policy_misses={}",
@@ -870,8 +1029,10 @@ struct CopyProbe {
 struct AcceptanceSamples {
     hig_median_ms: f64,
     hig_p95_ms: f64,
+    hig_p99_ms: f64,
     zip_median_ms: Option<f64>,
     zip_p95_ms: Option<f64>,
+    zip_p99_ms: Option<f64>,
     runs: usize,
 }
 
@@ -954,7 +1115,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         unlock_session_for_cache(&cache_dir, password, KdfProfile::Secure, 1_800)?;
     }
     let session_unlock_ms = session_unlock_started.elapsed().as_millis();
-    let session_pack = pack(PackOptions {
+    let session_pack = pack_with_daemon_policy(PackOptions {
         input_dir: input_dir.clone(),
         output_file: options.output.with_extension("session.hig"),
         password: None,
@@ -977,7 +1138,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_ttl_secs: None,
         solid: options.solid,
         pipeline: PipelineOptions {
-            daemon_mode: DaemonMode::Off,
+            daemon_mode: DaemonMode::Required,
             ..PipelineOptions::default()
         },
     })?;
@@ -991,7 +1152,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         println!("benchmark: --use-session was set; compare still reports unlock cost separately");
     }
 
-    let daemon_pack = pack(PackOptions {
+    let daemon_pack = pack_with_daemon_policy(PackOptions {
         input_dir: input_dir.clone(),
         output_file: options.output.with_extension("daemon.hig"),
         password: None,
@@ -1352,9 +1513,9 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
     )?;
     let markdown = render_markdown(&input_dir, &rows, &probe, &acceptance);
     fs::create_dir_all("artifacts")?;
-    fs::write("artifacts/hig-v1.7.0-benchmark.md", markdown)?;
-    println!("benchmark: wrote artifacts/hig-v1.7.0-benchmark.md");
-    let _ = clear_session(&cache_dir);
+    fs::write("artifacts/hig-v1.8.0-benchmark.md", markdown)?;
+    println!("benchmark: wrote artifacts/hig-v1.8.0-benchmark.md");
+    let _ = request_daemon(&cache_dir, DaemonRequest::ClearSession);
     Ok(())
 }
 
@@ -1368,36 +1529,47 @@ fn run_acceptance_samples(
     const RUNS: usize = 20;
     let mut hig_samples = Vec::with_capacity(RUNS);
     let mut zip_samples = Vec::with_capacity(RUNS);
-    for run in 0..RUNS {
+    let executable = std::env::current_exe()?;
+    let run_hig = |run: usize, warmup: bool| -> anyhow::Result<f64> {
+        let output = work_dir.join(if warmup {
+            "acceptance-warmup.hig".to_string()
+        } else {
+            format!("acceptance-{run}.hig")
+        });
         let started = Instant::now();
-        pack(PackOptions {
-            input_dir: input_dir.to_path_buf(),
-            output_file: work_dir.join(format!("acceptance-{run}.hig")),
-            password: None,
-            encryption: EncryptionMode::Password,
-            cache_dir: Some(cache_dir.to_path_buf()),
-            threads: options.threads,
-            compression: options.compression,
-            level: options.level,
-            use_cache: options.use_cache,
-            trust_metadata: false,
-            format: ArchiveFormat::HigV2,
-            batch: options.batch,
-            chunk: options.chunk,
-            speed: SpeedMode::Balanced,
-            kdf_profile: KdfProfile::Secure,
-            sealed_cache: false,
-            manifest_format: options.manifest_format,
-            use_session: true,
-            session_required: true,
-            session_ttl_secs: None,
-            solid: options.solid,
-            pipeline: PipelineOptions {
-                daemon_mode: DaemonMode::Required,
-                ..PipelineOptions::default()
-            },
-        })?;
-        hig_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        let mut command = ProcessCommand::new(&executable);
+        command
+            .arg("pack")
+            .arg(input_dir)
+            .arg("-o")
+            .arg(output)
+            .arg("--use-session")
+            .arg("--daemon")
+            .arg("required")
+            .arg("--cache-dir")
+            .arg(cache_dir)
+            .arg("--manifest-format")
+            .arg(match options.manifest_format {
+                ManifestFormat::Compact => "compact",
+                ManifestFormat::Legacy => "legacy",
+            })
+            .arg("--solid")
+            .arg(match options.solid {
+                SolidMode::Auto => "auto",
+                SolidMode::Off => "off",
+            })
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(threads) = options.threads {
+            command.arg("--threads").arg(threads.to_string());
+        }
+        let status = command.status()?;
+        anyhow::ensure!(status.success(), "independent daemon pack benchmark failed");
+        Ok(started.elapsed().as_secs_f64() * 1000.0)
+    };
+    let _ = run_hig(0, true)?;
+    for run in 0..RUNS {
+        hig_samples.push(run_hig(run, false)?);
 
         if zip_available {
             let output = work_dir.join(format!("acceptance-{run}.zip"));
@@ -1417,8 +1589,10 @@ fn run_acceptance_samples(
     Ok(AcceptanceSamples {
         hig_median_ms: median(&hig_samples),
         hig_p95_ms: p95(&hig_samples),
+        hig_p99_ms: percentile(&hig_samples, 0.99),
         zip_median_ms: (!zip_samples.is_empty()).then(|| median(&zip_samples)),
         zip_p95_ms: (!zip_samples.is_empty()).then(|| p95(&zip_samples)),
+        zip_p99_ms: (!zip_samples.is_empty()).then(|| percentile(&zip_samples, 0.99)),
         runs: RUNS,
     })
 }
@@ -1873,7 +2047,7 @@ fn render_markdown(
     acceptance: &AcceptanceSamples,
 ) -> String {
     let mut output = String::new();
-    output.push_str("# Hig v1.7.0 Benchmark\n\n");
+    output.push_str("# Hig v1.8.0 Benchmark\n\n");
     output.push_str(&format!("Input: `{}`\n\n", input_dir.display()));
     output.push_str("## Environment Qualification\n\n");
     output.push_str(&format!(
@@ -1889,19 +2063,23 @@ fn render_markdown(
         "Warm Balanced secure daemon and zip were each sampled {} times.\n\n",
         acceptance.runs
     ));
-    output.push_str("| tool | median ms | p95 ms |\n|---|---:|---:|\n");
+    output.push_str("| tool | median ms | p95 ms | p99 ms |\n|---|---:|---:|---:|\n");
     output.push_str(&format!(
-        "| Hig Balanced secure daemon | {:.3} | {:.3} |\n",
-        acceptance.hig_median_ms, acceptance.hig_p95_ms
+        "| Hig Balanced secure daemon | {:.3} | {:.3} | {:.3} |\n",
+        acceptance.hig_median_ms, acceptance.hig_p95_ms, acceptance.hig_p99_ms
     ));
     output.push_str(&format!(
-        "| zip -qr | {} | {} |\n\n",
+        "| zip -qr | {} | {} | {} |\n\n",
         acceptance
             .zip_median_ms
             .map(|value| format!("{value:.3}"))
             .unwrap_or_else(|| "-".to_string()),
         acceptance
             .zip_p95_ms
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "-".to_string()),
+        acceptance
+            .zip_p99_ms
             .map(|value| format!("{value:.3}"))
             .unwrap_or_else(|| "-".to_string())
     ));

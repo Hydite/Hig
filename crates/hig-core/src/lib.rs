@@ -14,16 +14,16 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub use archive::{pack, unpack};
-pub use cache::{CacheStats, PathChunkRecord};
+pub use cache::{CacheMaintenanceReport, CacheStats, PathChunkRecord};
 pub use crypto::{derive_key, random_bytes};
-pub use daemon::{daemon_status, run_daemon_server, stop_daemon};
+pub use daemon::{
+    DaemonRequest, DaemonResponse, DaemonStatus, JobKeyMaterial, PackJobRequest,
+    SerializablePackOptions, cache_writer_available, daemon_socket_path, daemon_status,
+    request_daemon, run_daemon_server, stop_daemon,
+};
 pub use pipeline::{BufferPool, PipelineScheduler};
 pub use scan::{ScanStats, ScannedFile};
-pub use session::{
-    SessionBinding, SessionLookup, SessionMaterial, clear_session, default_session_ttl,
-    derive_session_binding, lookup_session, run_session_server, session_socket_path,
-    session_status,
-};
+pub use session::{SessionBinding, default_session_ttl, derive_session_binding};
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
@@ -59,12 +59,12 @@ pub struct UnpackOptions {
     pub overwrite: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compression {
     Zstd,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArchiveFormat {
     HigV1,
     #[default]
@@ -152,7 +152,7 @@ pub enum WriterStrategy {
     OrderedPipeline,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IoOptions {
     pub writer_buffer_bytes: usize,
     pub transfer_chunk_bytes: usize,
@@ -160,7 +160,7 @@ pub struct IoOptions {
     pub pipeline_memory_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipelineOptions {
     pub daemon_mode: DaemonMode,
     pub cpu_queue_small_first: bool,
@@ -249,7 +249,7 @@ impl std::str::FromStr for ArchiveFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchOptions {
     pub enabled: bool,
     pub small_file_threshold: u64,
@@ -266,7 +266,7 @@ impl Default for BatchOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkOptions {
     pub enabled: bool,
     pub chunk_file_threshold: u64,
@@ -294,7 +294,7 @@ impl std::str::FromStr for Compression {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackReport {
     pub input_files: usize,
     pub input_bytes: u64,
@@ -324,9 +324,37 @@ pub struct PackReport {
     pub l1: L1CacheReport,
     pub l2: L2CacheReport,
     pub pipeline: PipelineReport,
+    pub timings_us: PackTimingsUs,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackTimingsUs {
+    pub total_us: u64,
+    pub daemon_connect_us: u64,
+    pub socket_request_us: u64,
+    pub queue_wait_us: u64,
+    pub cache_hot_lookup_us: u64,
+    pub walk_us: u64,
+    pub metadata_us: u64,
+    pub hash_us: u64,
+    pub plan_us: u64,
+    pub read_us: u64,
+    pub compression_us: u64,
+    pub crypto_us: u64,
+    pub cache_commit_wait_us: u64,
+    pub cache_commit_us: u64,
+    pub manifest_serialize_us: u64,
+    pub manifest_compress_us: u64,
+    pub manifest_encrypt_us: u64,
+    pub output_create_us: u64,
+    pub output_write_us: u64,
+    pub output_flush_us: u64,
+    pub output_rename_us: u64,
+    pub response_serialize_us: u64,
+    pub unattributed_us: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineReport {
     pub daemon_used: bool,
     pub daemon_lookup_ms: u128,
@@ -341,7 +369,7 @@ pub struct PipelineReport {
     pub pipeline_peak_memory_bytes: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionReport {
     pub session_used: bool,
     pub session_lookup_ms: u128,
@@ -349,7 +377,7 @@ pub struct SessionReport {
     pub kdf_skipped_by_session: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct L1CacheReport {
     pub l1_index_hits: usize,
     pub l1_metadata_hits: usize,
@@ -357,7 +385,7 @@ pub struct L1CacheReport {
     pub rayon_pool_reused: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct L2CacheReport {
     pub cache_index_format: String,
     pub cache_index_open_ms: u128,
@@ -367,7 +395,7 @@ pub struct L2CacheReport {
     pub cache_shard_dirty_count: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PackCriticalTimings {
     pub setup_ms: u128,
     pub cache_open_ms: u128,
@@ -381,7 +409,7 @@ pub struct PackCriticalTimings {
     pub unattributed_ms: u128,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ArchiveSizeBreakdown {
     pub header_bytes: u64,
     pub manifest_plain_bytes: u64,
@@ -391,7 +419,7 @@ pub struct ArchiveSizeBreakdown {
     pub total_archive_bytes: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PackTimings {
     pub scan_ms: u128,
     pub plan_ms: u128,
@@ -410,7 +438,7 @@ pub struct PackTimings {
     pub output_rename_ms: u128,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlockStats {
     pub batch_blocks: usize,
     pub single_blocks: usize,

@@ -1,6 +1,6 @@
 [package]
 name = "hig-core"
-version = "1.7.0"
+version = "1.8.0"
 edition.workspace = true
 
 [dependencies]
@@ -10,6 +10,8 @@ bincode.workspace = true
 blake3.workspace = true
 chacha20poly1305.workspace = true
 hex.workspace = true
+fs2.workspace = true
+libc.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
@@ -17,6 +19,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true
 zstd.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -32,7 +32,7 @@ pub struct ScanOptions {
     pub chunk: ChunkOptions,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanStats {
     pub hashed_files: usize,
     pub metadata_hash_reuses: usize,
@@ -41,6 +41,9 @@ pub struct ScanStats {
     pub chunk_metadata_reuses: usize,
     pub chunk_metadata_misses: usize,
     pub trusted_bytes_skipped: u64,
+    pub walk_us: u64,
+    pub metadata_us: u64,
+    pub hash_us: u64,
 }
 
 impl ScanStats {
@@ -81,6 +84,7 @@ pub fn scan_dir(
         std::env::current_dir()?.join(output_file)
     };
 
+    let walk_started = std::time::Instant::now();
     let paths = WalkDir::new(&input_dir)
         .follow_links(false)
         .into_iter()
@@ -92,13 +96,23 @@ pub fn scan_dir(
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
         .collect::<Vec<_>>();
+    let walk_us = walk_started.elapsed().as_micros() as u64;
 
-    let mut files = paths
+    let outcomes = paths
         .into_par_iter()
         .map(|path| scan_file(&input_dir, path, cache, options))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut files = outcomes
+        .iter()
+        .map(|outcome| outcome.file.clone())
+        .collect::<Vec<_>>();
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    let mut stats = ScanStats::default();
+    let mut stats = ScanStats {
+        walk_us,
+        metadata_us: outcomes.iter().map(|outcome| outcome.metadata_us).sum(),
+        hash_us: outcomes.iter().map(|outcome| outcome.hash_us).sum(),
+        ..ScanStats::default()
+    };
     for file in &files {
         match file.hash_source {
             HashSource::Computed => {
@@ -126,12 +140,19 @@ pub fn scan_dir(
     Ok(ScanReport { files, stats })
 }
 
+struct ScanOutcome {
+    file: ScannedFile,
+    metadata_us: u64,
+    hash_us: u64,
+}
+
 fn scan_file(
     root: &Path,
     path: PathBuf,
     cache: Option<&CacheStore>,
     options: ScanOptions,
-) -> anyhow::Result<ScannedFile> {
+) -> anyhow::Result<ScanOutcome> {
+    let metadata_started = std::time::Instant::now();
     let metadata = fs::metadata(&path)?;
     let relative_path = path
         .strip_prefix(root)?
@@ -145,6 +166,7 @@ fn scan_file(
     let mtime_ns = modified.map(unix_ns).unwrap_or_default();
     let permissions = permissions(&metadata);
     let size = metadata.len();
+    let metadata_us = metadata_started.elapsed().as_micros() as u64;
     if options.trust_metadata
         && let Some(record) = cache.and_then(|cache| cache.get_path_record(&relative_path))
         && record.size == size
@@ -157,28 +179,39 @@ fn scan_file(
             } else {
                 None
             };
-        return Ok(ScannedFile {
+        return Ok(ScanOutcome {
+            file: ScannedFile {
+                relative_path,
+                absolute_path: path,
+                size,
+                mtime_secs,
+                mtime_ns,
+                permissions,
+                content_hash: record.content_hash,
+                hash_source: HashSource::MetadataCache,
+                cached_chunks,
+            },
+            metadata_us,
+            hash_us: 0,
+        });
+    }
+    let hash_started = std::time::Instant::now();
+    let content_hash = *blake3::hash(&fs::read(&path)?).as_bytes();
+    let hash_us = hash_started.elapsed().as_micros() as u64;
+    Ok(ScanOutcome {
+        file: ScannedFile {
             relative_path,
             absolute_path: path,
             size,
             mtime_secs,
             mtime_ns,
             permissions,
-            content_hash: record.content_hash,
-            hash_source: HashSource::MetadataCache,
-            cached_chunks,
-        });
-    }
-    Ok(ScannedFile {
-        relative_path,
-        absolute_path: path.clone(),
-        size,
-        mtime_secs,
-        mtime_ns,
-        permissions,
-        content_hash: *blake3::hash(&fs::read(path)?).as_bytes(),
-        hash_source: HashSource::Computed,
-        cached_chunks: None,
+            content_hash,
+            hash_source: HashSource::Computed,
+            cached_chunks: None,
+        },
+        metadata_us,
+        hash_us,
     })
 }
 
