@@ -92,7 +92,7 @@ pub fn derive_session_binding(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"hig session binding v1");
     hasher.update(cache_dir_string.as_bytes());
-    hasher.update(format!("{kdf_profile:?}:{encryption:?}:1.6.0").as_bytes());
+    hasher.update(format!("{kdf_profile:?}:{encryption:?}:1.7.0").as_bytes());
     hasher.update(&kdf.memory_cost_kib.to_le_bytes());
     hasher.update(&kdf.time_cost.to_le_bytes());
     hasher.update(&kdf.parallelism.to_le_bytes());
@@ -102,7 +102,7 @@ pub fn derive_session_binding(
         kdf_profile,
         kdf: kdf.clone(),
         encryption,
-        hig_version: "1.6.0".to_string(),
+        hig_version: "1.7.0".to_string(),
     }
 }
 
@@ -198,7 +198,7 @@ pub fn run_session_server(socket_path: &Path, material: SessionMaterial) -> anyh
 
 #[cfg(not(unix))]
 pub fn run_session_server(_socket_path: &Path, _material: SessionMaterial) -> anyhow::Result<()> {
-    anyhow::bail!("session server is only supported on Unix platforms in v1.6.0")
+    anyhow::bail!("session server is only supported on Unix platforms in v1.7.0")
 }
 
 #[cfg(unix)]

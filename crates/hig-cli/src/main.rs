@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
 use hig_core::{
-    ArchiveFormat, BatchOptions, ChunkOptions, Compression, EncryptionMode, KdfProfile,
-    ManifestFormat, PackOptions, PackReport, SessionMaterial, SolidMode, SpeedMode, UnpackOptions,
-    bench, clear_session, default_session_ttl, derive_key, derive_session_binding, pack,
-    random_bytes, run_session_server, session_socket_path, session_status, unpack,
+    ArchiveFormat, BatchOptions, ChunkOptions, Compression, DaemonMode, EncryptionMode, KdfProfile,
+    ManifestFormat, PackOptions, PackReport, PipelineOptions, SessionMaterial, SolidMode,
+    SpeedMode, UnpackOptions, bench, clear_session, daemon_status, default_session_ttl, derive_key,
+    derive_session_binding, pack, random_bytes, run_session_server, session_socket_path,
+    session_status, stop_daemon, unpack,
 };
 use std::ffi::OsStr;
 use std::fs;
@@ -87,6 +88,12 @@ enum Command {
             help = "Use a previously unlocked in-memory Hig session key and skip KDF"
         )]
         use_session: bool,
+        #[arg(
+            long,
+            default_value = "auto",
+            help = "Daemon mode: auto, off, or required"
+        )]
+        daemon: DaemonMode,
         #[arg(long, default_value = "auto", help = "Solid grouping: auto or off")]
         solid: SolidMode,
     },
@@ -157,11 +164,17 @@ enum Command {
             help = "Use a previously unlocked in-memory Hig session key and skip KDF"
         )]
         use_session: bool,
+        #[arg(
+            long,
+            default_value = "auto",
+            help = "Daemon mode: auto, off, or required"
+        )]
+        daemon: DaemonMode,
         #[arg(long, default_value = "auto", help = "Solid grouping: auto or off")]
         solid: SolidMode,
         #[arg(
             long,
-            help = "Compare Hig against zip, tar+gzip, and tar+zstd, writing artifacts/hig-v1.6.0-benchmark.md"
+            help = "Compare Hig against zip, tar+gzip, and tar+zstd, writing artifacts/hig-v1.7.0-benchmark.md"
         )]
         compare: bool,
         #[arg(
@@ -173,6 +186,10 @@ enum Command {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
     },
 }
 
@@ -203,6 +220,24 @@ enum SessionCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    Start {
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+    },
+    Status {
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+    Stop {
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -228,6 +263,7 @@ fn main() -> anyhow::Result<()> {
             kdf_profile,
             trust_metadata,
             use_session,
+            daemon,
             solid,
         } => {
             validate_pack_encryption_args(encryption, password.as_deref(), use_session)?;
@@ -263,6 +299,10 @@ fn main() -> anyhow::Result<()> {
                 session_required: use_session,
                 session_ttl_secs: None,
                 solid,
+                pipeline: PipelineOptions {
+                    daemon_mode: daemon,
+                    ..PipelineOptions::default()
+                },
             })?;
             print_report("pack", &report);
         }
@@ -302,6 +342,7 @@ fn main() -> anyhow::Result<()> {
             kdf_profile,
             trust_metadata,
             use_session,
+            daemon,
             solid,
             compare,
             bench_dir,
@@ -335,6 +376,7 @@ fn main() -> anyhow::Result<()> {
                     bench_dir,
                     manifest_format,
                     use_session,
+                    daemon,
                     solid,
                 })?;
                 return Ok(());
@@ -369,6 +411,10 @@ fn main() -> anyhow::Result<()> {
                 session_required: use_session,
                 session_ttl_secs: None,
                 solid,
+                pipeline: PipelineOptions {
+                    daemon_mode: daemon,
+                    ..PipelineOptions::default()
+                },
             })?;
             print_report("bench:first", &report.first);
             print_report("bench:second", &report.second);
@@ -380,6 +426,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Session { command } => handle_session(command)?,
+        Command::Daemon { command } => handle_daemon(command)?,
     }
     Ok(())
 }
@@ -472,6 +519,72 @@ fn handle_session(command: SessionCommand) -> anyhow::Result<()> {
     }
 }
 
+fn handle_daemon(command: DaemonCommand) -> anyhow::Result<()> {
+    match command {
+        DaemonCommand::Start {
+            cache_dir,
+            ttl_secs,
+        } => {
+            let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
+            fs::create_dir_all(&cache_dir)?;
+            let ttl_secs = default_session_ttl(ttl_secs);
+            start_empty_daemon_for_cache(&cache_dir, ttl_secs)?;
+            let status = daemon_status(&cache_dir)?;
+            println!(
+                "daemon: started cache_dir={} active={} ttl_secs={}",
+                cache_dir.display(),
+                status.active,
+                ttl_secs
+            );
+            Ok(())
+        }
+        DaemonCommand::Status { cache_dir } => {
+            let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
+            let status = daemon_status(&cache_dir)?;
+            if status.active {
+                println!(
+                    "daemon: active cache_dir={} age_secs={} ttl_secs={}",
+                    cache_dir.display(),
+                    status.age_secs,
+                    status.ttl_secs
+                );
+            } else {
+                println!("daemon: inactive cache_dir={}", cache_dir.display());
+            }
+            Ok(())
+        }
+        DaemonCommand::Stop { cache_dir } => {
+            let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
+            let stopped = stop_daemon(&cache_dir)?;
+            println!(
+                "daemon: {} cache_dir={}",
+                if stopped { "stopped" } else { "inactive" },
+                cache_dir.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn start_empty_daemon_for_cache(cache_dir: &Path, ttl_secs: u64) -> anyhow::Result<()> {
+    let _ = stop_daemon(cache_dir);
+    let kdf_profile = KdfProfile::FastBench;
+    let kdf = kdf_profile.params();
+    let material = SessionMaterial {
+        binding: derive_session_binding(cache_dir, kdf_profile, &kdf, EncryptionMode::Password),
+        key: random_bytes::<32>(),
+        salt: random_bytes::<16>(),
+        created_unix_secs: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        ttl_secs,
+    };
+    let socket = session_socket_path(cache_dir);
+    spawn_session_server(&socket, &material)?;
+    Ok(())
+}
+
 fn unlock_session_for_cache(
     cache_dir: &Path,
     password: &str,
@@ -494,11 +607,16 @@ fn unlock_session_for_cache(
     };
     let socket = session_socket_path(cache_dir);
     let _ = clear_session(cache_dir);
+    spawn_session_server(&socket, &material)?;
+    Ok(())
+}
+
+fn spawn_session_server(socket: &Path, material: &SessionMaterial) -> anyhow::Result<()> {
     let mut child = ProcessCommand::new(std::env::current_exe()?)
         .arg("session")
         .arg("serve")
         .arg("--socket")
-        .arg(&socket)
+        .arg(socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -508,15 +626,15 @@ fn unlock_session_for_cache(
             .stdin
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("failed to open session server stdin"))?;
-        writeln!(stdin, "{}", serde_json::to_string(&material)?)?;
+        writeln!(stdin, "{}", serde_json::to_string(material)?)?;
     }
     for _ in 0..100 {
-        if session_status(cache_dir)?.is_some() {
+        if socket.exists() {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    anyhow::bail!("session server did not become ready")
+    anyhow::bail!("session server did not create socket")
 }
 
 fn default_cache_dir() -> PathBuf {
@@ -606,7 +724,7 @@ fn print_report(label: &str, report: &PackReport) {
         report.blocks.cache_pack_fallbacks
     );
     println!(
-        "{label}:critical setup_ms={} cache_open_ms={} scan_kdf_wall_ms={} plan_ms={} block_prepare_ms={} cache_commit_ms={} manifest_build_ms={} output_write_ms={} cleanup_ms={} unattributed_ms={} cache_index_format={} cache_index_open_ms={} cache_index_commit_ms={} cache_shards_read={} cache_shards_written={} cache_shard_dirty_count={} l1_index_hits={} l1_metadata_hits={} l1_scratch_reuses={} rayon_pool_reused={} header_bytes={} manifest_plain_bytes={} manifest_compressed_bytes={} manifest_protected_bytes={} payload_bytes={} compression_level_counts={:?} legacy_cache_hits={} parameterized_cache_hits={} cache_policy_misses={}",
+        "{label}:critical setup_ms={} cache_open_ms={} scan_kdf_wall_ms={} plan_ms={} block_prepare_ms={} cache_commit_ms={} manifest_build_ms={} output_write_ms={} cleanup_ms={} unattributed_ms={} cache_index_format={} cache_index_open_ms={} cache_index_commit_ms={} cache_shards_read={} cache_shards_written={} cache_shard_dirty_count={} l1_index_hits={} l1_metadata_hits={} l1_scratch_reuses={} rayon_pool_reused={} daemon_used={} daemon_lookup_ms={} scheduler_queue_ms={} cpu_worker_wait_ms={} buffer_pool_hits={} buffer_pool_misses={} cache_pack_range_hits={} cache_pack_open_count={} hot_index_reuses={} hot_metadata_reuses={} pipeline_peak_memory_bytes={} header_bytes={} manifest_plain_bytes={} manifest_compressed_bytes={} manifest_protected_bytes={} payload_bytes={} compression_level_counts={:?} legacy_cache_hits={} parameterized_cache_hits={} cache_policy_misses={}",
         report.critical.setup_ms,
         report.critical.cache_open_ms,
         report.critical.scan_kdf_wall_ms,
@@ -627,6 +745,17 @@ fn print_report(label: &str, report: &PackReport) {
         report.l1.l1_metadata_hits,
         report.l1.l1_scratch_reuses,
         report.l1.rayon_pool_reused,
+        report.pipeline.daemon_used,
+        report.pipeline.daemon_lookup_ms,
+        report.pipeline.scheduler_queue_ms,
+        report.pipeline.cpu_worker_wait_ms,
+        report.pipeline.buffer_pool_hits,
+        report.pipeline.buffer_pool_misses,
+        report.pipeline.cache_pack_range_hits,
+        report.pipeline.cache_pack_open_count,
+        report.pipeline.hot_index_reuses,
+        report.pipeline.hot_metadata_reuses,
+        report.pipeline.pipeline_peak_memory_bytes,
         report.metadata.header_bytes,
         report.metadata.manifest_plain_bytes,
         report.metadata.manifest_compressed_bytes,
@@ -702,6 +831,7 @@ struct BenchmarkRow {
     cache_index_format: Option<String>,
     cache_index_open_ms: Option<u128>,
     cache_index_commit_ms: Option<u128>,
+    pipeline: Option<hig_core::PipelineReport>,
     notes: String,
 }
 
@@ -720,6 +850,7 @@ struct CompareOptions {
     bench_dir: Option<PathBuf>,
     manifest_format: ManifestFormat,
     use_session: bool,
+    daemon: DaemonMode,
     solid: SolidMode,
 }
 
@@ -735,6 +866,15 @@ struct CopyProbe {
     qualified: bool,
 }
 
+#[derive(Debug, Clone)]
+struct AcceptanceSamples {
+    hig_median_ms: f64,
+    hig_p95_ms: f64,
+    zip_median_ms: Option<f64>,
+    zip_p95_ms: Option<f64>,
+    runs: usize,
+}
+
 fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
     let input_dir = options.input_dir.canonicalize()?;
     let input_bytes = dir_size(&input_dir)?;
@@ -742,6 +882,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
     let work_dir = benchmark_work_dir(Some(&probe.path))?;
     let cache_dir = options
         .cache_dir
+        .clone()
         .unwrap_or_else(|| work_dir.join("hig-cache"));
     let compare_invoked_with_session = options.use_session;
     let mut rows = Vec::new();
@@ -768,6 +909,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:batch:first", &first);
     rows.push(row_from_report(
@@ -798,6 +940,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:batch:second", &second);
     rows.push(row_from_report(
@@ -833,6 +976,10 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: true,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions {
+            daemon_mode: DaemonMode::Off,
+            ..PipelineOptions::default()
+        },
     })?;
     print_report("bench:higv2:balanced:session", &session_pack);
     rows.push(row_from_report(
@@ -843,6 +990,40 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
     if compare_invoked_with_session {
         println!("benchmark: --use-session was set; compare still reports unlock cost separately");
     }
+
+    let daemon_pack = pack(PackOptions {
+        input_dir: input_dir.clone(),
+        output_file: options.output.with_extension("daemon.hig"),
+        password: None,
+        encryption: EncryptionMode::Password,
+        cache_dir: Some(cache_dir.clone()),
+        threads: options.threads,
+        compression: options.compression,
+        level: options.level,
+        use_cache: options.use_cache,
+        trust_metadata: false,
+        format: ArchiveFormat::HigV2,
+        batch: options.batch,
+        chunk: options.chunk,
+        speed: SpeedMode::Balanced,
+        kdf_profile: KdfProfile::Secure,
+        sealed_cache: false,
+        manifest_format: options.manifest_format,
+        use_session: true,
+        session_required: true,
+        session_ttl_secs: None,
+        solid: options.solid,
+        pipeline: PipelineOptions {
+            daemon_mode: options.daemon,
+            ..PipelineOptions::default()
+        },
+    })?;
+    print_report("bench:higv2:balanced:daemon", &daemon_pack);
+    rows.push(row_from_report(
+        "higv2 balanced secure daemon",
+        &daemon_pack,
+        "secure hot daemon/session path; KDF skipped and cache index is warm",
+    ));
 
     let trusted = pack(PackOptions {
         input_dir: input_dir.clone(),
@@ -866,6 +1047,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:fastest:secure:warm", &trusted);
     let fastest_secure = pack(PackOptions {
@@ -890,6 +1072,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:fastest:secure", &fastest_secure);
     rows.push(row_from_report(
@@ -920,6 +1103,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report(
         "bench:higv2:fastest:interactive:warm",
@@ -949,6 +1133,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:fastest:interactive", &fastest_interactive);
     rows.push(row_from_report(
@@ -979,6 +1164,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:fastest:fast-bench", &fastest_bench);
     rows.push(row_from_report(
@@ -1012,6 +1198,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:no-batch", &no_batch);
     rows.push(row_from_report(
@@ -1046,6 +1233,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:no-chunk", &no_chunk);
     rows.push(row_from_report(
@@ -1079,6 +1267,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:no-chunk:second", &no_chunk_second);
     rows.push(row_from_report(
@@ -1109,6 +1298,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv2:none", &no_encryption);
     rows.push(row_from_report(
@@ -1139,6 +1329,7 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         session_required: false,
         session_ttl_secs: None,
         solid: options.solid,
+        pipeline: PipelineOptions::default(),
     })?;
     print_report("bench:higv1:legacy", &legacy);
     rows.push(row_from_report(
@@ -1152,11 +1343,84 @@ fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
     rows.push(run_tar_zstd_benchmark(&input_dir, &work_dir, input_bytes)?);
     rows.push(run_7z_benchmark(&input_dir, input_bytes));
 
-    let markdown = render_markdown(&input_dir, &rows, &probe);
+    let acceptance = run_acceptance_samples(
+        &input_dir,
+        &work_dir,
+        &cache_dir,
+        &options,
+        command_exists("zip"),
+    )?;
+    let markdown = render_markdown(&input_dir, &rows, &probe, &acceptance);
     fs::create_dir_all("artifacts")?;
-    fs::write("artifacts/hig-v1.6.0-benchmark.md", markdown)?;
-    println!("benchmark: wrote artifacts/hig-v1.6.0-benchmark.md");
+    fs::write("artifacts/hig-v1.7.0-benchmark.md", markdown)?;
+    println!("benchmark: wrote artifacts/hig-v1.7.0-benchmark.md");
+    let _ = clear_session(&cache_dir);
     Ok(())
+}
+
+fn run_acceptance_samples(
+    input_dir: &Path,
+    work_dir: &Path,
+    cache_dir: &Path,
+    options: &CompareOptions,
+    zip_available: bool,
+) -> anyhow::Result<AcceptanceSamples> {
+    const RUNS: usize = 20;
+    let mut hig_samples = Vec::with_capacity(RUNS);
+    let mut zip_samples = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let started = Instant::now();
+        pack(PackOptions {
+            input_dir: input_dir.to_path_buf(),
+            output_file: work_dir.join(format!("acceptance-{run}.hig")),
+            password: None,
+            encryption: EncryptionMode::Password,
+            cache_dir: Some(cache_dir.to_path_buf()),
+            threads: options.threads,
+            compression: options.compression,
+            level: options.level,
+            use_cache: options.use_cache,
+            trust_metadata: false,
+            format: ArchiveFormat::HigV2,
+            batch: options.batch,
+            chunk: options.chunk,
+            speed: SpeedMode::Balanced,
+            kdf_profile: KdfProfile::Secure,
+            sealed_cache: false,
+            manifest_format: options.manifest_format,
+            use_session: true,
+            session_required: true,
+            session_ttl_secs: None,
+            solid: options.solid,
+            pipeline: PipelineOptions {
+                daemon_mode: DaemonMode::Required,
+                ..PipelineOptions::default()
+            },
+        })?;
+        hig_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+
+        if zip_available {
+            let output = work_dir.join(format!("acceptance-{run}.zip"));
+            let started = Instant::now();
+            let status = ProcessCommand::new("zip")
+                .arg("-qr")
+                .arg(&output)
+                .arg(".")
+                .arg("-x")
+                .arg(".hig-cache/*")
+                .current_dir(input_dir)
+                .status()?;
+            anyhow::ensure!(status.success(), "zip acceptance benchmark failed");
+            zip_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    Ok(AcceptanceSamples {
+        hig_median_ms: median(&hig_samples),
+        hig_p95_ms: p95(&hig_samples),
+        zip_median_ms: (!zip_samples.is_empty()).then(|| median(&zip_samples)),
+        zip_p95_ms: (!zip_samples.is_empty()).then(|| p95(&zip_samples)),
+        runs: RUNS,
+    })
 }
 
 fn row_from_report(tool: &str, report: &PackReport, notes: &str) -> BenchmarkRow {
@@ -1222,6 +1486,7 @@ fn row_from_report(tool: &str, report: &PackReport, notes: &str) -> BenchmarkRow
         cache_index_format: Some(report.l2.cache_index_format.clone()),
         cache_index_open_ms: Some(report.l2.cache_index_open_ms),
         cache_index_commit_ms: Some(report.l2.cache_index_commit_ms),
+        pipeline: Some(report.pipeline.clone()),
         notes: notes.to_string(),
     }
 }
@@ -1309,6 +1574,7 @@ fn run_zip_benchmark(
         cache_index_format: None,
         cache_index_open_ms: None,
         cache_index_commit_ms: None,
+        pipeline: None,
         notes: "zip -qr".to_string(),
     })
 }
@@ -1413,6 +1679,7 @@ fn run_tar_zstd_benchmark(
         cache_index_format: None,
         cache_index_open_ms: None,
         cache_index_commit_ms: None,
+        pipeline: None,
         notes: "tar -cf + zstd -1".to_string(),
     })
 }
@@ -1515,6 +1782,7 @@ fn run_tar_gzip_benchmark(
         cache_index_format: None,
         cache_index_open_ms: None,
         cache_index_commit_ms: None,
+        pipeline: None,
         notes: "tar -cf + gzip -6".to_string(),
     })
 }
@@ -1593,13 +1861,19 @@ fn skipped_row(tool: &str, input_bytes: u64, notes: &str) -> BenchmarkRow {
         cache_index_format: None,
         cache_index_open_ms: None,
         cache_index_commit_ms: None,
+        pipeline: None,
         notes: notes.to_string(),
     }
 }
 
-fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow], probe: &CopyProbe) -> String {
+fn render_markdown(
+    input_dir: &Path,
+    rows: &[BenchmarkRow],
+    probe: &CopyProbe,
+    acceptance: &AcceptanceSamples,
+) -> String {
     let mut output = String::new();
-    output.push_str("# Hig v1.6.0 Benchmark\n\n");
+    output.push_str("# Hig v1.7.0 Benchmark\n\n");
     output.push_str(&format!("Input: `{}`\n\n", input_dir.display()));
     output.push_str("## Environment Qualification\n\n");
     output.push_str(&format!(
@@ -1609,6 +1883,27 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow], probe: &CopyProbe) -
         } else {
             "ENVIRONMENT_NOT_QUALIFIED"
         }
+    ));
+    output.push_str("## Release Gate Samples\n\n");
+    output.push_str(&format!(
+        "Warm Balanced secure daemon and zip were each sampled {} times.\n\n",
+        acceptance.runs
+    ));
+    output.push_str("| tool | median ms | p95 ms |\n|---|---:|---:|\n");
+    output.push_str(&format!(
+        "| Hig Balanced secure daemon | {:.3} | {:.3} |\n",
+        acceptance.hig_median_ms, acceptance.hig_p95_ms
+    ));
+    output.push_str(&format!(
+        "| zip -qr | {} | {} |\n\n",
+        acceptance
+            .zip_median_ms
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "-".to_string()),
+        acceptance
+            .zip_p95_ms
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "-".to_string())
     ));
     output.push_str("| path | free bytes | used % | 32MiB cp median MiB/s | 32MiB cp p95 MiB/s | 256MiB cp median MiB/s | 256MiB cp p95 MiB/s |\n");
     output.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
@@ -1634,6 +1929,17 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow], probe: &CopyProbe) -
         "cache index",
         "cache index open ms",
         "cache index commit ms",
+        "daemon used",
+        "daemon lookup ms",
+        "scheduler queue ms",
+        "worker wait ms",
+        "buffer pool hits",
+        "buffer pool misses",
+        "cache pack range hits",
+        "cache pack opens",
+        "hot index reuses",
+        "hot metadata reuses",
+        "pipeline peak memory",
         "writer",
         "preallocated bytes",
         "preallocation",
@@ -1738,6 +2044,36 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow], probe: &CopyProbe) -
         let cache_index = optional_to_string(row.cache_index_format.as_ref());
         let cache_index_open_ms = optional_to_string(row.cache_index_open_ms);
         let cache_index_commit_ms = optional_to_string(row.cache_index_commit_ms);
+        let daemon_used = optional_to_string(row.pipeline.as_ref().map(|value| value.daemon_used));
+        let daemon_lookup_ms =
+            optional_to_string(row.pipeline.as_ref().map(|value| value.daemon_lookup_ms));
+        let scheduler_queue_ms =
+            optional_to_string(row.pipeline.as_ref().map(|value| value.scheduler_queue_ms));
+        let cpu_worker_wait_ms =
+            optional_to_string(row.pipeline.as_ref().map(|value| value.cpu_worker_wait_ms));
+        let buffer_pool_hits =
+            optional_to_string(row.pipeline.as_ref().map(|value| value.buffer_pool_hits));
+        let buffer_pool_misses =
+            optional_to_string(row.pipeline.as_ref().map(|value| value.buffer_pool_misses));
+        let cache_pack_range_hits = optional_to_string(
+            row.pipeline
+                .as_ref()
+                .map(|value| value.cache_pack_range_hits),
+        );
+        let cache_pack_open_count = optional_to_string(
+            row.pipeline
+                .as_ref()
+                .map(|value| value.cache_pack_open_count),
+        );
+        let hot_index_reuses =
+            optional_to_string(row.pipeline.as_ref().map(|value| value.hot_index_reuses));
+        let hot_metadata_reuses =
+            optional_to_string(row.pipeline.as_ref().map(|value| value.hot_metadata_reuses));
+        let pipeline_peak_memory = optional_to_string(
+            row.pipeline
+                .as_ref()
+                .map(|value| value.pipeline_peak_memory_bytes),
+        );
         let kdf_overlap = optional_to_string(row.kdf_overlapped_ms);
         let read_ms = optional_to_string(row.read_ms);
         let compression_ms = optional_to_string(row.compression_ms);
@@ -1812,6 +2148,17 @@ fn render_markdown(input_dir: &Path, rows: &[BenchmarkRow], probe: &CopyProbe) -
             cache_index,
             cache_index_open_ms,
             cache_index_commit_ms,
+            daemon_used,
+            daemon_lookup_ms,
+            scheduler_queue_ms,
+            cpu_worker_wait_ms,
+            buffer_pool_hits,
+            buffer_pool_misses,
+            cache_pack_range_hits,
+            cache_pack_open_count,
+            hot_index_reuses,
+            hot_metadata_reuses,
+            pipeline_peak_memory,
             writer_strategy,
             preallocated,
             preallocation,

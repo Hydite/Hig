@@ -2,6 +2,8 @@ mod archive;
 mod cache;
 mod codec;
 mod crypto;
+mod daemon;
+mod pipeline;
 mod scan;
 mod session;
 mod writer;
@@ -14,6 +16,8 @@ use std::time::Duration;
 pub use archive::{pack, unpack};
 pub use cache::{CacheStats, PathChunkRecord};
 pub use crypto::{derive_key, random_bytes};
+pub use daemon::{daemon_status, run_daemon_server, stop_daemon};
+pub use pipeline::{BufferPool, PipelineScheduler};
 pub use scan::{ScanStats, ScannedFile};
 pub use session::{
     SessionBinding, SessionLookup, SessionMaterial, clear_session, default_session_ttl,
@@ -44,6 +48,7 @@ pub struct PackOptions {
     pub session_required: bool,
     pub session_ttl_secs: Option<u64>,
     pub solid: SolidMode,
+    pub pipeline: PipelineOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +90,27 @@ pub enum SolidMode {
     #[default]
     Auto,
     Off,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DaemonMode {
+    #[default]
+    Auto,
+    Off,
+    Required,
+}
+
+impl std::str::FromStr for DaemonMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            "required" => Ok(Self::Required),
+            other => anyhow::bail!("unsupported daemon mode: {other}"),
+        }
+    }
 }
 
 impl std::str::FromStr for SolidMode {
@@ -132,6 +158,27 @@ pub struct IoOptions {
     pub transfer_chunk_bytes: usize,
     pub prefetch_depth: usize,
     pub pipeline_memory_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineOptions {
+    pub daemon_mode: DaemonMode,
+    pub cpu_queue_small_first: bool,
+    pub memory_budget_bytes: usize,
+    pub io_prefetch_bytes: usize,
+    pub cache_pack_enabled: bool,
+}
+
+impl Default for PipelineOptions {
+    fn default() -> Self {
+        Self {
+            daemon_mode: DaemonMode::Auto,
+            cpu_queue_small_first: true,
+            memory_budget_bytes: 128 * 1024 * 1024,
+            io_prefetch_bytes: 4 * 1024 * 1024,
+            cache_pack_enabled: true,
+        }
+    }
 }
 
 impl Default for IoOptions {
@@ -276,6 +323,22 @@ pub struct PackReport {
     pub session: SessionReport,
     pub l1: L1CacheReport,
     pub l2: L2CacheReport,
+    pub pipeline: PipelineReport,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PipelineReport {
+    pub daemon_used: bool,
+    pub daemon_lookup_ms: u128,
+    pub scheduler_queue_ms: u128,
+    pub cpu_worker_wait_ms: u128,
+    pub buffer_pool_hits: u64,
+    pub buffer_pool_misses: u64,
+    pub cache_pack_range_hits: u64,
+    pub cache_pack_open_count: u64,
+    pub hot_index_reuses: u64,
+    pub hot_metadata_reuses: u64,
+    pub pipeline_peak_memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]

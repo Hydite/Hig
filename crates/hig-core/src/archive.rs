@@ -4,13 +4,15 @@ use crate::cache::{
 };
 use crate::codec;
 use crate::crypto::{self, KdfParams, NONCE_LEN, SALT_LEN};
+use crate::pipeline::{BufferPool, PipelineScheduler, PipelineTask, PipelineTaskClass};
 use crate::scan::{ScanOptions, scan_dir, unix_ns};
 use crate::session::{derive_session_binding, lookup_session};
 use crate::writer::{ArchiveWriter, PayloadSource};
 use crate::{
     ArchiveFormat, ArchiveSizeBreakdown, BatchOptions, BlockStats, ChunkOptions, Compression,
-    EncryptionMode, IoOptions, L1CacheReport, L2CacheReport, ManifestFormat, PackCriticalTimings,
-    PackOptions, PackReport, PackTimings, SessionReport, SolidMode, SpeedMode, UnpackOptions,
+    DaemonMode, EncryptionMode, IoOptions, L1CacheReport, L2CacheReport, ManifestFormat,
+    PackCriticalTimings, PackOptions, PackReport, PackTimings, PipelineReport, SessionReport,
+    SolidMode, SpeedMode, UnpackOptions,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -305,6 +307,10 @@ struct WarmSummary {
     chunk_bytes: u64,
     read_ms: u128,
     compression_ms: u128,
+    scheduler_queue_ms: u128,
+    buffer_pool_hits: u64,
+    buffer_pool_misses: u64,
+    peak_buffer_pool_bytes: u64,
 }
 
 enum WarmKind {
@@ -578,6 +584,7 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
             cache_shards_written: 0,
             cache_shard_dirty_count: 0,
         },
+        pipeline: PipelineReport::default(),
     })
 }
 
@@ -623,6 +630,22 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
     let kdf = options.kdf_profile.params();
     let session_binding =
         derive_session_binding(&cache_dir, options.kdf_profile, &kdf, options.encryption);
+    let daemon_lookup_started = Instant::now();
+    let daemon_active = if options.encryption == EncryptionMode::Password
+        && options.use_cache
+        && options.use_session
+        && options.pipeline.daemon_mode != DaemonMode::Off
+    {
+        crate::daemon_status(&cache_dir)?.active
+    } else {
+        false
+    };
+    let daemon_lookup_ms = daemon_lookup_started.elapsed().as_millis();
+    if options.pipeline.daemon_mode == DaemonMode::Required && !daemon_active {
+        anyhow::bail!(
+            "no active Hig daemon found; run `hig daemon start` and `hig session unlock` first"
+        );
+    }
     let session_lookup_started = Instant::now();
     let session_lookup = if options.encryption == EncryptionMode::Password
         && options.use_cache
@@ -716,7 +739,13 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
 
     let pack_blocks_started = Instant::now();
     let warm_summary = if let Some(cache_store) = cache.as_mut() {
-        prewarm_compressed_cache(cache_store, &plans, &files, options.compression)?
+        prewarm_compressed_cache(
+            cache_store,
+            &plans,
+            &files,
+            options.compression,
+            options.pipeline,
+        )?
     } else {
         WarmSummary::default()
     };
@@ -1409,6 +1438,9 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
         + cache_commit_ms
         + manifest_ms
         + write_ms;
+    let cache_pack_range_hits = block_stats.cache_pack_hits as u64;
+    let cache_pack_open_count = writer_report.cached_range_open_count as u64;
+    let pipeline_peak_memory_bytes = peak_pipeline_memory_bytes;
     Ok(PackReport {
         input_files: files.len(),
         input_bytes,
@@ -1488,6 +1520,20 @@ fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
             cache_shards_read,
             cache_shards_written,
             cache_shard_dirty_count: cache_dirty_shard_count,
+        },
+        pipeline: PipelineReport {
+            daemon_used: daemon_active && session_used,
+            daemon_lookup_ms,
+            scheduler_queue_ms: warm_summary.scheduler_queue_ms,
+            cpu_worker_wait_ms: 0,
+            buffer_pool_hits: warm_summary.buffer_pool_hits,
+            buffer_pool_misses: warm_summary.buffer_pool_misses,
+            cache_pack_range_hits,
+            cache_pack_open_count,
+            hot_index_reuses: l1_index_hits as u64,
+            hot_metadata_reuses: 0,
+            pipeline_peak_memory_bytes: pipeline_peak_memory_bytes
+                .max(warm_summary.peak_buffer_pool_bytes),
         },
     })
 }
@@ -1952,11 +1998,68 @@ fn build_batch_raw(files: &[crate::ScannedFile], indices: &[usize]) -> anyhow::R
     Ok(raw)
 }
 
+fn pipeline_task_class(plan: &PlannedBlock) -> PipelineTaskClass {
+    match plan {
+        PlannedBlock::Single { .. } => PipelineTaskClass::Single,
+        PlannedBlock::Batch {
+            kind: BlockKind::Solid,
+            ..
+        } => PipelineTaskClass::Solid,
+        PlannedBlock::Batch { .. } => PipelineTaskClass::Batch,
+        PlannedBlock::Chunk { .. } => PipelineTaskClass::Chunk,
+    }
+}
+
+fn planned_raw_size(plan: &PlannedBlock, files: &[crate::ScannedFile]) -> u64 {
+    match plan {
+        PlannedBlock::Single { file_index, .. } => files[*file_index].size,
+        PlannedBlock::Batch { raw_size, .. } => *raw_size,
+        PlannedBlock::Chunk { len, .. } => *len,
+    }
+}
+
+fn fill_planned_raw(
+    plan: &PlannedBlock,
+    files: &[crate::ScannedFile],
+    raw: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    raw.clear();
+    match plan {
+        PlannedBlock::Single { file_index, .. } => {
+            fs::File::open(&files[*file_index].absolute_path)?.read_to_end(raw)?;
+        }
+        PlannedBlock::Batch { file_indices, .. } => {
+            for file_index in file_indices {
+                fs::File::open(&files[*file_index].absolute_path)?.read_to_end(raw)?;
+            }
+        }
+        PlannedBlock::Chunk {
+            file_index,
+            file_offset,
+            len,
+            ..
+        } => {
+            raw.resize(*len as usize, 0);
+            let mut input = fs::File::open(&files[*file_index].absolute_path)?;
+            input.seek(SeekFrom::Start(*file_offset))?;
+            input.read_exact(raw)?;
+        }
+    }
+    let expected = planned_raw_size(plan, files) as usize;
+    anyhow::ensure!(
+        raw.len() == expected,
+        "pipeline raw length mismatch: expected {expected}, got {}",
+        raw.len()
+    );
+    Ok(())
+}
+
 fn prewarm_compressed_cache(
     cache: &mut CacheStore,
     plans: &[PlannedBlock],
     files: &[crate::ScannedFile],
     compression: Compression,
+    pipeline: crate::PipelineOptions,
 ) -> anyhow::Result<WarmSummary> {
     let missing = plans
         .iter()
@@ -1989,11 +2092,30 @@ fn prewarm_compressed_cache(
         .cloned()
         .collect::<Vec<_>>();
 
+    let scheduling_started = Instant::now();
+    let scheduler = PipelineScheduler::new(pipeline.cpu_queue_small_first);
+    let mut tasks = missing
+        .iter()
+        .enumerate()
+        .map(|(index, plan)| PipelineTask {
+            plan_index: index,
+            class: pipeline_task_class(plan),
+            estimated_bytes: planned_raw_size(plan, files),
+        })
+        .collect::<Vec<_>>();
+    scheduler.order(&mut tasks);
+    let missing = tasks
+        .into_iter()
+        .map(|task| missing[task.plan_index].clone())
+        .collect::<Vec<_>>();
+    let scheduler_queue_ms = scheduling_started.elapsed().as_millis();
+    let buffer_pool = BufferPool::new(pipeline.memory_budget_bytes);
+
     let results = missing
         .par_iter()
         .map(|plan| -> anyhow::Result<WarmResult> {
             let read_started = Instant::now();
-            let (kind, raw_size, raw) = match plan {
+            let (kind, raw_size) = match plan {
                 PlannedBlock::Single { file_index, level } => {
                     let file = &files[*file_index];
                     let key = compressed_object_key(
@@ -2009,11 +2131,10 @@ fn prewarm_compressed_cache(
                             level: *level,
                         },
                         file.size,
-                        fs::read(&file.absolute_path)?,
                     )
                 }
                 PlannedBlock::Batch {
-                    file_indices,
+                    file_indices: _,
                     raw_size,
                     batch_key,
                     level,
@@ -2026,11 +2147,10 @@ fn prewarm_compressed_cache(
                         kind: *kind,
                     },
                     *raw_size,
-                    build_batch_raw(files, file_indices)?,
                 ),
                 PlannedBlock::Chunk {
-                    file_index,
-                    file_offset,
+                    file_index: _,
+                    file_offset: _,
                     len,
                     chunk_hash,
                     level,
@@ -2047,9 +2167,10 @@ fn prewarm_compressed_cache(
                         level: *level,
                     },
                     *len,
-                    read_file_slice(&files[*file_index], *file_offset, *len)?,
                 ),
             };
+            let mut raw = buffer_pool.get(raw_size as usize);
+            fill_planned_raw(plan, files, raw.bytes_mut())?;
             let read_ms = read_started.elapsed().as_millis();
             let compression_started = Instant::now();
             let level = match plan {
@@ -2057,7 +2178,7 @@ fn prewarm_compressed_cache(
                 | PlannedBlock::Batch { level, .. }
                 | PlannedBlock::Chunk { level, .. } => *level,
             };
-            let compressed = codec::compress(compression, &raw, level)?;
+            let compressed = codec::compress(compression, raw.bytes(), level)?;
             Ok(WarmResult {
                 kind,
                 raw_size,
@@ -2068,7 +2189,13 @@ fn prewarm_compressed_cache(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let mut summary = WarmSummary::default();
+    let mut summary = WarmSummary {
+        scheduler_queue_ms,
+        buffer_pool_hits: buffer_pool.hits(),
+        buffer_pool_misses: buffer_pool.misses(),
+        peak_buffer_pool_bytes: buffer_pool.peak_bytes(),
+        ..WarmSummary::default()
+    };
     for result in results {
         summary.read_ms += result.read_ms;
         summary.compression_ms += result.compression_ms;
@@ -2899,6 +3026,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         };
         let first = pack(options.clone()).unwrap();
         let second = pack(PackOptions {
@@ -2952,6 +3080,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert!(
@@ -2997,6 +3126,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
 
@@ -3048,6 +3178,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
 
@@ -3083,6 +3214,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(first.scan.hashed_files, 2);
@@ -3109,6 +3241,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(second.cache.hits, 2);
@@ -3145,6 +3278,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -3172,6 +3306,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(second.scan.metadata_hash_reuses, 1);
@@ -3211,6 +3346,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 1);
@@ -3262,6 +3398,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Auto,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(report.blocks.solid_groups, 1);
@@ -3321,6 +3458,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 0);
@@ -3357,6 +3495,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 1);
@@ -3393,6 +3532,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         };
         let first = pack(options.clone()).unwrap();
         assert_eq!(first.blocks.batch_cache_misses, 1);
@@ -3436,6 +3576,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert!(
@@ -3481,6 +3622,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         let mut bytes = fs::read(&output).unwrap();
@@ -3613,6 +3755,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(report.blocks.chunked_files, 1);
@@ -3666,6 +3809,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         };
         let first = pack(options.clone()).unwrap();
         assert_eq!(first.blocks.chunk_cache_misses, 4);
@@ -3750,6 +3894,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         };
         let first = pack(options.clone()).unwrap();
         assert_eq!(first.blocks.sealed_block_hits, 0);
@@ -3813,6 +3958,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         };
         pack(options.clone()).unwrap();
         let changed_password = pack(PackOptions {
@@ -3855,6 +4001,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         };
         pack(options.clone()).unwrap();
         let sealed = fs::read_dir(cache_dir.join("blocks"))
@@ -3930,6 +4077,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         };
         pack(options.clone()).unwrap();
         let second_path = temp.path().join("second.hig");
@@ -3995,6 +4143,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(report.blocks.chunk_blocks, 0);
@@ -4033,6 +4182,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         };
         pack(options.clone()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -4094,6 +4244,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 1);
@@ -4150,6 +4301,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         assert_eq!(report.encryption_mode, EncryptionMode::None);
@@ -4205,6 +4357,7 @@ mod tests {
             session_required: false,
             session_ttl_secs: None,
             solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
         })
         .unwrap();
         let mut bytes = fs::read(&archive_path).unwrap();
@@ -4220,5 +4373,49 @@ mod tests {
             .is_err()
         );
         assert!(!restored.exists());
+    }
+
+    #[test]
+    fn daemon_required_fails_before_pack_without_active_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(input.join("a.txt"), b"daemon required").unwrap();
+        let result = pack(PackOptions {
+            input_dir: input,
+            output_file: temp.path().join("out.hig"),
+            password: None,
+            encryption: EncryptionMode::Password,
+            cache_dir: Some(cache),
+            threads: None,
+            compression: Compression::Zstd,
+            level: Some(1),
+            use_cache: true,
+            trust_metadata: false,
+            format: ArchiveFormat::HigV2,
+            batch: BatchOptions::default(),
+            chunk: ChunkOptions::default(),
+            speed: SpeedMode::Balanced,
+            kdf_profile: crate::KdfProfile::Secure,
+            sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
+            use_session: true,
+            session_required: true,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions {
+                daemon_mode: DaemonMode::Required,
+                ..crate::PipelineOptions::default()
+            },
+        });
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no active Hig daemon")
+        );
     }
 }
