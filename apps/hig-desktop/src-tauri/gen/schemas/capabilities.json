@@ -1,0 +1,1 @@
+{"main-window":{"identifier":"main-window","description":"Minimal permissions for the Hig desktop main window","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save"]}}

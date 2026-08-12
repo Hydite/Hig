@@ -1,18 +1,21 @@
+use crate::adaptive_io::{AdaptiveIoController, IoDirection};
 use crate::cache::{
-    CacheStats, CacheStore, PathCacheRecord, PathChunkRecord, SealedCacheRecord, sealed_cache_file,
-    sealed_nonce,
+    CacheSaveOptions, CacheStats, CacheStore, PathCacheRecord, PathChunkRecord, SealedCacheRecord,
+    sealed_cache_file, sealed_nonce,
 };
 use crate::codec;
 use crate::crypto::{self, KdfParams, NONCE_LEN, SALT_LEN};
 use crate::pipeline::{BufferPool, PipelineScheduler, PipelineTask, PipelineTaskClass};
-use crate::scan::{ScanOptions, scan_dir, unix_ns};
-use crate::writer::{ArchiveWriter, PayloadSource};
+use crate::scan::{HotChunkRecord, ScanOptions, read_file_adaptive, scan_dir, unix_ns};
+use crate::writer::{ArchiveWriter, PayloadSource, PayloadStager, WriterReport};
 use crate::{
-    ArchiveFormat, ArchiveSizeBreakdown, BatchOptions, BlockStats, ChunkOptions, Compression,
-    DaemonMode, EncryptionMode, IoOptions, L1CacheReport, L2CacheReport, ManifestFormat,
+    ArchiveFileInfo, ArchiveFormat, ArchiveInspection, ArchiveSizeBreakdown, BatchOptions,
+    BlockStats, ChunkOptions, Compression, DaemonMode, EncryptionMode, IoOptions, L1CacheReport,
+    L2CacheReport, ManifestFormat, OperationControl, OperationKind, OperationPhase,
     PackCriticalTimings, PackOptions, PackReport, PackTimings, PackTimingsUs, PipelineReport,
-    SessionReport, SolidMode, SpeedMode, UnpackOptions,
+    SessionReport, SolidMode, SpeedMode, UnpackOptions, WriteProfileReport,
 };
+use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -292,6 +295,7 @@ enum PlannedBlock {
         chunk_hash: [u8; 32],
         from_metadata_cache: bool,
         level: i32,
+        raw_bytes: Option<Vec<u8>>,
     },
 }
 
@@ -312,6 +316,8 @@ struct WarmSummary {
     buffer_pool_hits: u64,
     buffer_pool_misses: u64,
     peak_buffer_pool_bytes: u64,
+    source_read_bytes: u64,
+    source_hot_raw_bytes: u64,
 }
 
 enum WarmKind {
@@ -341,9 +347,39 @@ struct WarmResult {
     compression_ms: u128,
     read_us: u64,
     compression_us: u64,
+    source_read_bytes: u64,
+    source_hot_raw_bytes: u64,
+}
+
+#[derive(Default)]
+struct WarmOutput {
+    summary: WarmSummary,
+    payloads: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+}
+
+#[derive(Default)]
+struct PlannedRawFill {
+    source_read_bytes: u64,
+    source_hot_raw_bytes: u64,
 }
 
 pub fn pack(options: PackOptions) -> anyhow::Result<PackReport> {
+    pack_with_control(options, &OperationControl::detached(OperationKind::Pack))
+}
+
+pub fn pack_with_control(
+    options: PackOptions,
+    control: &OperationControl,
+) -> anyhow::Result<PackReport> {
+    control.check_cancelled()?;
+    control.report(
+        OperationPhase::Scanning,
+        0,
+        None,
+        0,
+        None,
+        Some("Preparing archive".to_string()),
+    );
     if options.format == ArchiveFormat::HigV1 && options.encryption != EncryptionMode::Password {
         anyhow::bail!("HIGV1 only supports password encryption");
     }
@@ -359,10 +395,20 @@ pub fn pack(options: PackOptions) -> anyhow::Result<PackReport> {
     if options.encryption == EncryptionMode::None && options.password.is_some() {
         anyhow::bail!("--password cannot be used with encryption mode none");
     }
-    match options.format {
-        ArchiveFormat::HigV1 => pack_v1(options),
-        ArchiveFormat::HigV2 => pack_v2(options),
-    }
+    let report = match options.format {
+        ArchiveFormat::HigV1 => pack_v1(options, control),
+        ArchiveFormat::HigV2 => pack_v2(options, control),
+    }?;
+    control.check_cancelled()?;
+    control.report(
+        OperationPhase::Completed,
+        report.input_files as u64,
+        Some(report.input_files as u64),
+        report.input_bytes,
+        Some(report.input_bytes),
+        None,
+    );
+    Ok(report)
 }
 
 #[derive(Debug, Clone)]
@@ -377,15 +423,33 @@ pub(crate) fn pack_with_engine_cache(
     options: PackOptions,
     cache: &mut CacheStore,
     key_override: Option<PackKeyOverride>,
+    project_snapshot: Option<&crate::ProjectSnapshot>,
+) -> anyhow::Result<PackReport> {
+    let control = OperationControl::detached(OperationKind::Pack);
+    pack_with_engine_cache_control(options, cache, key_override, project_snapshot, &control)
+}
+
+pub(crate) fn pack_with_engine_cache_control(
+    options: PackOptions,
+    cache: &mut CacheStore,
+    key_override: Option<PackKeyOverride>,
+    project_snapshot: Option<&crate::ProjectSnapshot>,
+    control: &OperationControl,
 ) -> anyhow::Result<PackReport> {
     anyhow::ensure!(
         options.format == ArchiveFormat::HigV2,
         "daemon PackEngine only supports HIGV2"
     );
-    pack_v2_with_context(options, Some(cache), key_override)
+    pack_v2_with_context(
+        options,
+        Some(cache),
+        key_override,
+        project_snapshot,
+        control,
+    )
 }
 
-fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
+fn pack_v1(options: PackOptions, control: &OperationControl) -> anyhow::Result<PackReport> {
     let started = Instant::now();
     let level = options
         .level
@@ -418,6 +482,9 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
         ScanOptions {
             trust_metadata: options.trust_metadata,
             chunk: options.chunk,
+            hot_raw_bytes_budget: 0,
+            probe_chunk_levels: false,
+            io_controller: None,
         },
     )?;
     let files = scan.files;
@@ -431,6 +498,7 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
     let mut file_entries = Vec::with_capacity(files.len());
 
     for file in &files {
+        control.check_cancelled()?;
         let compressed = if let Some(cache_store) = cache.as_mut() {
             if let Some(bytes) = cache_store.get(&file.content_hash)? {
                 stats.hits += 1;
@@ -521,7 +589,10 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
         manifest_ciphertext.len() as u64,
         prepared.iter().map(|block| block.ciphertext.len() as u64),
     )?;
+    let output_create_started = Instant::now();
     let mut out = ArchiveWriter::create(&options.output_file, expected_len, IoOptions::default())?;
+    let output_create_us = output_create_started.elapsed().as_micros() as u64;
+    let header_write_started = Instant::now();
     write_header(
         &mut out,
         MAGIC_V1,
@@ -534,7 +605,10 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
             encryption: EncryptionMode::Password,
         },
     )?;
+    let header_write_us = header_write_started.elapsed().as_micros() as u64;
+    let manifest_write_started = Instant::now();
     out.write_all(&manifest_ciphertext)?;
+    let manifest_write_us = manifest_write_started.elapsed().as_micros() as u64;
     let payloads = prepared
         .into_iter()
         .map(|block| PayloadSource::Memory(block.ciphertext))
@@ -546,10 +620,19 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
             PayloadSource::CachedFile { .. } | PayloadSource::CachedRange { .. } => None,
         })
         .sum();
+    let payload_write_started = Instant::now();
     out.write_payloads(&payloads)?;
+    let payload_write_total_us = payload_write_started.elapsed().as_micros() as u64;
     let writer_report = out.finish()?;
+    let write_us = write_started.elapsed().as_micros() as u64;
     let write_ms = write_started.elapsed().as_millis();
     let archive_bytes = expected_len;
+    let write_profile = write_profile_report(
+        &writer_report,
+        header_write_us,
+        manifest_write_us,
+        payload_write_total_us,
+    );
 
     Ok(PackReport {
         input_files: files.len(),
@@ -561,7 +644,11 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
             payload_write_ms: writer_report.payload_write_ms,
             payload_read_ms: writer_report.payload_read_ms,
             writer_wait_ms: writer_report.writer_wait_ms,
+            output_preallocate_ms: (writer_report.preallocate_us / 1000) as u128,
+            output_header_write_ms: (header_write_us / 1000) as u128,
+            output_manifest_write_ms: (manifest_write_us / 1000) as u128,
             output_flush_ms: writer_report.flush_ms,
+            output_fsync_ms: (writer_report.fsync_us / 1000) as u128,
             output_rename_ms: writer_report.rename_ms,
             ..PackTimings::default()
         },
@@ -606,34 +693,159 @@ fn pack_v1(options: PackOptions) -> anyhow::Result<PackReport> {
             cache_shards_read: 0,
             cache_shards_written: 0,
             cache_shard_dirty_count: 0,
+            cache_commit_mode: "disabled".to_string(),
+            journal_upsert_records: 0,
+            journal_upsert_paths: 0,
+            journal_upsert_objects: 0,
+            journal_upsert_sealed: 0,
         },
         pipeline: PipelineReport::default(),
         timings_us: PackTimingsUs {
             total_us: started.elapsed().as_micros() as u64,
+            output_create_us,
+            output_preallocate_us: writer_report.preallocate_us,
+            output_header_write_us: header_write_us,
+            output_manifest_write_us: manifest_write_us,
+            output_payload_read_us: writer_report.payload_read_us,
+            output_payload_write_us: payload_write_total_us,
+            output_write_us: write_us,
+            output_flush_us: writer_report.flush_us,
+            output_fsync_us: writer_report.fsync_us,
+            output_rename_us: writer_report.rename_us,
             ..PackTimingsUs::default()
         },
+        write_profile,
+        project: crate::ProjectPackReport::default(),
+        adaptive_io: crate::AdaptiveIoReport::default(),
     })
 }
 
 pub fn unpack(options: UnpackOptions) -> anyhow::Result<()> {
+    unpack_with_control(options, &OperationControl::detached(OperationKind::Unpack))
+}
+
+pub fn unpack_with_control(
+    options: UnpackOptions,
+    control: &OperationControl,
+) -> anyhow::Result<()> {
+    control.check_cancelled()?;
+    control.report(OperationPhase::VerifyingArchive, 0, None, 0, None, None);
     let mut archive = fs::File::open(&options.archive_file)?;
     let mut magic = [0_u8; 8];
     archive.read_exact(&mut magic)?;
+    control.check_cancelled()?;
+    control.report(OperationPhase::Extracting, 0, None, 0, None, None);
     match &magic {
-        MAGIC_V1 => unpack_v1(options, archive),
-        MAGIC_V2 => unpack_v2(options, archive),
+        MAGIC_V1 => unpack_v1(options, archive, control),
+        MAGIC_V2 => unpack_v2(options, archive, control),
+        _ => anyhow::bail!("not a hig archive"),
+    }?;
+    control.check_cancelled()?;
+    control.report(OperationPhase::Completed, 0, None, 0, None, None);
+    Ok(())
+}
+
+pub fn inspect_archive(path: &Path, password: Option<&str>) -> anyhow::Result<ArchiveInspection> {
+    let archive_bytes = fs::metadata(path)?.len();
+    let mut archive = fs::File::open(path)?;
+    let mut magic = [0_u8; 8];
+    archive.read_exact(&mut magic)?;
+    match &magic {
+        MAGIC_V1 => {
+            let header = read_header_after_magic(&mut archive, VERSION_V1)?;
+            let mut manifest_ciphertext = vec![0_u8; header.manifest_len as usize];
+            archive.read_exact(&mut manifest_ciphertext)?;
+            let key = crypto::derive_key(
+                password
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("password is required for this archive"))?,
+                &header.salt,
+                &header.kdf,
+            )?;
+            let manifest_plain =
+                crypto::decrypt(&key, &header.manifest_nonce, &manifest_ciphertext)?;
+            let manifest: Manifest = bincode::deserialize(&manifest_plain)?;
+            let files = manifest
+                .files
+                .into_iter()
+                .map(|file| {
+                    checked_target(Path::new("."), &file.relative_path)?;
+                    Ok(ArchiveFileInfo {
+                        relative_path: file.relative_path,
+                        size: file.size,
+                        modified_unix_ns: file.mtime_secs as i128 * 1_000_000_000,
+                        permissions: file.permissions,
+                        content_hash: file.content_hash,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(ArchiveInspection {
+                format: ArchiveFormat::HigV1,
+                encrypted: true,
+                input_bytes: files.iter().map(|file| file.size).sum(),
+                archive_bytes,
+                files,
+            })
+        }
+        MAGIC_V2 => {
+            let header = read_header_after_magic(&mut archive, VERSION_V2)?;
+            let mut manifest_payload = vec![0_u8; header.manifest_len as usize];
+            archive.read_exact(&mut manifest_payload)?;
+            let key = match header.encryption {
+                EncryptionMode::Password => Some(crypto::derive_key(
+                    password
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("password is required for this archive"))?,
+                    &header.salt,
+                    &header.kdf,
+                )?),
+                EncryptionMode::None => None,
+            };
+            let manifest_compressed = unprotect_payload(
+                header.encryption,
+                key.as_ref(),
+                &header.manifest_nonce,
+                &manifest_payload,
+            )?;
+            let manifest_plain =
+                codec::decompress_unknown(Compression::Zstd, &manifest_compressed)?;
+            let manifest = decode_v2_manifest(&manifest_plain)?;
+            let files = manifest
+                .files
+                .into_iter()
+                .map(|file| {
+                    checked_target(Path::new("."), &file.relative_path)?;
+                    Ok(ArchiveFileInfo {
+                        relative_path: file.relative_path,
+                        size: file.size,
+                        modified_unix_ns: file.mtime_ns,
+                        permissions: file.permissions,
+                        content_hash: file.content_hash,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(ArchiveInspection {
+                format: ArchiveFormat::HigV2,
+                encrypted: header.encryption == EncryptionMode::Password,
+                input_bytes: files.iter().map(|file| file.size).sum(),
+                archive_bytes,
+                files,
+            })
+        }
         _ => anyhow::bail!("not a hig archive"),
     }
 }
 
-fn pack_v2(options: PackOptions) -> anyhow::Result<PackReport> {
-    pack_v2_with_context(options, None, None)
+fn pack_v2(options: PackOptions, control: &OperationControl) -> anyhow::Result<PackReport> {
+    pack_v2_with_context(options, None, None, None, control)
 }
 
 fn pack_v2_with_context(
     options: PackOptions,
     persistent_cache: Option<&mut CacheStore>,
     key_override: Option<PackKeyOverride>,
+    project_snapshot: Option<&crate::ProjectSnapshot>,
+    control: &OperationControl,
 ) -> anyhow::Result<PackReport> {
     let started = Instant::now();
     let setup_started = Instant::now();
@@ -648,6 +860,7 @@ fn pack_v2_with_context(
             .num_threads(threads)
             .build_global();
     }
+    let adaptive_io = AdaptiveIoController::new(worker_count(options.threads));
 
     let input_dir = options.input_dir.canonicalize()?;
     let cache_dir = options
@@ -657,6 +870,7 @@ fn pack_v2_with_context(
     let setup_us = setup_started.elapsed().as_micros() as u64;
     let setup_ms = (setup_us / 1000) as u128;
     let cache_open_started = Instant::now();
+    let cache_is_persistent = persistent_cache.is_some();
     let mut owned_cache = if options.use_cache && persistent_cache.is_none() {
         Some(CacheStore::open(&cache_dir)?)
     } else {
@@ -667,6 +881,9 @@ fn pack_v2_with_context(
     } else {
         None
     };
+    if let Some(cache_store) = cache.as_deref_mut() {
+        cache_store.set_io_controller(adaptive_io.clone());
+    }
     let cache_open_us = cache_open_started.elapsed().as_micros() as u64;
     let cache_open_ms = (cache_open_us / 1000) as u128;
     let kdf = options.kdf_profile.params();
@@ -724,19 +941,62 @@ fn pack_v2_with_context(
         }
         EncryptionMode::None => None,
     };
+    let hot_raw_memory = resolve_hot_raw_memory_budget(options.pipeline.payload_memory_mode);
     let scan_started = Instant::now();
-    let scan = scan_dir(
-        &input_dir,
-        &cache_dir,
-        &options.output_file,
-        cache.as_deref(),
-        ScanOptions {
-            trust_metadata,
-            chunk: options.chunk,
-        },
-    )?;
+    let scan = if let Some(snapshot) = project_snapshot {
+        let files = snapshot
+            .files
+            .values()
+            .map(|record| crate::ScannedFile {
+                relative_path: record.relative_path.clone(),
+                absolute_path: input_dir.join(&record.relative_path),
+                size: record.size,
+                mtime_secs: (record.mtime_ns / 1_000_000_000) as i64,
+                mtime_ns: record.mtime_ns,
+                permissions: record.permissions,
+                content_hash: record.content_hash,
+                hash_source: crate::scan::HashSource::MetadataCache,
+                cached_chunks: (!record.chunks.is_empty()).then(|| record.chunks.clone()),
+                hot_chunks: None,
+                raw_bytes: None,
+            })
+            .collect::<Vec<_>>();
+        crate::scan::ScanReport {
+            stats: crate::ScanStats {
+                metadata_hash_reuses: files.len(),
+                scan_cache_hits: files.len(),
+                trusted_bytes_skipped: files.iter().map(|file| file.size).sum(),
+                ..crate::ScanStats::default()
+            },
+            files,
+        }
+    } else {
+        scan_dir(
+            &input_dir,
+            &cache_dir,
+            &options.output_file,
+            cache.as_deref(),
+            ScanOptions {
+                trust_metadata,
+                chunk: options.chunk,
+                hot_raw_bytes_budget: hot_raw_memory.budget_bytes,
+                probe_chunk_levels: options.level.is_none() && options.speed != SpeedMode::Fastest,
+                io_controller: Some(adaptive_io.clone()),
+            },
+        )?
+    };
+    control.check_cancelled()?;
+    control.report(
+        OperationPhase::Planning,
+        0,
+        Some(scan.files.len() as u64),
+        0,
+        Some(scan.files.iter().map(|file| file.size).sum()),
+        None,
+    );
     let scan_us = scan_started.elapsed().as_micros() as u64;
     let scan_ms = (scan_us / 1000) as u128;
+    let scan_hot_raw_bytes = scan.stats.hot_raw_bytes;
     let files = scan.files;
     let input_bytes = files.iter().map(|file| file.size).sum::<u64>();
     let mut cache_stats = CacheStats::default();
@@ -756,43 +1016,73 @@ fn pack_v2_with_context(
     let scan_kdf_wall_us = scan_kdf_started.elapsed().as_micros() as u64;
     let scan_kdf_wall_ms = (scan_kdf_wall_us / 1000) as u128;
     let plan_started = Instant::now();
-    let plans = plan_blocks(
+    let plans = plan_blocks_with_hot_chunks(
         &files,
         options.batch,
         options.chunk,
         options.speed,
         options.level,
         options.solid,
+        hot_raw_memory.budget_bytes,
     )?;
+    control.check_cancelled()?;
     let plan_us = plan_started.elapsed().as_micros() as u64;
     let plan_ms = (plan_us / 1000) as u128;
     if sealed_enabled && let Some(cache_store) = cache.as_mut() {
         cache_store.prepare_sealed_key(kdf.clone(), key.as_ref().expect("password mode key"));
     }
     let kdf_overlapped_ms = kdf_ms.min(scan_ms);
+    let planned_block_count = plans.len() as u64;
     let mut prepared = Vec::with_capacity(plans.len());
     let mut file_entries = Vec::with_capacity(files.len());
     let mut chunk_refs: std::collections::BTreeMap<usize, Vec<ChunkRef>> =
         std::collections::BTreeMap::new();
     let mut path_chunk_refs: std::collections::BTreeMap<usize, Vec<PathChunkRecord>> =
         std::collections::BTreeMap::new();
+    let payload_memory =
+        resolve_payload_memory_budget(options.pipeline.payload_memory_mode, input_bytes);
+    let mut payload_stager = PayloadStager::new_with_io(
+        &options.output_file,
+        payload_memory.budget_bytes,
+        Some(adaptive_io.clone()),
+    );
 
     let pack_blocks_started = Instant::now();
-    let warm_summary = if let Some(cache_store) = cache.as_mut() {
+    let WarmOutput {
+        summary: warm_summary,
+        payloads: mut warm_payloads,
+    } = if let Some(cache_store) = cache.as_mut() {
         prewarm_compressed_cache(
             cache_store,
             &plans,
             &files,
             options.compression,
             options.pipeline,
+            Some(&adaptive_io),
+            true,
         )?
     } else {
-        WarmSummary::default()
+        WarmOutput::default()
     };
-    let defer_block_crypto = options.encryption == EncryptionMode::Password && !sealed_enabled;
+    let mut warm_payload_uses = std::collections::BTreeMap::new();
+    for plan in &plans {
+        let key = planned_object_key(plan, &files, options.compression);
+        if warm_payloads.contains_key(&key) {
+            *warm_payload_uses.entry(key).or_insert(0_usize) += 1;
+        }
+    }
     let mut crypto_ms = 0_u128;
     let mut crypto_us = 0_u64;
-    for plan in plans {
+    for (plan_index, plan) in plans.into_iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(
+            OperationPhase::Compressing,
+            plan_index as u64,
+            Some(planned_block_count),
+            0,
+            Some(input_bytes),
+            None,
+        );
         match plan {
             PlannedBlock::Single { file_index, level } => {
                 block_stats.single_blocks += 1;
@@ -847,7 +1137,17 @@ fn pack_v2_with_context(
                     block_stats.cache_pack_misses += 1;
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
-                    if let Some(bytes) = cache_store.get(&object_key)? {
+                    if let Some(bytes) =
+                        take_warm_payload(&mut warm_payloads, &mut warm_payload_uses, &object_key)
+                    {
+                        cache_stats.hits += 1;
+                        block_stats.parameterized_cache_hits += 1;
+                        cache_stats.bytes_reused += file.size;
+                        if sealed_enabled {
+                            block_stats.reencrypted_cache_hits += 1;
+                        }
+                        bytes
+                    } else if let Some(bytes) = cache_store.get(&object_key)? {
                         cache_stats.hits += 1;
                         block_stats.parameterized_cache_hits += 1;
                         cache_stats.bytes_reused += file.size;
@@ -866,7 +1166,8 @@ fn pack_v2_with_context(
                         cache_stats.misses += 1;
                         block_stats.cache_policy_misses += 1;
                         cache_stats.bytes_compressed += file.size;
-                        let input = fs::read(&file.absolute_path)?;
+                        let input =
+                            read_scanned_file(file, Some(&adaptive_io), "block-source-read")?;
                         let bytes = codec::compress(options.compression, &input, level)?;
                         cache_store.insert_parameterized(
                             &object_key,
@@ -880,7 +1181,7 @@ fn pack_v2_with_context(
                 } else {
                     cache_stats.misses += 1;
                     cache_stats.bytes_compressed += file.size;
-                    let input = fs::read(&file.absolute_path)?;
+                    let input = read_scanned_file(file, Some(&adaptive_io), "block-source-read")?;
                     codec::compress(options.compression, &input, level)?
                 };
                 let nonce = if sealed_enabled {
@@ -888,17 +1189,14 @@ fn pack_v2_with_context(
                 } else {
                     crypto::random_bytes::<NONCE_LEN>()
                 };
-                let ciphertext = if defer_block_crypto {
-                    compressed.clone()
-                } else {
-                    protect_payload_timed(
-                        options.encryption,
-                        key.as_ref(),
-                        &nonce,
-                        &compressed,
-                        &mut crypto_ms,
-                    )?
-                };
+                let ciphertext = protect_payload_timed(
+                    options.encryption,
+                    key.as_ref(),
+                    &nonce,
+                    &compressed,
+                    &mut crypto_ms,
+                    &mut crypto_us,
+                )?;
                 let block_id = *blake3::hash(&compressed).as_bytes();
                 if sealed_enabled {
                     write_sealed_payload(
@@ -915,7 +1213,7 @@ fn pack_v2_with_context(
                     )?;
                 }
                 let encrypted_size = ciphertext.len() as u64;
-                let payload = prepared_memory_payload(ciphertext, &mut block_stats);
+                let payload = prepared_payload(ciphertext, &mut block_stats, &mut payload_stager)?;
                 file_entries.push(V2FileEntry {
                     relative_path: file.relative_path.clone(),
                     size: file.size,
@@ -1018,7 +1316,21 @@ fn pack_v2_with_context(
                     block_stats.cache_pack_misses += 1;
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
-                    if let Some(bytes) = cache_store.get_batch(&object_key)? {
+                    if let Some(bytes) =
+                        take_warm_payload(&mut warm_payloads, &mut warm_payload_uses, &object_key)
+                    {
+                        if kind == BlockKind::Solid {
+                            block_stats.solid_cache_hits += 1;
+                        } else {
+                            block_stats.batch_cache_hits += 1;
+                        }
+                        block_stats.parameterized_cache_hits += 1;
+                        cache_stats.bytes_reused += raw_size;
+                        if sealed_enabled {
+                            block_stats.reencrypted_cache_hits += 1;
+                        }
+                        bytes
+                    } else if let Some(bytes) = cache_store.get_batch(&object_key)? {
                         if kind == BlockKind::Solid {
                             block_stats.solid_cache_hits += 1;
                         } else {
@@ -1049,15 +1361,16 @@ fn pack_v2_with_context(
                         }
                         block_stats.cache_policy_misses += 1;
                         cache_stats.bytes_compressed += raw_size;
-                        let raw = build_batch_raw(&files, &file_indices)?;
+                        let raw = build_batch_raw(&files, &file_indices, Some(&adaptive_io))?;
                         let bytes = codec::compress(options.compression, &raw, level)?;
-                        cache_store.insert_batch(&object_key, &bytes)?;
-                        cache_store.record_object(
+                        let pack_location = cache_store.insert_batch(&object_key, &bytes)?;
+                        cache_store.record_object_with_location(
                             &object_key,
                             &batch_key,
                             level,
                             block_kind_name(kind),
                             bytes.len() as u64,
+                            Some(pack_location),
                         );
                         bytes
                     }
@@ -1068,7 +1381,7 @@ fn pack_v2_with_context(
                         block_stats.batch_cache_misses += 1;
                     }
                     cache_stats.bytes_compressed += raw_size;
-                    let raw = build_batch_raw(&files, &file_indices)?;
+                    let raw = build_batch_raw(&files, &file_indices, Some(&adaptive_io))?;
                     codec::compress(options.compression, &raw, level)?
                 };
                 let nonce = if sealed_enabled {
@@ -1076,17 +1389,14 @@ fn pack_v2_with_context(
                 } else {
                     crypto::random_bytes::<NONCE_LEN>()
                 };
-                let ciphertext = if defer_block_crypto {
-                    compressed.clone()
-                } else {
-                    protect_payload_timed(
-                        options.encryption,
-                        key.as_ref(),
-                        &nonce,
-                        &compressed,
-                        &mut crypto_ms,
-                    )?
-                };
+                let ciphertext = protect_payload_timed(
+                    options.encryption,
+                    key.as_ref(),
+                    &nonce,
+                    &compressed,
+                    &mut crypto_ms,
+                    &mut crypto_us,
+                )?;
                 let block_id = *blake3::hash(&compressed).as_bytes();
                 if sealed_enabled {
                     write_sealed_payload(
@@ -1103,7 +1413,7 @@ fn pack_v2_with_context(
                     )?;
                 }
                 let encrypted_size = ciphertext.len() as u64;
-                let payload = prepared_memory_payload(ciphertext, &mut block_stats);
+                let payload = prepared_payload(ciphertext, &mut block_stats, &mut payload_stager)?;
                 let mut block_offset = 0_u64;
                 for index in &file_indices {
                     let file = &files[*index];
@@ -1147,6 +1457,7 @@ fn pack_v2_with_context(
                 chunk_hash,
                 from_metadata_cache,
                 level,
+                raw_bytes,
             } => {
                 block_stats.chunk_blocks += 1;
                 *block_stats
@@ -1203,7 +1514,19 @@ fn pack_v2_with_context(
                     block_stats.cache_pack_misses += 1;
                 }
                 let compressed = if let Some(cache_store) = cache.as_mut() {
-                    if let Some(bytes) = cache_store.get_chunk(&object_key)? {
+                    if let Some(bytes) =
+                        take_warm_payload(&mut warm_payloads, &mut warm_payload_uses, &object_key)
+                    {
+                        cache_stats.hits += 1;
+                        block_stats.parameterized_cache_hits += 1;
+                        cache_stats.bytes_reused += len;
+                        block_stats.chunk_cache_hits += 1;
+                        block_stats.chunk_bytes_reused += len;
+                        if sealed_enabled {
+                            block_stats.reencrypted_cache_hits += 1;
+                        }
+                        bytes
+                    } else if let Some(bytes) = cache_store.get_chunk(&object_key)? {
                         cache_stats.hits += 1;
                         block_stats.parameterized_cache_hits += 1;
                         cache_stats.bytes_reused += len;
@@ -1228,15 +1551,22 @@ fn pack_v2_with_context(
                         cache_stats.bytes_compressed += len;
                         block_stats.chunk_cache_misses += 1;
                         block_stats.chunk_bytes_compressed += len;
-                        let raw = read_file_slice(file, file_offset, len)?;
+                        let raw = planned_chunk_raw(
+                            file,
+                            file_offset,
+                            len,
+                            raw_bytes.as_deref(),
+                            Some(&adaptive_io),
+                        )?;
                         let bytes = codec::compress(options.compression, &raw, level)?;
-                        cache_store.insert_chunk(&object_key, &bytes)?;
-                        cache_store.record_object(
+                        let pack_location = cache_store.insert_chunk(&object_key, &bytes)?;
+                        cache_store.record_object_with_location(
                             &object_key,
                             &chunk_hash,
                             level,
                             "chunk",
                             bytes.len() as u64,
+                            Some(pack_location),
                         );
                         bytes
                     }
@@ -1245,7 +1575,13 @@ fn pack_v2_with_context(
                     cache_stats.bytes_compressed += len;
                     block_stats.chunk_cache_misses += 1;
                     block_stats.chunk_bytes_compressed += len;
-                    let raw = read_file_slice(file, file_offset, len)?;
+                    let raw = planned_chunk_raw(
+                        file,
+                        file_offset,
+                        len,
+                        raw_bytes.as_deref(),
+                        Some(&adaptive_io),
+                    )?;
                     codec::compress(options.compression, &raw, level)?
                 };
                 let nonce = if sealed_enabled {
@@ -1253,17 +1589,14 @@ fn pack_v2_with_context(
                 } else {
                     crypto::random_bytes::<NONCE_LEN>()
                 };
-                let ciphertext = if defer_block_crypto {
-                    compressed.clone()
-                } else {
-                    protect_payload_timed(
-                        options.encryption,
-                        key.as_ref(),
-                        &nonce,
-                        &compressed,
-                        &mut crypto_ms,
-                    )?
-                };
+                let ciphertext = protect_payload_timed(
+                    options.encryption,
+                    key.as_ref(),
+                    &nonce,
+                    &compressed,
+                    &mut crypto_ms,
+                    &mut crypto_us,
+                )?;
                 let block_id = *blake3::hash(&compressed).as_bytes();
                 if sealed_enabled {
                     write_sealed_payload(
@@ -1280,7 +1613,7 @@ fn pack_v2_with_context(
                     )?;
                 }
                 let encrypted_size = ciphertext.len() as u64;
-                let payload = prepared_memory_payload(ciphertext, &mut block_stats);
+                let payload = prepared_payload(ciphertext, &mut block_stats, &mut payload_stager)?;
                 chunk_refs.entry(file_index).or_default().push(ChunkRef {
                     chunk_hash,
                     block_id,
@@ -1312,6 +1645,11 @@ fn pack_v2_with_context(
             }
         }
     }
+    debug_assert!(
+        warm_payloads.is_empty(),
+        "all cold pipeline payloads must be consumed"
+    );
+    debug_assert!(warm_payload_uses.is_empty());
     cache_stats.hits = cache_stats
         .hits
         .saturating_sub(warm_summary.single_blocks + warm_summary.chunk_blocks);
@@ -1321,6 +1659,8 @@ fn pack_v2_with_context(
     );
     cache_stats.bytes_compressed +=
         warm_summary.single_bytes + warm_summary.batch_bytes + warm_summary.chunk_bytes;
+    block_stats.source_read_bytes = warm_summary.source_read_bytes;
+    block_stats.source_hot_raw_bytes = warm_summary.source_hot_raw_bytes;
     block_stats.batch_cache_hits = block_stats
         .batch_cache_hits
         .saturating_sub(warm_summary.batch_blocks);
@@ -1351,30 +1691,22 @@ fn pack_v2_with_context(
         .parameterized_cache_hits
         .saturating_sub(warmed_blocks);
     block_stats.cache_policy_misses += warmed_blocks;
-    if defer_block_crypto {
-        let crypto_started = Instant::now();
-        let encryption_key = key.as_ref().expect("password mode key");
-        prepared
-            .par_iter_mut()
-            .try_for_each(|block| -> anyhow::Result<()> {
-                let PayloadSource::Memory(plaintext) = &mut block.payload else {
-                    return Ok(());
-                };
-                let ciphertext = crypto::encrypt(encryption_key, &block.entry.nonce, plaintext)?;
-                block.entry.encrypted_size = ciphertext.len() as u64;
-                *plaintext = ciphertext;
-                Ok(())
-            })?;
-        crypto_us += crypto_started.elapsed().as_micros() as u64;
-        crypto_ms = (crypto_us / 1000) as u128;
-        block_stats.payload_source_memory_bytes = prepared
-            .iter()
-            .filter_map(|block| match &block.payload {
-                PayloadSource::Memory(bytes) => Some(bytes.len() as u64),
-                PayloadSource::CachedFile { .. } | PayloadSource::CachedRange { .. } => None,
-            })
-            .sum();
-    }
+    block_stats.payload_memory_mode = options.pipeline.payload_memory_mode;
+    block_stats.payload_memory_budget_bytes = payload_memory.budget_bytes as u64;
+    block_stats.payload_memory_available_bytes = payload_memory.available_bytes as u64;
+    payload_stager.finish_writes()?;
+    debug_assert_eq!(
+        block_stats.payload_source_memory_bytes,
+        payload_stager.memory_bytes()
+    );
+    debug_assert_eq!(
+        block_stats.payload_source_spool_bytes,
+        payload_stager.spool_bytes()
+    );
+    debug_assert_eq!(
+        block_stats.payload_source_spool_payloads,
+        payload_stager.spool_payloads()
+    );
     let pack_blocks_us = pack_blocks_started.elapsed().as_micros() as u64;
     let pack_blocks_ms = (pack_blocks_us / 1000) as u128;
     for (file_index, chunks) in chunk_refs {
@@ -1409,7 +1741,9 @@ fn pack_v2_with_context(
         .map(CacheStore::dirty_shard_count)
         .unwrap_or(0);
     if let Some(cache_store) = cache.as_mut() {
-        cache_store.save()?;
+        cache_store.save_with_options(CacheSaveOptions {
+            refresh_l1: !cache_is_persistent,
+        })?;
     }
     let cache_commit_us = cache_commit_started.elapsed().as_micros() as u64;
     let cache_commit_ms = (cache_commit_us / 1000) as u128;
@@ -1428,6 +1762,20 @@ fn pack_v2_with_context(
             .map(CacheStore::l1_index_hit)
             .unwrap_or(false),
     );
+    let cache_commit_mode = cache
+        .as_deref()
+        .map(CacheStore::last_commit_mode)
+        .unwrap_or("disabled")
+        .to_string();
+    let (
+        journal_upsert_records,
+        journal_upsert_paths,
+        journal_upsert_objects,
+        journal_upsert_sealed,
+    ) = cache
+        .as_deref()
+        .map(CacheStore::journal_upsert_counts)
+        .unwrap_or((0, 0, 0, 0));
 
     let manifest_started = Instant::now();
     file_entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -1457,6 +1805,7 @@ fn pack_v2_with_context(
         &manifest_nonce,
         &manifest_compressed,
         &mut crypto_ms,
+        &mut crypto_us,
     )?;
     let manifest_encrypt_us = manifest_encrypt_started.elapsed().as_micros() as u64;
     let manifest_us = manifest_started.elapsed().as_micros() as u64;
@@ -1468,8 +1817,14 @@ fn pack_v2_with_context(
         prepared.iter().map(|block| block.entry.encrypted_size),
     )?;
     let output_create_started = Instant::now();
-    let mut out = ArchiveWriter::create(&options.output_file, expected_len, IoOptions::default())?;
+    let mut out = ArchiveWriter::create_with_io(
+        &options.output_file,
+        expected_len,
+        IoOptions::default(),
+        Some(adaptive_io.clone()),
+    )?;
     let output_create_us = output_create_started.elapsed().as_micros() as u64;
+    let header_write_started = Instant::now();
     write_header(
         &mut out,
         MAGIC_V2,
@@ -1482,19 +1837,31 @@ fn pack_v2_with_context(
             encryption: options.encryption,
         },
     )?;
+    let header_write_us = header_write_started.elapsed().as_micros() as u64;
+    let manifest_write_started = Instant::now();
     out.write_all(&manifest_ciphertext)?;
+    let manifest_write_us = manifest_write_started.elapsed().as_micros() as u64;
     let payloads = prepared
         .into_iter()
         .map(|block| block.payload)
         .collect::<Vec<_>>();
+    let payload_write_started = Instant::now();
     out.write_payloads(&payloads)?;
+    let payload_write_total_us = payload_write_started.elapsed().as_micros() as u64;
     let writer_report = out.finish()?;
+    let write_profile = write_profile_report(
+        &writer_report,
+        header_write_us,
+        manifest_write_us,
+        payload_write_total_us,
+    );
     let archive_bytes = expected_len;
     let write_us = write_started.elapsed().as_micros() as u64;
     let write_ms = (write_us / 1000) as u128;
     let peak_pipeline_memory_bytes = writer_report
         .peak_pipeline_memory_bytes
-        .max(block_stats.payload_source_memory_bytes);
+        .saturating_add(block_stats.payload_source_memory_bytes)
+        .saturating_add(scan_hot_raw_bytes);
 
     let total_ms = started.elapsed().as_millis();
     let attributed_ms = setup_ms
@@ -1508,9 +1875,18 @@ fn pack_v2_with_context(
     let cache_pack_range_hits = block_stats.cache_pack_hits as u64;
     let cache_pack_open_count = writer_report.cached_range_open_count as u64;
     let pipeline_peak_memory_bytes = peak_pipeline_memory_bytes;
+    let pipeline_peak_with_warm = pipeline_peak_memory_bytes.max(
+        scan_hot_raw_bytes
+            .saturating_add(block_stats.payload_source_memory_bytes)
+            .saturating_add(warm_summary.peak_buffer_pool_bytes),
+    );
     let scan_walk_us = scan.stats.walk_us;
     let scan_metadata_us = scan.stats.metadata_us;
     let scan_hash_us = scan.stats.hash_us;
+    let project_prepared_object_hits =
+        cache_stats.hits as u64 + block_stats.parameterized_cache_hits as u64;
+    let project_prepared_object_misses =
+        cache_stats.misses as u64 + block_stats.cache_policy_misses as u64;
     Ok(PackReport {
         input_files: files.len(),
         input_bytes,
@@ -1530,7 +1906,11 @@ fn pack_v2_with_context(
             payload_write_ms: writer_report.payload_write_ms,
             payload_read_ms: writer_report.payload_read_ms,
             writer_wait_ms: writer_report.writer_wait_ms,
+            output_preallocate_ms: (writer_report.preallocate_us / 1000) as u128,
+            output_header_write_ms: (header_write_us / 1000) as u128,
+            output_manifest_write_ms: (manifest_write_us / 1000) as u128,
             output_flush_ms: writer_report.flush_ms,
+            output_fsync_ms: (writer_report.fsync_us / 1000) as u128,
             output_rename_ms: writer_report.rename_ms,
         },
         cache: cache_stats,
@@ -1590,6 +1970,11 @@ fn pack_v2_with_context(
             cache_shards_read,
             cache_shards_written,
             cache_shard_dirty_count: cache_dirty_shard_count,
+            cache_commit_mode,
+            journal_upsert_records,
+            journal_upsert_paths,
+            journal_upsert_objects,
+            journal_upsert_sealed,
         },
         pipeline: PipelineReport {
             daemon_used: daemon_active && session_used,
@@ -1602,8 +1987,7 @@ fn pack_v2_with_context(
             cache_pack_open_count,
             hot_index_reuses: l1_index_hits as u64,
             hot_metadata_reuses: 0,
-            pipeline_peak_memory_bytes: pipeline_peak_memory_bytes
-                .max(warm_summary.peak_buffer_pool_bytes),
+            pipeline_peak_memory_bytes: pipeline_peak_with_warm,
         },
         timings_us: PackTimingsUs {
             total_us: started.elapsed().as_micros() as u64,
@@ -1622,8 +2006,14 @@ fn pack_v2_with_context(
             manifest_compress_us,
             manifest_encrypt_us,
             output_create_us,
+            output_preallocate_us: writer_report.preallocate_us,
+            output_header_write_us: header_write_us,
+            output_manifest_write_us: manifest_write_us,
+            output_payload_read_us: writer_report.payload_read_us,
+            output_payload_write_us: payload_write_total_us,
             output_write_us: write_us,
             output_flush_us: writer_report.flush_us,
+            output_fsync_us: writer_report.fsync_us,
             output_rename_us: writer_report.rename_us,
             unattributed_us: started.elapsed().as_micros().saturating_sub(
                 setup_us as u128
@@ -1637,10 +2027,33 @@ fn pack_v2_with_context(
             ) as u64,
             ..PackTimingsUs::default()
         },
+        write_profile,
+        project: crate::ProjectPackReport {
+            project_mode_used: project_snapshot.is_some(),
+            project_generation: project_snapshot
+                .map(|value| value.generation)
+                .unwrap_or_default(),
+            project_snapshot_valid: project_snapshot
+                .is_some_and(|value| value.validity == crate::SnapshotValidity::Ready),
+            project_metadata_verified_files: project_snapshot
+                .map(|value| value.files.len() as u64)
+                .unwrap_or_default(),
+            project_hash_reuses: project_snapshot
+                .map(|value| value.files.len() as u64)
+                .unwrap_or_default(),
+            project_prepared_object_hits,
+            project_prepared_object_misses,
+            ..crate::ProjectPackReport::default()
+        },
+        adaptive_io: adaptive_io.report(),
     })
 }
 
-fn unpack_v1(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()> {
+fn unpack_v1(
+    options: UnpackOptions,
+    mut archive: fs::File,
+    control: &OperationControl,
+) -> anyhow::Result<()> {
     let header = read_header_after_magic(&mut archive, VERSION_V1)?;
     let mut manifest_ciphertext = vec![0_u8; header.manifest_len as usize];
     archive.read_exact(&mut manifest_ciphertext)?;
@@ -1660,7 +2073,17 @@ fn unpack_v1(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
     }
 
     let mut verified_files = Vec::with_capacity(manifest.files.len());
-    for file in &manifest.files {
+    let file_count = manifest.files.len() as u64;
+    for (file_index, file) in manifest.files.iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(
+            OperationPhase::VerifyingArchive,
+            file_index as u64,
+            Some(file_count),
+            0,
+            None,
+            None,
+        );
         let target = checked_target(&options.output_dir, &file.relative_path)?;
         if target.exists() && !options.overwrite {
             anyhow::bail!("refusing to overwrite existing file: {}", target.display());
@@ -1686,17 +2109,30 @@ fn unpack_v1(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
     }
 
     fs::create_dir_all(&options.output_dir)?;
-    for (target, content, permissions) in verified_files {
+    for (file_index, (target, content, permissions)) in verified_files.into_iter().enumerate() {
+        control.check_cancelled()?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(&target, content)?;
         set_permissions(&target, permissions)?;
+        control.report(
+            OperationPhase::Extracting,
+            file_index as u64 + 1,
+            Some(file_count),
+            0,
+            None,
+            None,
+        );
     }
     Ok(())
 }
 
-fn unpack_v2(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()> {
+fn unpack_v2(
+    options: UnpackOptions,
+    mut archive: fs::File,
+    control: &OperationControl,
+) -> anyhow::Result<()> {
     let header = read_header_after_magic(&mut archive, VERSION_V2)?;
     let mut manifest_ciphertext = vec![0_u8; header.manifest_len as usize];
     archive.read_exact(&mut manifest_ciphertext)?;
@@ -1743,6 +2179,7 @@ fn unpack_v2(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
     let mut next_block_offset = HEADER_FIXED_LEN as u64 + header.manifest_len;
     let mut raw_blocks = std::collections::BTreeMap::new();
     for block in &manifest.blocks {
+        control.check_cancelled()?;
         let mut ciphertext = vec![0_u8; block.encrypted_size as usize];
         archive.seek(SeekFrom::Start(next_block_offset))?;
         archive.read_exact(&mut ciphertext)?;
@@ -1756,7 +2193,17 @@ fn unpack_v2(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
         raw_blocks.insert(block.block_id, raw);
     }
 
-    for file in &manifest.files {
+    let file_count = manifest.files.len() as u64;
+    for (file_index, file) in manifest.files.iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(
+            OperationPhase::VerifyingArchive,
+            file_index as u64,
+            Some(file_count),
+            0,
+            None,
+            None,
+        );
         let target = checked_target(&options.output_dir, &file.relative_path)?;
         if target.exists() && !options.overwrite {
             anyhow::bail!("refusing to overwrite existing file: {}", target.display());
@@ -1814,12 +2261,21 @@ fn unpack_v2(options: UnpackOptions, mut archive: fs::File) -> anyhow::Result<()
     }
 
     fs::create_dir_all(&options.output_dir)?;
-    for (target, content, permissions) in verified_files {
+    for (file_index, (target, content, permissions)) in verified_files.into_iter().enumerate() {
+        control.check_cancelled()?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(&target, content)?;
         set_permissions(&target, permissions)?;
+        control.report(
+            OperationPhase::Extracting,
+            file_index as u64 + 1,
+            Some(file_count),
+            0,
+            None,
+            None,
+        );
     }
     Ok(())
 }
@@ -1832,6 +2288,26 @@ fn plan_blocks(
     explicit_level: Option<i32>,
     solid: SolidMode,
 ) -> anyhow::Result<Vec<PlannedBlock>> {
+    plan_blocks_with_hot_chunks(
+        files,
+        batch_options,
+        chunk_options,
+        speed,
+        explicit_level,
+        solid,
+        0,
+    )
+}
+
+fn plan_blocks_with_hot_chunks(
+    files: &[crate::ScannedFile],
+    batch_options: BatchOptions,
+    chunk_options: ChunkOptions,
+    speed: SpeedMode,
+    explicit_level: Option<i32>,
+    solid: SolidMode,
+    hot_chunk_raw_bytes_budget: usize,
+) -> anyhow::Result<Vec<PlannedBlock>> {
     if chunk_options.enabled && chunk_options.chunk_size == 0 {
         anyhow::bail!("chunk size must be greater than zero");
     }
@@ -1840,6 +2316,7 @@ fn plan_blocks(
     let mut current_size = 0_u64;
     let mut solid_current = Vec::new();
     let mut solid_current_size = 0_u64;
+    let mut hot_chunk_raw_bytes_remaining = hot_chunk_raw_bytes_budget;
     let inline_level = explicit_level.unwrap_or(if speed == SpeedMode::Fastest { 1 } else { 5 });
     for (index, file) in files.iter().enumerate() {
         if chunk_options.enabled && file.size > 0 && file.size >= chunk_options.chunk_file_threshold
@@ -1860,7 +2337,9 @@ fn plan_blocks(
                 inline_level,
                 BlockKind::Solid,
             );
-            if let Some(chunks) = file.cached_chunks.as_ref() {
+            if let Some(chunks) = file.hot_chunks.as_ref() {
+                append_hot_chunk_plans(&mut plans, index, chunks, speed, explicit_level);
+            } else if let Some(chunks) = file.cached_chunks.as_ref() {
                 append_cached_chunk_plans(&mut plans, index, chunks, explicit_level.unwrap_or(1));
             } else {
                 append_chunk_plans(
@@ -1870,6 +2349,7 @@ fn plan_blocks(
                     chunk_options.chunk_size,
                     speed,
                     explicit_level,
+                    &mut hot_chunk_raw_bytes_remaining,
                 )?;
             }
             continue;
@@ -2005,6 +2485,7 @@ fn append_chunk_plans(
     chunk_size: u64,
     speed: SpeedMode,
     explicit_level: Option<i32>,
+    hot_chunk_raw_bytes_remaining: &mut usize,
 ) -> anyhow::Result<()> {
     let file = &files[file_index];
     let mut input = fs::File::open(&file.absolute_path)?;
@@ -2028,10 +2509,48 @@ fn append_chunk_plans(
             chunk_hash,
             from_metadata_cache: false,
             level,
+            raw_bytes: reserve_hot_chunk_raw_bytes(hot_chunk_raw_bytes_remaining, buffer),
         });
         offset += len;
     }
     Ok(())
+}
+
+fn reserve_hot_chunk_raw_bytes(remaining: &mut usize, bytes: Vec<u8>) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return Some(bytes);
+    }
+    if bytes.len() > *remaining {
+        return None;
+    }
+    *remaining -= bytes.len();
+    Some(bytes)
+}
+
+fn append_hot_chunk_plans(
+    plans: &mut Vec<PlannedBlock>,
+    file_index: usize,
+    chunks: &[HotChunkRecord],
+    speed: SpeedMode,
+    explicit_level: Option<i32>,
+) {
+    for chunk in chunks {
+        plans.push(PlannedBlock::Chunk {
+            file_index,
+            file_offset: chunk.file_offset,
+            len: chunk.len,
+            chunk_hash: chunk.chunk_hash,
+            from_metadata_cache: false,
+            level: explicit_level.unwrap_or_else(|| {
+                if speed == SpeedMode::Fastest {
+                    1
+                } else {
+                    chunk.balanced_level
+                }
+            }),
+            raw_bytes: chunk.raw_bytes.clone(),
+        });
+    }
 }
 
 fn append_cached_chunk_plans(
@@ -2048,6 +2567,7 @@ fn append_cached_chunk_plans(
             chunk_hash: chunk.chunk_hash,
             from_metadata_cache: true,
             level,
+            raw_bytes: None,
         });
     }
 }
@@ -2091,11 +2611,70 @@ fn batch_key(files: &[crate::ScannedFile], indices: &[usize]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn build_batch_raw(files: &[crate::ScannedFile], indices: &[usize]) -> anyhow::Result<Vec<u8>> {
+fn read_scanned_file(
+    file: &crate::ScannedFile,
+    io_controller: Option<&std::sync::Arc<AdaptiveIoController>>,
+    stage: &'static str,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(bytes) = &file.raw_bytes {
+        return Ok(bytes.clone());
+    }
+    read_file_adaptive(&file.absolute_path, file.size, io_controller, stage)
+}
+
+fn append_file_adaptive(
+    path: &Path,
+    expected_size: u64,
+    output: &mut Vec<u8>,
+    io_controller: Option<&std::sync::Arc<AdaptiveIoController>>,
+    stage: &'static str,
+) -> anyhow::Result<()> {
+    let Some(controller) = io_controller else {
+        fs::File::open(path)?.read_to_end(output)?;
+        return Ok(());
+    };
+    let mut input = fs::File::open(path)?;
+    output.reserve(usize::try_from(expected_size).unwrap_or(0));
+    if expected_size <= 1024 * 1024 {
+        let before = output.len();
+        let permit = controller.acquire(stage, IoDirection::Read, expected_size);
+        input.read_to_end(output)?;
+        permit.finish_with_bytes(output.len().saturating_sub(before) as u64);
+        return Ok(());
+    }
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let permit = controller.acquire(stage, IoDirection::Read, buffer.len() as u64);
+        let read = input.read(&mut buffer)?;
+        permit.finish_with_bytes(read as u64);
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..read]);
+    }
+    Ok(())
+}
+
+fn build_batch_raw(
+    files: &[crate::ScannedFile],
+    indices: &[usize],
+    io_controller: Option<&std::sync::Arc<AdaptiveIoController>>,
+) -> anyhow::Result<Vec<u8>> {
     let raw_size = indices.iter().map(|index| files[*index].size).sum::<u64>();
     let mut raw = Vec::with_capacity(raw_size as usize);
     for index in indices {
-        raw.extend(fs::read(&files[*index].absolute_path)?);
+        let file = &files[*index];
+        if let Some(bytes) = &file.raw_bytes {
+            raw.extend(bytes);
+        } else {
+            append_file_adaptive(
+                &file.absolute_path,
+                file.size,
+                &mut raw,
+                io_controller,
+                "block-source-read",
+            )?;
+        }
     }
     Ok(raw)
 }
@@ -2112,6 +2691,46 @@ fn pipeline_task_class(plan: &PlannedBlock) -> PipelineTaskClass {
     }
 }
 
+fn planned_object_key(
+    plan: &PlannedBlock,
+    files: &[crate::ScannedFile],
+    compression: Compression,
+) -> [u8; 32] {
+    match plan {
+        PlannedBlock::Single { file_index, level } => compressed_object_key(
+            compression,
+            *level,
+            BlockKind::Single,
+            &files[*file_index].content_hash,
+        ),
+        PlannedBlock::Batch {
+            batch_key,
+            level,
+            kind,
+            ..
+        } => compressed_object_key(compression, *level, *kind, batch_key),
+        PlannedBlock::Chunk {
+            chunk_hash, level, ..
+        } => compressed_object_key(compression, *level, BlockKind::Chunk, chunk_hash),
+    }
+}
+
+fn take_warm_payload(
+    payloads: &mut std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+    uses: &mut std::collections::BTreeMap<[u8; 32], usize>,
+    key: &[u8; 32],
+) -> Option<Vec<u8>> {
+    let remaining = uses.get_mut(key)?;
+    debug_assert!(*remaining > 0);
+    if *remaining == 1 {
+        uses.remove(key);
+        payloads.remove(key)
+    } else {
+        *remaining -= 1;
+        payloads.get(key).cloned()
+    }
+}
+
 fn planned_raw_size(plan: &PlannedBlock, files: &[crate::ScannedFile]) -> u64 {
     match plan {
         PlannedBlock::Single { file_index, .. } => files[*file_index].size,
@@ -2124,27 +2743,77 @@ fn fill_planned_raw(
     plan: &PlannedBlock,
     files: &[crate::ScannedFile],
     raw: &mut Vec<u8>,
-) -> anyhow::Result<()> {
+    io_controller: Option<&std::sync::Arc<AdaptiveIoController>>,
+) -> anyhow::Result<PlannedRawFill> {
     raw.clear();
+    let mut fill = PlannedRawFill::default();
     match plan {
         PlannedBlock::Single { file_index, .. } => {
-            fs::File::open(&files[*file_index].absolute_path)?.read_to_end(raw)?;
+            let file = &files[*file_index];
+            if let Some(bytes) = &file.raw_bytes {
+                raw.extend_from_slice(bytes);
+                fill.source_hot_raw_bytes += bytes.len() as u64;
+            } else {
+                append_file_adaptive(
+                    &file.absolute_path,
+                    file.size,
+                    raw,
+                    io_controller,
+                    "block-source-read",
+                )?;
+                fill.source_read_bytes += file.size;
+            }
         }
         PlannedBlock::Batch { file_indices, .. } => {
             for file_index in file_indices {
-                fs::File::open(&files[*file_index].absolute_path)?.read_to_end(raw)?;
+                let file = &files[*file_index];
+                if let Some(bytes) = &file.raw_bytes {
+                    raw.extend_from_slice(bytes);
+                    fill.source_hot_raw_bytes += bytes.len() as u64;
+                } else {
+                    append_file_adaptive(
+                        &file.absolute_path,
+                        file.size,
+                        raw,
+                        io_controller,
+                        "block-source-read",
+                    )?;
+                    fill.source_read_bytes += file.size;
+                }
             }
         }
         PlannedBlock::Chunk {
             file_index,
             file_offset,
             len,
+            raw_bytes,
             ..
         } => {
             raw.resize(*len as usize, 0);
-            let mut input = fs::File::open(&files[*file_index].absolute_path)?;
-            input.seek(SeekFrom::Start(*file_offset))?;
-            input.read_exact(raw)?;
+            let file = &files[*file_index];
+            if let Some(bytes) = raw_bytes.as_deref() {
+                raw.copy_from_slice(bytes);
+                fill.source_hot_raw_bytes += *len;
+            } else if let Some(bytes) = &file.raw_bytes {
+                let start = *file_offset as usize;
+                let end = start
+                    .checked_add(*len as usize)
+                    .ok_or_else(|| anyhow::anyhow!("chunk slice overflow"))?;
+                anyhow::ensure!(end <= bytes.len(), "chunk slice exceeds hot raw bytes");
+                raw.copy_from_slice(&bytes[start..end]);
+                fill.source_hot_raw_bytes += *len;
+            } else {
+                let mut input = fs::File::open(&file.absolute_path)?;
+                input.seek(SeekFrom::Start(*file_offset))?;
+                let permit = io_controller.map(|controller| {
+                    controller.acquire("block-source-read", IoDirection::Read, *len)
+                });
+                input.read_exact(raw)?;
+                if let Some(permit) = permit {
+                    permit.finish_with_bytes(*len);
+                }
+                fill.source_read_bytes += *len;
+            }
         }
     }
     let expected = planned_raw_size(plan, files) as usize;
@@ -2153,6 +2822,180 @@ fn fill_planned_raw(
         "pipeline raw length mismatch: expected {expected}, got {}",
         raw.len()
     );
+    Ok(fill)
+}
+
+fn compress_warm_plan(
+    plan: &PlannedBlock,
+    files: &[crate::ScannedFile],
+    compression: Compression,
+    buffer_pool: &BufferPool,
+    io_controller: Option<&std::sync::Arc<AdaptiveIoController>>,
+) -> anyhow::Result<WarmResult> {
+    let read_started = Instant::now();
+    let (kind, raw_size) = match plan {
+        PlannedBlock::Single { file_index, level } => {
+            let file = &files[*file_index];
+            (
+                WarmKind::Single {
+                    key: compressed_object_key(
+                        compression,
+                        *level,
+                        BlockKind::Single,
+                        &file.content_hash,
+                    ),
+                    source_hash: file.content_hash,
+                    level: *level,
+                },
+                file.size,
+            )
+        }
+        PlannedBlock::Batch {
+            raw_size,
+            batch_key,
+            level,
+            kind,
+            ..
+        } => (
+            WarmKind::Batch {
+                key: compressed_object_key(compression, *level, *kind, batch_key),
+                source_hash: *batch_key,
+                level: *level,
+                kind: *kind,
+            },
+            *raw_size,
+        ),
+        PlannedBlock::Chunk {
+            len,
+            chunk_hash,
+            level,
+            ..
+        } => (
+            WarmKind::Chunk {
+                key: compressed_object_key(compression, *level, BlockKind::Chunk, chunk_hash),
+                source_hash: *chunk_hash,
+                level: *level,
+            },
+            *len,
+        ),
+    };
+    let mut raw = buffer_pool.get(raw_size as usize);
+    let fill = fill_planned_raw(plan, files, raw.bytes_mut(), io_controller)?;
+    let read_us = read_started.elapsed().as_micros() as u64;
+    let compression_started = Instant::now();
+    let level = match plan {
+        PlannedBlock::Single { level, .. }
+        | PlannedBlock::Batch { level, .. }
+        | PlannedBlock::Chunk { level, .. } => *level,
+    };
+    let compressed = codec::compress(compression, raw.bytes(), level)?;
+    let compression_us = compression_started.elapsed().as_micros() as u64;
+    Ok(WarmResult {
+        kind,
+        raw_size,
+        compressed,
+        read_ms: (read_us / 1000) as u128,
+        compression_ms: (compression_us / 1000) as u128,
+        read_us,
+        compression_us,
+        source_read_bytes: fill.source_read_bytes,
+        source_hot_raw_bytes: fill.source_hot_raw_bytes,
+    })
+}
+
+fn commit_warm_result(
+    cache: &mut CacheStore,
+    result: WarmResult,
+    retain_payload: bool,
+    summary: &mut WarmSummary,
+    payloads: &mut std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+) -> anyhow::Result<()> {
+    summary.read_ms += result.read_ms;
+    summary.compression_ms += result.compression_ms;
+    summary.read_us += result.read_us;
+    summary.compression_us += result.compression_us;
+    summary.source_read_bytes += result.source_read_bytes;
+    summary.source_hot_raw_bytes += result.source_hot_raw_bytes;
+    let payload_key = match result.kind {
+        WarmKind::Single {
+            key,
+            source_hash,
+            level,
+        } => {
+            if retain_payload {
+                cache.insert_parameterized_for_pipeline(
+                    &key,
+                    &source_hash,
+                    result.raw_size,
+                    level,
+                    &result.compressed,
+                )?;
+            } else {
+                cache.insert_parameterized(
+                    &key,
+                    &source_hash,
+                    result.raw_size,
+                    level,
+                    &result.compressed,
+                )?;
+            }
+            summary.single_blocks += 1;
+            summary.single_bytes += result.raw_size;
+            key
+        }
+        WarmKind::Batch {
+            key,
+            source_hash,
+            level,
+            kind,
+        } => {
+            let pack_location = if retain_payload {
+                cache.insert_batch_for_pipeline(&key, &result.compressed)?
+            } else {
+                cache.insert_batch(&key, &result.compressed)?
+            };
+            cache.record_object_with_location(
+                &key,
+                &source_hash,
+                level,
+                block_kind_name(kind),
+                result.compressed.len() as u64,
+                Some(pack_location),
+            );
+            if kind == BlockKind::Solid {
+                summary.solid_blocks += 1;
+            } else {
+                summary.batch_blocks += 1;
+            }
+            summary.batch_bytes += result.raw_size;
+            key
+        }
+        WarmKind::Chunk {
+            key,
+            source_hash,
+            level,
+        } => {
+            let pack_location = if retain_payload {
+                cache.insert_chunk_for_pipeline(&key, &result.compressed)?
+            } else {
+                cache.insert_chunk(&key, &result.compressed)?
+            };
+            cache.record_object_with_location(
+                &key,
+                &source_hash,
+                level,
+                "chunk",
+                result.compressed.len() as u64,
+                Some(pack_location),
+            );
+            summary.chunk_blocks += 1;
+            summary.chunk_bytes += result.raw_size;
+            key
+        }
+    };
+    if retain_payload {
+        payloads.insert(payload_key, result.compressed);
+    }
     Ok(())
 }
 
@@ -2162,7 +3005,9 @@ fn prewarm_compressed_cache(
     files: &[crate::ScannedFile],
     compression: Compression,
     pipeline: crate::PipelineOptions,
-) -> anyhow::Result<WarmSummary> {
+    io_controller: Option<&std::sync::Arc<AdaptiveIoController>>,
+    retain_payloads: bool,
+) -> anyhow::Result<WarmOutput> {
     let missing = plans
         .iter()
         .filter(|plan| match plan {
@@ -2213,156 +3058,100 @@ fn prewarm_compressed_cache(
     let scheduler_queue_ms = scheduling_started.elapsed().as_millis();
     let buffer_pool = BufferPool::new(pipeline.memory_budget_bytes);
 
-    let results = missing
-        .par_iter()
-        .map(|plan| -> anyhow::Result<WarmResult> {
-            let read_started = Instant::now();
-            let (kind, raw_size) = match plan {
-                PlannedBlock::Single { file_index, level } => {
-                    let file = &files[*file_index];
-                    let key = compressed_object_key(
-                        compression,
-                        *level,
-                        BlockKind::Single,
-                        &file.content_hash,
-                    );
-                    (
-                        WarmKind::Single {
-                            key,
-                            source_hash: file.content_hash,
-                            level: *level,
-                        },
-                        file.size,
-                    )
-                }
-                PlannedBlock::Batch {
-                    file_indices: _,
-                    raw_size,
-                    batch_key,
-                    level,
-                    kind,
-                } => (
-                    WarmKind::Batch {
-                        key: compressed_object_key(compression, *level, *kind, batch_key),
-                        source_hash: *batch_key,
-                        level: *level,
-                        kind: *kind,
-                    },
-                    *raw_size,
-                ),
-                PlannedBlock::Chunk {
-                    file_index: _,
-                    file_offset: _,
-                    len,
-                    chunk_hash,
-                    level,
-                    ..
-                } => (
-                    WarmKind::Chunk {
-                        key: compressed_object_key(
-                            compression,
-                            *level,
-                            BlockKind::Chunk,
-                            chunk_hash,
-                        ),
-                        source_hash: *chunk_hash,
-                        level: *level,
-                    },
-                    *len,
-                ),
-            };
-            let mut raw = buffer_pool.get(raw_size as usize);
-            fill_planned_raw(plan, files, raw.bytes_mut())?;
-            let read_us = read_started.elapsed().as_micros() as u64;
-            let read_ms = (read_us / 1000) as u128;
-            let compression_started = Instant::now();
-            let level = match plan {
-                PlannedBlock::Single { level, .. }
-                | PlannedBlock::Batch { level, .. }
-                | PlannedBlock::Chunk { level, .. } => *level,
-            };
-            let compressed = codec::compress(compression, raw.bytes(), level)?;
-            let compression_us = compression_started.elapsed().as_micros() as u64;
-            Ok(WarmResult {
-                kind,
-                raw_size,
-                compressed,
-                read_ms,
-                compression_ms: (compression_us / 1000) as u128,
-                read_us,
-                compression_us,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
     let mut summary = WarmSummary {
         scheduler_queue_ms,
-        buffer_pool_hits: buffer_pool.hits(),
-        buffer_pool_misses: buffer_pool.misses(),
-        peak_buffer_pool_bytes: buffer_pool.peak_bytes(),
         ..WarmSummary::default()
     };
-    for result in results {
-        summary.read_ms += result.read_ms;
-        summary.compression_ms += result.compression_ms;
-        summary.read_us += result.read_us;
-        summary.compression_us += result.compression_us;
-        match result.kind {
-            WarmKind::Single {
-                key,
-                source_hash,
-                level,
-            } => {
-                cache.insert_parameterized(
-                    &key,
-                    &source_hash,
-                    result.raw_size,
-                    level,
-                    &result.compressed,
-                )?;
-                summary.single_blocks += 1;
-                summary.single_bytes += result.raw_size;
-            }
-            WarmKind::Batch {
-                key,
-                source_hash,
-                level,
-                kind,
-            } => {
-                cache.insert_batch(&key, &result.compressed)?;
-                cache.record_object(
-                    &key,
-                    &source_hash,
-                    level,
-                    block_kind_name(kind),
-                    result.compressed.len() as u64,
-                );
-                if kind == BlockKind::Solid {
-                    summary.solid_blocks += 1;
-                } else {
-                    summary.batch_blocks += 1;
+    let mut payloads = std::collections::BTreeMap::new();
+    let worker_count = rayon::current_num_threads().max(1);
+
+    if worker_count == 1 {
+        for plan in &missing {
+            let result = compress_warm_plan(plan, files, compression, &buffer_pool, io_controller)?;
+            commit_warm_result(cache, result, retain_payloads, &mut summary, &mut payloads)?;
+        }
+    } else {
+        let (sender, receiver) = bounded::<anyhow::Result<WarmResult>>(worker_count * 2);
+        let mut consumer_error = None;
+        rayon::join(
+            || {
+                missing.par_iter().for_each_with(sender, |sender, plan| {
+                    let result =
+                        compress_warm_plan(plan, files, compression, &buffer_pool, io_controller);
+                    let _ = sender.send(result);
+                });
+            },
+            || {
+                for result in receiver {
+                    if consumer_error.is_some() {
+                        continue;
+                    }
+                    match result.and_then(|result| {
+                        commit_warm_result(
+                            cache,
+                            result,
+                            retain_payloads,
+                            &mut summary,
+                            &mut payloads,
+                        )
+                    }) {
+                        Ok(()) => {}
+                        Err(error) => consumer_error = Some(error),
+                    }
                 }
-                summary.batch_bytes += result.raw_size;
-            }
-            WarmKind::Chunk {
-                key,
-                source_hash,
-                level,
-            } => {
-                cache.insert_chunk(&key, &result.compressed)?;
-                cache.record_object(
-                    &key,
-                    &source_hash,
-                    level,
-                    "chunk",
-                    result.compressed.len() as u64,
-                );
-                summary.chunk_blocks += 1;
-                summary.chunk_bytes += result.raw_size;
-            }
+            },
+        );
+        if let Some(error) = consumer_error {
+            return Err(error);
         }
     }
-    Ok(summary)
+
+    summary.buffer_pool_hits = buffer_pool.hits();
+    summary.buffer_pool_misses = buffer_pool.misses();
+    summary.peak_buffer_pool_bytes = buffer_pool.peak_bytes();
+    Ok(WarmOutput { summary, payloads })
+}
+
+pub(crate) fn prewarm_project_snapshot(
+    root: &Path,
+    snapshot: &crate::ProjectSnapshot,
+    cache: &mut CacheStore,
+    batch: BatchOptions,
+    chunk: ChunkOptions,
+    solid: SolidMode,
+    pipeline: crate::PipelineOptions,
+) -> anyhow::Result<(u64, u64)> {
+    let files = snapshot
+        .files
+        .values()
+        .map(|record| crate::ScannedFile {
+            relative_path: record.relative_path.clone(),
+            absolute_path: root.join(&record.relative_path),
+            size: record.size,
+            mtime_secs: (record.mtime_ns / 1_000_000_000) as i64,
+            mtime_ns: record.mtime_ns,
+            permissions: record.permissions,
+            content_hash: record.content_hash,
+            hash_source: crate::scan::HashSource::MetadataCache,
+            cached_chunks: (!record.chunks.is_empty()).then(|| record.chunks.clone()),
+            hot_chunks: None,
+            raw_bytes: None,
+        })
+        .collect::<Vec<_>>();
+    let plans = plan_blocks(&files, batch, chunk, SpeedMode::Balanced, None, solid)?;
+    let output = prewarm_compressed_cache(
+        cache,
+        &plans,
+        &files,
+        Compression::Zstd,
+        pipeline,
+        None,
+        false,
+    )?;
+    let prepared_blocks =
+        output.summary.single_blocks + output.summary.batch_blocks + output.summary.solid_blocks;
+    let prepared_bytes = output.summary.single_bytes + output.summary.batch_bytes;
+    Ok((prepared_blocks as u64, prepared_bytes))
 }
 
 fn try_sealed_payload(
@@ -2426,9 +3215,23 @@ fn try_sealed_payload(
     )))
 }
 
-fn prepared_memory_payload(ciphertext: Vec<u8>, stats: &mut BlockStats) -> PayloadSource {
-    stats.payload_source_memory_bytes += ciphertext.len() as u64;
-    PayloadSource::Memory(ciphertext)
+fn prepared_payload(
+    ciphertext: Vec<u8>,
+    stats: &mut BlockStats,
+    stager: &mut PayloadStager,
+) -> anyhow::Result<PayloadSource> {
+    let payload = stager.stage(ciphertext)?;
+    match &payload {
+        PayloadSource::Memory(bytes) => {
+            stats.payload_source_memory_bytes += bytes.len() as u64;
+        }
+        PayloadSource::CachedRange { len, .. } => {
+            stats.payload_source_spool_payloads += 1;
+            stats.payload_source_spool_bytes += *len;
+        }
+        PayloadSource::CachedFile { .. } => {}
+    }
+    Ok(payload)
 }
 
 fn write_sealed_payload(
@@ -2503,11 +3306,49 @@ fn protect_payload_timed(
     nonce: &[u8; NONCE_LEN],
     plaintext: &[u8],
     elapsed_ms: &mut u128,
+    elapsed_us: &mut u64,
 ) -> anyhow::Result<Vec<u8>> {
     let started = Instant::now();
     let result = protect_payload(mode, key, nonce, plaintext);
-    *elapsed_ms += started.elapsed().as_millis();
+    let duration = started.elapsed();
+    *elapsed_ms += duration.as_millis();
+    *elapsed_us += duration.as_micros() as u64;
     result
+}
+
+fn write_profile_report(
+    writer: &WriterReport,
+    header_write_us: u64,
+    manifest_write_us: u64,
+    payload_write_total_us: u64,
+) -> WriteProfileReport {
+    WriteProfileReport {
+        temp_create_us: writer.temp_create_us,
+        preallocate_us: writer.preallocate_us,
+        header_write_us,
+        manifest_write_us,
+        payload_read_us: writer.payload_read_us,
+        payload_write_us: payload_write_total_us,
+        payload_memory_write_us: writer.payload_memory_write_us,
+        payload_cached_write_us: writer.payload_cached_write_us,
+        direct_write_us: writer.direct_write_us,
+        buffered_write_us: writer.buffered_write_us,
+        writer_wait_us: writer.writer_wait_us,
+        flush_us: writer.flush_us,
+        fsync_us: writer.fsync_us,
+        rename_us: writer.rename_us,
+        memory_payload_count: writer.memory_payload_count,
+        memory_payload_bytes: writer.memory_payload_bytes,
+        cached_file_payload_count: writer.cached_file_payload_count,
+        cached_file_payload_bytes: writer.cached_file_payload_bytes,
+        cached_range_payload_count: writer.cached_range_payload_count,
+        cached_range_payload_bytes: writer.cached_range_payload_bytes,
+        direct_write_count: writer.direct_write_count,
+        buffered_write_count: writer.buffered_write_count,
+        coalesced_write_count: writer.coalesced_write_count,
+        coalesced_payload_count: writer.coalesced_payload_count,
+        coalesced_bytes: writer.coalesced_bytes,
+    }
 }
 
 fn unprotect_payload(
@@ -2537,12 +3378,48 @@ fn worker_count(requested: Option<usize>) -> usize {
     requested.unwrap_or_else(rayon::current_num_threads).max(1)
 }
 
-fn read_file_slice(file: &crate::ScannedFile, offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+fn read_file_slice(
+    file: &crate::ScannedFile,
+    offset: u64,
+    len: u64,
+    io_controller: Option<&std::sync::Arc<AdaptiveIoController>>,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(bytes) = &file.raw_bytes {
+        let start = offset as usize;
+        let end = start
+            .checked_add(len as usize)
+            .ok_or_else(|| anyhow::anyhow!("file slice overflow"))?;
+        anyhow::ensure!(end <= bytes.len(), "file slice exceeds hot raw bytes");
+        return Ok(bytes[start..end].to_vec());
+    }
     let mut input = fs::File::open(&file.absolute_path)?;
     input.seek(SeekFrom::Start(offset))?;
     let mut buffer = vec![0_u8; len as usize];
+    let permit = io_controller
+        .map(|controller| controller.acquire("block-source-read", IoDirection::Read, len));
     input.read_exact(&mut buffer)?;
+    if let Some(permit) = permit {
+        permit.finish_with_bytes(len);
+    }
     Ok(buffer)
+}
+
+fn planned_chunk_raw(
+    file: &crate::ScannedFile,
+    offset: u64,
+    len: u64,
+    planned_raw: Option<&[u8]>,
+    io_controller: Option<&std::sync::Arc<AdaptiveIoController>>,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(bytes) = planned_raw {
+        anyhow::ensure!(
+            bytes.len() == len as usize,
+            "planned chunk raw length mismatch: expected {len}, got {}",
+            bytes.len()
+        );
+        return Ok(bytes.to_vec());
+    }
+    read_file_slice(file, offset, len, io_controller)
 }
 
 fn slice_block<'a>(
@@ -3571,6 +4448,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.blocks.batch_blocks, 0);
         assert_eq!(report.blocks.single_blocks, 2);
+        assert!(!report.adaptive_io.stages.contains_key("cache-pack-read"));
     }
 
     #[test]
@@ -3804,6 +4682,8 @@ mod tests {
                     len: 8,
                 },
             ]),
+            hot_chunks: None,
+            raw_bytes: None,
         }];
         let plans = plan_blocks(
             &files,
@@ -3826,6 +4706,66 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn planner_keeps_chunk_raw_bytes_within_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("large.bin");
+        let source = b"aaaaaaaabbbbbbbbccccccccdddddddd";
+        fs::write(&file_path, source).unwrap();
+        let files = vec![crate::ScannedFile {
+            relative_path: "large.bin".to_string(),
+            absolute_path: file_path,
+            size: source.len() as u64,
+            mtime_secs: 1,
+            mtime_ns: 1,
+            permissions: 0o644,
+            content_hash: *blake3::hash(source).as_bytes(),
+            hash_source: crate::scan::HashSource::Computed,
+            cached_chunks: None,
+            hot_chunks: None,
+            raw_bytes: None,
+        }];
+        let plans = plan_blocks_with_hot_chunks(
+            &files,
+            BatchOptions::default(),
+            ChunkOptions {
+                enabled: true,
+                chunk_file_threshold: 8,
+                chunk_size: 8,
+            },
+            SpeedMode::Fastest,
+            Some(1),
+            SolidMode::Off,
+            16,
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 4);
+        let retained = plans
+            .iter()
+            .filter(|plan| {
+                matches!(
+                    plan,
+                    PlannedBlock::Chunk {
+                        raw_bytes: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(retained, 2);
+        let mut raw = Vec::new();
+        let fill = fill_planned_raw(&plans[0], &files, &mut raw, None).unwrap();
+        assert_eq!(raw, b"aaaaaaaa");
+        assert_eq!(fill.source_hot_raw_bytes, 8);
+        assert_eq!(fill.source_read_bytes, 0);
+
+        let fill = fill_planned_raw(&plans[3], &files, &mut raw, None).unwrap();
+        assert_eq!(raw, b"dddddddd");
+        assert_eq!(fill.source_hot_raw_bytes, 0);
+        assert_eq!(fill.source_read_bytes, 8);
     }
 
     #[test]
@@ -4525,5 +5465,252 @@ mod tests {
                 .to_string()
                 .contains("no active Hig daemon")
         );
+    }
+
+    #[test]
+    fn archive_inspection_authenticates_manifest_without_extracting() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        let archive = temp.path().join("inspect.hig");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("hello.txt"), b"authenticated inspection").unwrap();
+        pack(PackOptions {
+            input_dir: input,
+            output_file: archive.clone(),
+            password: Some("inspect-password".to_string()),
+            encryption: EncryptionMode::Password,
+            cache_dir: Some(temp.path().join("cache")),
+            threads: None,
+            compression: Compression::Zstd,
+            level: Some(1),
+            use_cache: true,
+            trust_metadata: false,
+            format: ArchiveFormat::HigV2,
+            batch: BatchOptions::default(),
+            chunk: ChunkOptions::default(),
+            speed: SpeedMode::Balanced,
+            kdf_profile: crate::KdfProfile::FastBench,
+            sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
+            pipeline: crate::PipelineOptions::default(),
+        })
+        .unwrap();
+
+        assert!(inspect_archive(&archive, Some("wrong")).is_err());
+        let inspection = inspect_archive(&archive, Some("inspect-password")).unwrap();
+        assert!(inspection.encrypted);
+        assert_eq!(inspection.files.len(), 1);
+        assert_eq!(inspection.files[0].relative_path, "hello.txt");
+        assert_eq!(inspection.input_bytes, 24);
+    }
+
+    #[test]
+    fn cancelled_pack_does_not_create_an_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        let archive = temp.path().join("cancelled.hig");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("data.txt"), b"cancel me").unwrap();
+        let control = OperationControl::detached(OperationKind::Pack);
+        control.cancel();
+        let result = pack_with_control(
+            PackOptions {
+                input_dir: input,
+                output_file: archive.clone(),
+                password: None,
+                encryption: EncryptionMode::None,
+                cache_dir: None,
+                threads: None,
+                compression: Compression::Zstd,
+                level: Some(1),
+                use_cache: false,
+                trust_metadata: false,
+                format: ArchiveFormat::HigV2,
+                batch: BatchOptions::default(),
+                chunk: ChunkOptions::default(),
+                speed: SpeedMode::Balanced,
+                kdf_profile: crate::KdfProfile::Secure,
+                sealed_cache: false,
+                manifest_format: ManifestFormat::Compact,
+                use_session: false,
+                session_required: false,
+                session_ttl_secs: None,
+                solid: SolidMode::Off,
+                pipeline: crate::PipelineOptions::default(),
+            },
+            &control,
+        );
+        assert!(result.is_err());
+        assert!(!archive.exists());
+    }
+}
+const LOW_PAYLOAD_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const ADAPTIVE_PAYLOAD_MEMORY_FLOOR_BYTES: usize = 256 * 1024 * 1024;
+const ADAPTIVE_PAYLOAD_MEMORY_CEILING_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedPayloadMemory {
+    budget_bytes: usize,
+    available_bytes: usize,
+}
+
+fn resolve_payload_memory_budget(
+    mode: crate::PayloadMemoryMode,
+    input_bytes: u64,
+) -> ResolvedPayloadMemory {
+    let available_bytes = available_physical_memory_bytes().unwrap_or(0);
+    resolve_payload_memory_budget_with_available(mode, input_bytes, available_bytes)
+}
+
+fn resolve_hot_raw_memory_budget(mode: crate::PayloadMemoryMode) -> ResolvedPayloadMemory {
+    let available_bytes = available_physical_memory_bytes().unwrap_or(0);
+    resolve_hot_raw_memory_budget_with_available(mode, available_bytes)
+}
+
+fn resolve_hot_raw_memory_budget_with_available(
+    mode: crate::PayloadMemoryMode,
+    available_bytes: usize,
+) -> ResolvedPayloadMemory {
+    resolve_payload_memory_budget_with_available(
+        mode,
+        ADAPTIVE_PAYLOAD_MEMORY_CEILING_BYTES as u64,
+        available_bytes,
+    )
+}
+
+fn resolve_payload_memory_budget_with_available(
+    mode: crate::PayloadMemoryMode,
+    input_bytes: u64,
+    available_bytes: usize,
+) -> ResolvedPayloadMemory {
+    let budget_bytes = match mode {
+        crate::PayloadMemoryMode::Low => LOW_PAYLOAD_MEMORY_BYTES,
+        crate::PayloadMemoryMode::Adaptive => {
+            let workload_target = usize::try_from(input_bytes).unwrap_or(usize::MAX).clamp(
+                ADAPTIVE_PAYLOAD_MEMORY_FLOOR_BYTES,
+                ADAPTIVE_PAYLOAD_MEMORY_CEILING_BYTES,
+            );
+            let system_limit = if available_bytes == 0 {
+                ADAPTIVE_PAYLOAD_MEMORY_CEILING_BYTES
+            } else {
+                (available_bytes / 4).max(LOW_PAYLOAD_MEMORY_BYTES)
+            };
+            workload_target.min(system_limit)
+        }
+    };
+    ResolvedPayloadMemory {
+        budget_bytes,
+        available_bytes,
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn available_physical_memory_bytes() -> Option<usize> {
+    let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: stats points to HOST_VM_INFO64_COUNT writable integer slots.
+    let status = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            (&mut stats as *mut libc::vm_statistics64).cast(),
+            &mut count,
+        )
+    };
+    if status != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: sysconf has no memory safety preconditions.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    let pages = u64::from(stats.free_count)
+        + u64::from(stats.inactive_count)
+        + u64::from(stats.speculative_count)
+        + u64::from(stats.purgeable_count);
+    usize::try_from(pages)
+        .ok()?
+        .checked_mul(usize::try_from(page_size).ok()?)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn available_physical_memory_bytes() -> Option<usize> {
+    // SAFETY: sysconf has no memory safety preconditions.
+    let pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
+    // SAFETY: sysconf has no memory safety preconditions.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if pages <= 0 || page_size <= 0 {
+        return None;
+    }
+    usize::try_from(pages)
+        .ok()?
+        .checked_mul(usize::try_from(page_size).ok()?)
+}
+
+#[cfg(not(unix))]
+fn available_physical_memory_bytes() -> Option<usize> {
+    None
+}
+
+#[cfg(test)]
+mod payload_memory_tests {
+    use super::*;
+    use crate::PayloadMemoryMode;
+
+    #[test]
+    fn low_mode_always_uses_fixed_budget() {
+        let resolved =
+            resolve_payload_memory_budget_with_available(PayloadMemoryMode::Low, u64::MAX, 0);
+        assert_eq!(resolved.budget_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn adaptive_mode_keeps_medium_projects_in_memory() {
+        let resolved = resolve_payload_memory_budget_with_available(
+            PayloadMemoryMode::Adaptive,
+            506 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        );
+        assert_eq!(resolved.budget_bytes, 506 * 1024 * 1024);
+    }
+
+    #[test]
+    fn adaptive_mode_caps_large_projects() {
+        let resolved = resolve_payload_memory_budget_with_available(
+            PayloadMemoryMode::Adaptive,
+            4 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        );
+        assert_eq!(resolved.budget_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn adaptive_mode_respects_low_available_memory() {
+        let resolved = resolve_payload_memory_budget_with_available(
+            PayloadMemoryMode::Adaptive,
+            506 * 1024 * 1024,
+            320 * 1024 * 1024,
+        );
+        assert_eq!(resolved.budget_bytes, 80 * 1024 * 1024);
+    }
+
+    #[test]
+    fn adaptive_hot_raw_budget_uses_ceiling_workload_target() {
+        let resolved =
+            resolve_hot_raw_memory_budget_with_available(PayloadMemoryMode::Adaptive, usize::MAX);
+        assert_eq!(resolved.budget_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn low_hot_raw_budget_matches_low_memory_mode() {
+        let resolved =
+            resolve_hot_raw_memory_budget_with_available(PayloadMemoryMode::Low, usize::MAX);
+        assert_eq!(resolved.budget_bytes, 64 * 1024 * 1024);
     }
 }

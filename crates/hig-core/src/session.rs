@@ -33,7 +33,7 @@ pub fn derive_session_binding(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"hig session binding v2");
     hasher.update(cache_dir_string.as_bytes());
-    hasher.update(format!("{kdf_profile:?}:{encryption:?}:1.8.0").as_bytes());
+    hasher.update(format!("{kdf_profile:?}:{encryption:?}:1.9.7").as_bytes());
     hasher.update(&kdf.memory_cost_kib.to_le_bytes());
     hasher.update(&kdf.time_cost.to_le_bytes());
     hasher.update(&kdf.parallelism.to_le_bytes());
@@ -43,7 +43,7 @@ pub fn derive_session_binding(
         kdf_profile,
         kdf: kdf.clone(),
         encryption,
-        hig_version: "1.8.0".to_string(),
+        hig_version: "1.9.7".to_string(),
     }
 }
 

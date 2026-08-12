@@ -1,8 +1,10 @@
+use crate::adaptive_io::{AdaptiveIoController, IoDirection};
 use crate::{IoOptions, WriterStrategy};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::Instant;
 
@@ -10,7 +12,11 @@ const SMALL_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
 const LARGE_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const PREALLOCATE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 const PREFETCH_MIN_BYTES: u64 = 8 * 1024 * 1024;
-const DIRECT_WRITE_MIN_BYTES: usize = 32 * 1024 * 1024;
+const DIRECT_WRITE_MIN_BYTES: usize = 8 * 1024 * 1024;
+const COALESCED_MAX_BYTES: usize = 8 * 1024 * 1024;
+const COALESCED_MAX_SLICES: usize = 64;
+const CONSTRAINED_COALESCED_MAX_BYTES: usize = 1024 * 1024;
+const CONSTRAINED_COALESCED_MAX_SLICES: usize = 16;
 
 pub(crate) enum PayloadSource {
     Memory(Vec<u8>),
@@ -23,6 +29,155 @@ pub(crate) enum PayloadSource {
         offset: u64,
         len: u64,
     },
+}
+
+pub(crate) struct PayloadStager {
+    memory_budget_bytes: u64,
+    memory_bytes: u64,
+    spool_path: PathBuf,
+    spool_writer: Option<BufWriter<File>>,
+    spool_bytes: u64,
+    spool_payloads: usize,
+    io_controller: Option<Arc<AdaptiveIoController>>,
+}
+
+impl PayloadStager {
+    #[cfg(test)]
+    pub(crate) fn new(final_path: &Path, memory_budget_bytes: usize) -> Self {
+        Self::new_with_io(final_path, memory_budget_bytes, None)
+    }
+
+    pub(crate) fn new_with_io(
+        final_path: &Path,
+        memory_budget_bytes: usize,
+        io_controller: Option<Arc<AdaptiveIoController>>,
+    ) -> Self {
+        Self {
+            memory_budget_bytes: memory_budget_bytes as u64,
+            memory_bytes: 0,
+            spool_path: unique_sidecar_path(final_path, "payload-spool"),
+            spool_writer: None,
+            spool_bytes: 0,
+            spool_payloads: 0,
+            io_controller,
+        }
+    }
+
+    pub(crate) fn stage(&mut self, bytes: Vec<u8>) -> anyhow::Result<PayloadSource> {
+        let len = bytes.len() as u64;
+        if self
+            .memory_bytes
+            .checked_add(len)
+            .is_some_and(|total| total <= self.memory_budget_bytes)
+        {
+            self.memory_bytes += len;
+            return Ok(PayloadSource::Memory(bytes));
+        }
+
+        let offset = self.spool_bytes;
+        if self.spool_writer.is_none() {
+            if let Some(parent) = self.spool_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent)?;
+            }
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&self.spool_path)?;
+            self.spool_writer = Some(BufWriter::with_capacity(8 * 1024 * 1024, file));
+        }
+        for chunk in bytes.chunks(1024 * 1024) {
+            let buffered_before = self
+                .spool_writer
+                .as_ref()
+                .expect("payload spool opened")
+                .buffer()
+                .len();
+            let will_flush = buffered_before.saturating_add(chunk.len())
+                >= self
+                    .spool_writer
+                    .as_ref()
+                    .expect("payload spool opened")
+                    .capacity();
+            let permit = if will_flush {
+                self.io_controller.as_ref().map(|controller| {
+                    controller.acquire(
+                        "payload-spool-write",
+                        IoDirection::Write,
+                        buffered_before.saturating_add(chunk.len()) as u64,
+                    )
+                })
+            } else {
+                None
+            };
+            self.spool_writer
+                .as_mut()
+                .expect("payload spool opened")
+                .write_all(chunk)?;
+            let buffered_after = self
+                .spool_writer
+                .as_ref()
+                .expect("payload spool opened")
+                .buffer()
+                .len();
+            if let Some(permit) = permit {
+                permit.finish_with_bytes(
+                    buffered_before
+                        .saturating_add(chunk.len())
+                        .saturating_sub(buffered_after) as u64,
+                );
+            }
+        }
+        self.spool_bytes = self
+            .spool_bytes
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("payload spool length overflow"))?;
+        self.spool_payloads += 1;
+        Ok(PayloadSource::CachedRange {
+            path: self.spool_path.clone(),
+            offset,
+            len,
+        })
+    }
+
+    pub(crate) fn finish_writes(&mut self) -> anyhow::Result<()> {
+        let Some(mut writer) = self.spool_writer.take() else {
+            return Ok(());
+        };
+        let pending = writer.buffer().len() as u64;
+        let permit = self.io_controller.as_ref().map(|controller| {
+            controller.acquire("payload-spool-write", IoDirection::Write, pending)
+        });
+        writer.flush()?;
+        if let Some(permit) = permit {
+            permit.finish_with_bytes(pending);
+        }
+        writer
+            .into_inner()
+            .map_err(|error| anyhow::anyhow!("payload spool flush failed: {}", error.error()))?;
+        Ok(())
+    }
+
+    pub(crate) fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
+    }
+
+    pub(crate) fn spool_bytes(&self) -> u64 {
+        self.spool_bytes
+    }
+
+    pub(crate) fn spool_payloads(&self) -> usize {
+        self.spool_payloads
+    }
+}
+
+impl Drop for PayloadStager {
+    fn drop(&mut self) {
+        if self.spool_writer.is_some() || self.spool_bytes > 0 {
+            let _ = fs::remove_file(&self.spool_path);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,10 +239,29 @@ pub(crate) struct WriterReport {
     pub writer_wait_ms: u128,
     pub flush_ms: u128,
     pub rename_ms: u128,
+    pub temp_create_us: u64,
+    pub preallocate_us: u64,
+    pub payload_read_us: u64,
+    pub payload_write_us: u64,
+    pub payload_memory_write_us: u64,
+    pub payload_cached_write_us: u64,
+    pub direct_write_us: u64,
+    pub buffered_write_us: u64,
+    pub writer_wait_us: u64,
     pub flush_us: u64,
+    pub fsync_us: u64,
     pub rename_us: u64,
+    pub memory_payload_count: usize,
+    pub memory_payload_bytes: u64,
+    pub cached_file_payload_count: usize,
+    pub cached_file_payload_bytes: u64,
+    pub cached_range_payload_count: usize,
+    pub cached_range_payload_bytes: u64,
     pub direct_write_count: usize,
     pub buffered_write_count: usize,
+    pub coalesced_write_count: usize,
+    pub coalesced_payload_count: usize,
+    pub coalesced_bytes: u64,
     pub preallocation_enabled: bool,
 }
 
@@ -100,6 +274,7 @@ pub(crate) struct ArchiveWriter {
     committed: bool,
     options: ResolvedIoOptions,
     report: WriterReport,
+    io_controller: Option<Arc<AdaptiveIoController>>,
 }
 
 impl ArchiveWriter {
@@ -108,18 +283,44 @@ impl ArchiveWriter {
         expected_len: u64,
         options: IoOptions,
     ) -> anyhow::Result<Self> {
+        Self::create_with_io(final_path, expected_len, options, None)
+    }
+
+    pub(crate) fn create_with_io(
+        final_path: &Path,
+        expected_len: u64,
+        options: IoOptions,
+        io_controller: Option<Arc<AdaptiveIoController>>,
+    ) -> anyhow::Result<Self> {
         let options = ResolvedIoOptions::resolve(expected_len, options)?;
         let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
         let temp_path = unique_temp_path(final_path);
+        let temp_create_started = Instant::now();
+        let create_permit = io_controller
+            .as_ref()
+            .map(|controller| controller.acquire("archive-create", IoDirection::Write, 0));
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temp_path)?;
+        if let Some(permit) = create_permit {
+            permit.finish();
+        }
+        let temp_create_us = temp_create_started.elapsed().as_micros() as u64;
+        let mut preallocate_us = 0;
         if options.preallocate {
+            let preallocate_started = Instant::now();
+            let permit = io_controller
+                .as_ref()
+                .map(|controller| controller.acquire("archive-preallocate", IoDirection::Write, 0));
             file.set_len(expected_len)?;
+            if let Some(permit) = permit {
+                permit.finish();
+            }
+            preallocate_us = preallocate_started.elapsed().as_micros() as u64;
         }
         Ok(Self {
             final_path: final_path.to_path_buf(),
@@ -130,10 +331,14 @@ impl ArchiveWriter {
             committed: false,
             options,
             report: WriterReport {
+                temp_create_us,
+                preallocate_us,
                 preallocated_bytes: if options.preallocate { expected_len } else { 0 },
                 preallocation_enabled: options.preallocate,
+                peak_pipeline_memory_bytes: options.writer_buffer_bytes as u64,
                 ..WriterReport::default()
             },
+            io_controller,
         })
     }
 
@@ -180,7 +385,15 @@ impl ArchiveWriter {
             .writer
             .take()
             .ok_or_else(|| anyhow::anyhow!("archive writer already finished"))?;
+        let pending = writer.buffer().len() as u64;
+        let flush_permit = self
+            .io_controller
+            .as_ref()
+            .map(|controller| controller.acquire("archive-write", IoDirection::Write, pending));
         writer.flush()?;
+        if let Some(permit) = flush_permit {
+            permit.finish_with_bytes(pending);
+        }
         let file = writer
             .into_inner()
             .map_err(|error| anyhow::anyhow!("archive flush failed: {}", error.error()))?;
@@ -198,19 +411,36 @@ impl ArchiveWriter {
 
     fn write_buffered(&mut self, payloads: &[PayloadSource]) -> anyhow::Result<()> {
         let mut buffer = vec![0_u8; self.options.transfer_chunk_bytes];
-        self.report.peak_pipeline_memory_bytes = buffer.len() as u64;
+        self.report.peak_pipeline_memory_bytes = self
+            .report
+            .peak_pipeline_memory_bytes
+            .max((self.options.writer_buffer_bytes + buffer.len()) as u64);
         let mut open_files = BTreeMap::<PathBuf, File>::new();
-        for payload in payloads {
-            match payload {
-                PayloadSource::Memory(bytes) => self.write_payload_bytes(bytes)?,
+        let mut payload_index = 0;
+        while payload_index < payloads.len() {
+            match &payloads[payload_index] {
+                PayloadSource::Memory(_) => {
+                    let run_start = payload_index;
+                    while payload_index < payloads.len()
+                        && matches!(payloads[payload_index], PayloadSource::Memory(_))
+                    {
+                        payload_index += 1;
+                    }
+                    self.write_memory_run(&payloads[run_start..payload_index])?;
+                    continue;
+                }
                 PayloadSource::CachedFile { path, len } => {
                     validate_cached_file(path, *len)?;
                     let mut input = File::open(path)?;
                     self.report.cached_payload_open_count += 1;
+                    self.report.cached_file_payload_count += 1;
+                    self.report.cached_file_payload_bytes += *len;
                     self.copy_range(&mut input, *len, &mut buffer)?;
                 }
                 PayloadSource::CachedRange { path, offset, len } => {
                     validate_cached_range(path, *offset, *len)?;
+                    self.report.cached_range_payload_count += 1;
+                    self.report.cached_range_payload_bytes += *len;
                     let input = match open_files.get_mut(path) {
                         Some(input) => input,
                         None => {
@@ -224,6 +454,7 @@ impl ArchiveWriter {
                     self.copy_range(input, *len, &mut buffer)?;
                 }
             }
+            payload_index += 1;
         }
         Ok(())
     }
@@ -232,10 +463,18 @@ impl ArchiveWriter {
         let mut remaining = len;
         while remaining > 0 {
             let limit = remaining.min(buffer.len() as u64) as usize;
+            let permit = self.io_controller.as_ref().map(|controller| {
+                controller.acquire("archive-payload-read", IoDirection::Read, limit as u64)
+            });
             let read_started = Instant::now();
             input.read_exact(&mut buffer[..limit])?;
-            self.report.payload_read_ms += read_started.elapsed().as_millis();
-            self.write_payload_bytes(&buffer[..limit])?;
+            let read_us = read_started.elapsed().as_micros() as u64;
+            if let Some(permit) = permit {
+                permit.finish_with_bytes(limit as u64);
+            }
+            self.report.payload_read_us += read_us;
+            self.report.payload_read_ms += (read_us / 1000) as u128;
+            self.write_payload_bytes(&buffer[..limit], PayloadWriteKind::Cached)?;
             self.report.cached_payload_read_bytes += limit as u64;
             remaining -= limit as u64;
         }
@@ -274,7 +513,10 @@ impl ArchiveWriter {
 
         let chunk_size = self.options.transfer_chunk_bytes;
         let pool_size = self.options.prefetch_depth + 1;
-        self.report.peak_pipeline_memory_bytes = (chunk_size * pool_size) as u64;
+        self.report.peak_pipeline_memory_bytes = self
+            .report
+            .peak_pipeline_memory_bytes
+            .max((self.options.writer_buffer_bytes + chunk_size * pool_size) as u64);
         let (data_tx, data_rx) = sync_channel(self.options.prefetch_depth);
         let (free_tx, free_rx) = sync_channel(pool_size);
         for _ in 0..pool_size {
@@ -282,27 +524,45 @@ impl ArchiveWriter {
         }
 
         std::thread::scope(|scope| -> anyhow::Result<()> {
-            let producer =
-                scope.spawn(move || prefetch_cached(cached, chunk_size, free_rx, data_tx));
+            let io_controller = self.io_controller.clone();
+            let producer = scope.spawn(move || {
+                prefetch_cached(cached, chunk_size, free_rx, data_tx, io_controller)
+            });
             let write_result = (|| -> anyhow::Result<()> {
-                for (index, payload) in payloads.iter().enumerate() {
-                    match payload {
-                        PayloadSource::Memory(bytes) => self.write_payload_bytes(bytes)?,
+                let mut index = 0;
+                while index < payloads.len() {
+                    match &payloads[index] {
+                        PayloadSource::Memory(_) => {
+                            let run_start = index;
+                            while index < payloads.len()
+                                && matches!(payloads[index], PayloadSource::Memory(_))
+                            {
+                                index += 1;
+                            }
+                            self.write_memory_run(&payloads[run_start..index])?;
+                            continue;
+                        }
                         PayloadSource::CachedFile { len, .. }
                         | PayloadSource::CachedRange { len, .. } => {
-                            if matches!(payload, PayloadSource::CachedFile { .. }) {
-                                self.report.cached_payload_open_count += 1;
+                            if matches!(payloads[index], PayloadSource::CachedFile { .. }) {
+                                self.report.cached_file_payload_count += 1;
+                                self.report.cached_file_payload_bytes += *len;
+                            } else {
+                                self.report.cached_range_payload_count += 1;
+                                self.report.cached_range_payload_bytes += *len;
                             }
                             let mut received = 0_u64;
                             loop {
                                 let wait_started = Instant::now();
                                 let message = data_rx.recv()?;
-                                self.report.writer_wait_ms += wait_started.elapsed().as_millis();
+                                let wait_us = wait_started.elapsed().as_micros() as u64;
+                                self.report.writer_wait_us += wait_us;
+                                self.report.writer_wait_ms += (wait_us / 1000) as u128;
                                 match message {
                                     PrefetchMessage::Data {
                                         payload_index,
                                         mut bytes,
-                                        read_ms,
+                                        read_us,
                                     } => {
                                         ensure_payload_index(index, payload_index)?;
                                         received =
@@ -314,10 +574,11 @@ impl ArchiveWriter {
                                                 "prefetched payload exceeds declared length"
                                             );
                                         }
-                                        self.report.payload_read_ms += read_ms;
+                                        self.report.payload_read_us += read_us;
+                                        self.report.payload_read_ms += (read_us / 1000) as u128;
                                         self.report.cached_payload_read_bytes += bytes.len() as u64;
                                         self.report.prefetched_bytes += bytes.len() as u64;
-                                        self.write_payload_bytes(&bytes)?;
+                                        self.write_payload_bytes(&bytes, PayloadWriteKind::Cached)?;
                                         bytes.clear();
                                         let _ = free_tx.send(bytes);
                                     }
@@ -347,6 +608,7 @@ impl ArchiveWriter {
                             }
                         }
                     }
+                    index += 1;
                 }
                 Ok(())
             })();
@@ -361,30 +623,216 @@ impl ArchiveWriter {
         })
     }
 
-    fn write_payload_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+    fn write_payload_bytes(&mut self, bytes: &[u8], kind: PayloadWriteKind) -> anyhow::Result<()> {
         let started = Instant::now();
         if self.can_direct_write(bytes.len()) {
+            self.flush_buffered_prefix()?;
+            let permit = self.io_controller.as_ref().map(|controller| {
+                controller.acquire("archive-write", IoDirection::Write, bytes.len() as u64)
+            });
             let writer = self
                 .writer
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("archive writer already finished"))?;
             writer.get_mut().write_all(bytes)?;
+            if let Some(permit) = permit {
+                permit.finish_with_bytes(bytes.len() as u64);
+            }
             self.written = self
                 .written
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| anyhow::anyhow!("archive length overflow"))?;
             self.report.direct_write_count += 1;
+            let elapsed_us = started.elapsed().as_micros() as u64;
+            self.report.direct_write_us += elapsed_us;
+            self.record_payload_write_elapsed(kind, elapsed_us);
         } else {
             self.write_all(bytes)?;
             self.report.buffered_write_count += 1;
+            let elapsed_us = started.elapsed().as_micros() as u64;
+            self.report.buffered_write_us += elapsed_us;
+            self.record_payload_write_elapsed(kind, elapsed_us);
         }
-        self.report.payload_write_ms += started.elapsed().as_millis();
         Ok(())
     }
 
-    fn can_direct_write(&self, len: usize) -> bool {
-        len >= DIRECT_WRITE_MIN_BYTES && len > self.options.writer_buffer_bytes
+    fn write_memory_run(&mut self, payloads: &[PayloadSource]) -> anyhow::Result<()> {
+        for payload in payloads {
+            let PayloadSource::Memory(bytes) = payload else {
+                unreachable!("memory run contains a cached payload");
+            };
+            self.report.memory_payload_count += 1;
+            self.report.memory_payload_bytes += bytes.len() as u64;
+        }
+
+        let mut index = 0;
+        while index < payloads.len() {
+            let PayloadSource::Memory(bytes) = &payloads[index] else {
+                unreachable!("memory run contains a cached payload");
+            };
+            if bytes.len() >= DIRECT_WRITE_MIN_BYTES {
+                self.write_payload_bytes(bytes, PayloadWriteKind::Memory)?;
+                index += 1;
+                continue;
+            }
+
+            let (max_bytes, max_slices) = self.coalescing_limits();
+            let batch_start = index;
+            let mut batch_bytes = 0_usize;
+            while index < payloads.len() && index - batch_start < max_slices {
+                let PayloadSource::Memory(bytes) = &payloads[index] else {
+                    unreachable!("memory run contains a cached payload");
+                };
+                if bytes.len() >= DIRECT_WRITE_MIN_BYTES
+                    || (batch_bytes > 0 && batch_bytes.saturating_add(bytes.len()) > max_bytes)
+                {
+                    break;
+                }
+                batch_bytes = batch_bytes.saturating_add(bytes.len());
+                index += 1;
+            }
+
+            let batch = &payloads[batch_start..index];
+            if batch.len() == 1 {
+                let PayloadSource::Memory(bytes) = &batch[0] else {
+                    unreachable!("memory run contains a cached payload");
+                };
+                self.write_payload_bytes(bytes, PayloadWriteKind::Memory)?;
+            } else {
+                let slices = batch
+                    .iter()
+                    .map(|payload| match payload {
+                        PayloadSource::Memory(bytes) => bytes.as_slice(),
+                        _ => unreachable!("memory run contains a cached payload"),
+                    })
+                    .collect::<Vec<_>>();
+                self.write_payload_slices(&slices, batch_bytes)?;
+            }
+        }
+        Ok(())
     }
+
+    fn write_payload_slices(&mut self, slices: &[&[u8]], total: usize) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let mut slice_index = 0;
+        let mut slice_offset = 0;
+        while slice_index < slices.len() {
+            let mut io_slices = Vec::with_capacity(slices.len() - slice_index);
+            io_slices.push(IoSlice::new(&slices[slice_index][slice_offset..]));
+            io_slices.extend(
+                slices[slice_index + 1..]
+                    .iter()
+                    .map(|bytes| IoSlice::new(bytes)),
+            );
+            let written = self.write_vectored_once(&io_slices)?;
+            if written == 0 && io_slices.iter().any(|slice| !slice.is_empty()) {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
+            let mut remaining = written;
+            while slice_index < slices.len() {
+                let available = slices[slice_index].len().saturating_sub(slice_offset);
+                if remaining < available {
+                    slice_offset += remaining;
+                    break;
+                }
+                remaining -= available;
+                slice_index += 1;
+                slice_offset = 0;
+            }
+        }
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        self.report.buffered_write_count += 1;
+        self.report.buffered_write_us += elapsed_us;
+        self.report.coalesced_write_count += 1;
+        self.report.coalesced_payload_count += slices.len();
+        self.report.coalesced_bytes += total as u64;
+        self.record_payload_write_elapsed(PayloadWriteKind::Memory, elapsed_us);
+        Ok(())
+    }
+
+    fn write_vectored_once(&mut self, slices: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let writer = self.writer.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "archive writer finished")
+        })?;
+        let buffered_before = writer.buffer().len();
+        let requested = slices.iter().map(|slice| slice.len()).sum::<usize>();
+        let will_flush = buffered_before.saturating_add(requested) >= writer.capacity();
+        let permit = if will_flush {
+            self.io_controller.as_ref().map(|controller| {
+                controller.acquire(
+                    "archive-write",
+                    IoDirection::Write,
+                    buffered_before.saturating_add(requested) as u64,
+                )
+            })
+        } else {
+            None
+        };
+        let written = writer.write_vectored(slices)?;
+        let buffered_after = writer.buffer().len();
+        if let Some(permit) = permit {
+            permit.finish_with_bytes(
+                buffered_before
+                    .saturating_add(written)
+                    .saturating_sub(buffered_after) as u64,
+            );
+        }
+        self.written = self
+            .written
+            .checked_add(written as u64)
+            .ok_or_else(|| std::io::Error::other("archive length overflow"))?;
+        Ok(written)
+    }
+
+    fn coalescing_limits(&self) -> (usize, usize) {
+        let constrained = self.io_controller.as_ref().is_some_and(|controller| {
+            controller.target_concurrency() < controller.max_concurrency()
+        });
+        if constrained {
+            (
+                CONSTRAINED_COALESCED_MAX_BYTES,
+                CONSTRAINED_COALESCED_MAX_SLICES,
+            )
+        } else {
+            (COALESCED_MAX_BYTES, COALESCED_MAX_SLICES)
+        }
+    }
+
+    fn flush_buffered_prefix(&mut self) -> anyhow::Result<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("archive writer already finished"))?;
+        let pending = writer.buffer().len() as u64;
+        let permit = self
+            .io_controller
+            .as_ref()
+            .map(|controller| controller.acquire("archive-write", IoDirection::Write, pending));
+        writer.flush()?;
+        if let Some(permit) = permit {
+            permit.finish_with_bytes(pending);
+        }
+        Ok(())
+    }
+
+    fn record_payload_write_elapsed(&mut self, kind: PayloadWriteKind, elapsed_us: u64) {
+        self.report.payload_write_us += elapsed_us;
+        self.report.payload_write_ms += (elapsed_us / 1000) as u128;
+        match kind {
+            PayloadWriteKind::Memory => self.report.payload_memory_write_us += elapsed_us,
+            PayloadWriteKind::Cached => self.report.payload_cached_write_us += elapsed_us,
+        }
+    }
+
+    fn can_direct_write(&self, len: usize) -> bool {
+        len >= DIRECT_WRITE_MIN_BYTES
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PayloadWriteKind {
+    Memory,
+    Cached,
 }
 
 impl Write for ArchiveWriter {
@@ -392,7 +840,28 @@ impl Write for ArchiveWriter {
         let writer = self.writer.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "archive writer finished")
         })?;
+        let buffered_before = writer.buffer().len();
+        let will_flush = buffered_before.saturating_add(bytes.len()) >= writer.capacity();
+        let permit = if will_flush {
+            self.io_controller.as_ref().map(|controller| {
+                controller.acquire(
+                    "archive-write",
+                    IoDirection::Write,
+                    buffered_before.saturating_add(bytes.len()) as u64,
+                )
+            })
+        } else {
+            None
+        };
         let written = writer.write(bytes)?;
+        let buffered_after = writer.buffer().len();
+        if let Some(permit) = permit {
+            permit.finish_with_bytes(
+                buffered_before
+                    .saturating_add(written)
+                    .saturating_sub(buffered_after) as u64,
+            );
+        }
         self.written = self
             .written
             .checked_add(written as u64)
@@ -401,12 +870,21 @@ impl Write for ArchiveWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.writer
-            .as_mut()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "archive writer finished")
-            })?
-            .flush()
+        let writer = self.writer.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "archive writer finished")
+        })?;
+        let pending = writer.buffer().len() as u64;
+        let permit = self
+            .io_controller
+            .as_ref()
+            .map(|controller| controller.acquire("archive-write", IoDirection::Write, pending));
+        let result = writer.flush();
+        if result.is_ok()
+            && let Some(permit) = permit
+        {
+            permit.finish_with_bytes(pending);
+        }
+        result
     }
 }
 
@@ -435,7 +913,7 @@ enum PrefetchMessage {
     Data {
         payload_index: usize,
         bytes: Vec<u8>,
-        read_ms: u128,
+        read_us: u64,
     },
     End {
         payload_index: usize,
@@ -449,6 +927,7 @@ fn prefetch_cached(
     chunk_size: usize,
     free_rx: Receiver<Vec<u8>>,
     data_tx: SyncSender<PrefetchMessage>,
+    io_controller: Option<Arc<AdaptiveIoController>>,
 ) -> anyhow::Result<()> {
     let mut open_files = BTreeMap::<PathBuf, File>::new();
     for cached_read in cached {
@@ -474,15 +953,21 @@ fn prefetch_cached(
                 let mut buffer = free_rx.recv()?;
                 let limit = remaining.min(chunk_size as u64) as usize;
                 buffer.resize(limit, 0);
+                let permit = io_controller.as_ref().map(|controller| {
+                    controller.acquire("archive-payload-read", IoDirection::Read, limit as u64)
+                });
                 let read_started = Instant::now();
                 input.read_exact(&mut buffer)?;
-                let read_ms = read_started.elapsed().as_millis();
+                let read_us = read_started.elapsed().as_micros() as u64;
+                if let Some(permit) = permit {
+                    permit.finish_with_bytes(limit as u64);
+                }
                 total += limit as u64;
                 remaining -= limit as u64;
                 data_tx.send(PrefetchMessage::Data {
                     payload_index: cached_read.payload_index,
                     bytes: buffer,
-                    read_ms,
+                    read_us,
                 })?;
             }
             data_tx.send(PrefetchMessage::End {
@@ -538,6 +1023,10 @@ fn ensure_payload_index(expected: usize, actual: usize) -> anyhow::Result<()> {
 }
 
 fn unique_temp_path(final_path: &Path) -> PathBuf {
+    unique_sidecar_path(final_path, "hig-tmp")
+}
+
+fn unique_sidecar_path(final_path: &Path, kind: &str) -> PathBuf {
     let name = final_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -546,7 +1035,7 @@ fn unique_temp_path(final_path: &Path) -> PathBuf {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    final_path.with_file_name(format!(".{name}.hig-tmp-{}-{random}", std::process::id()))
+    final_path.with_file_name(format!(".{name}.{kind}-{}-{random}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -562,6 +1051,118 @@ mod tests {
         writer.write_all(b"short").unwrap();
         assert!(writer.finish().is_err());
         assert_eq!(fs::read(target).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn payload_stager_bounds_memory_and_cleans_spool() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("nested/archive.hig");
+        let spool_path;
+        {
+            let mut stager = PayloadStager::new(&target, 4);
+            assert!(matches!(
+                stager.stage(b"aaaa".to_vec()).unwrap(),
+                PayloadSource::Memory(_)
+            ));
+            let second = stager.stage(b"bbbb".to_vec()).unwrap();
+            let third = stager.stage(b"cc".to_vec()).unwrap();
+            stager.finish_writes().unwrap();
+
+            assert_eq!(stager.memory_bytes(), 4);
+            assert_eq!(stager.spool_bytes(), 6);
+            assert_eq!(stager.spool_payloads(), 2);
+            assert!(matches!(
+                second,
+                PayloadSource::CachedRange {
+                    offset: 0,
+                    len: 4,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                third,
+                PayloadSource::CachedRange {
+                    offset: 4,
+                    len: 2,
+                    ..
+                }
+            ));
+            spool_path = stager.spool_path.clone();
+            assert_eq!(fs::read(&spool_path).unwrap(), b"bbbbcc");
+        }
+        assert!(!spool_path.exists());
+    }
+
+    #[test]
+    fn direct_payload_preserves_buffered_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("archive.hig");
+        let payload = vec![7_u8; DIRECT_WRITE_MIN_BYTES];
+        let expected_len = (6 + payload.len()) as u64;
+        let mut writer =
+            ArchiveWriter::create(&target, expected_len, IoOptions::default()).unwrap();
+        writer.write_all(b"header").unwrap();
+        writer
+            .write_payloads(&[PayloadSource::Memory(payload)])
+            .unwrap();
+        let report = writer.finish().unwrap();
+        let bytes = fs::read(target).unwrap();
+
+        assert_eq!(&bytes[..6], b"header");
+        assert!(bytes[6..].iter().all(|byte| *byte == 7));
+        assert_eq!(report.direct_write_count, 1);
+        assert_eq!(report.buffered_write_count, 0);
+    }
+
+    #[test]
+    fn consecutive_memory_payloads_are_coalesced_without_reordering() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("coalesced.hig");
+        let payloads = (0..130)
+            .map(|index| PayloadSource::Memory(vec![index as u8; 4]))
+            .collect::<Vec<_>>();
+        let expected = (0..130)
+            .flat_map(|index| vec![index as u8; 4])
+            .collect::<Vec<_>>();
+        let mut writer =
+            ArchiveWriter::create(&target, expected.len() as u64, IoOptions::default()).unwrap();
+
+        writer.write_payloads(&payloads).unwrap();
+        let report = writer.finish().unwrap();
+
+        assert_eq!(fs::read(target).unwrap(), expected);
+        assert_eq!(report.memory_payload_count, 130);
+        assert_eq!(report.memory_payload_bytes, 520);
+        assert_eq!(report.buffered_write_count, 3);
+        assert_eq!(report.coalesced_write_count, 3);
+        assert_eq!(report.coalesced_payload_count, 130);
+        assert_eq!(report.coalesced_bytes, 520);
+    }
+
+    #[test]
+    fn direct_payload_splits_memory_coalescing_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("mixed.hig");
+        let large = vec![7_u8; DIRECT_WRITE_MIN_BYTES];
+        let payloads = vec![
+            PayloadSource::Memory(b"before".to_vec()),
+            PayloadSource::Memory(large.clone()),
+            PayloadSource::Memory(b"after".to_vec()),
+        ];
+        let expected_len = (11 + large.len()) as u64;
+        let mut writer =
+            ArchiveWriter::create(&target, expected_len, IoOptions::default()).unwrap();
+
+        writer.write_payloads(&payloads).unwrap();
+        let report = writer.finish().unwrap();
+        let bytes = fs::read(target).unwrap();
+
+        assert_eq!(&bytes[..6], b"before");
+        assert_eq!(&bytes[6..6 + large.len()], large);
+        assert_eq!(&bytes[6 + large.len()..], b"after");
+        assert_eq!(report.direct_write_count, 1);
+        assert_eq!(report.buffered_write_count, 2);
+        assert_eq!(report.coalesced_write_count, 0);
     }
 
     #[test]
@@ -674,6 +1275,30 @@ mod tests {
             ArchiveWriter::create(&target, 64 * 1024 * 1024, IoOptions::default()).unwrap();
         assert!(writer.report.preallocation_enabled);
         assert_eq!(writer.report.preallocated_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn adaptive_writer_reports_bytes_flushed_to_the_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("adaptive.hig");
+        let payload = vec![5_u8; 2 * 1024 * 1024];
+        let controller = AdaptiveIoController::new(4);
+        let mut writer = ArchiveWriter::create_with_io(
+            &target,
+            payload.len() as u64,
+            IoOptions::default(),
+            Some(controller.clone()),
+        )
+        .unwrap();
+        writer.write_all(&payload).unwrap();
+        writer.finish().unwrap();
+
+        let report = controller.report();
+        assert_eq!(
+            report.stages.get("archive-write").unwrap().bytes,
+            payload.len() as u64
+        );
+        assert_eq!(fs::read(target).unwrap(), payload);
     }
 
     #[test]

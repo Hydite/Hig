@@ -1,0 +1,18 @@
+{
+  "name": "@hig/archive-mcp-server",
+  "version": "1.10.0",
+  "private": true,
+  "description": "MCP stdio adapter for the Hig CLI archive tool.",
+  "type": "module",
+  "bin": {
+    "hig-mcp-server": "./bin/hig-mcp-server.js"
+  },
+  "scripts": {
+    "start": "node ./bin/hig-mcp-server.js",
+    "smoke": "node ./bin/hig-mcp-server.js --smoke"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

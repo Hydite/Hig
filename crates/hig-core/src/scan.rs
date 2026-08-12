@@ -1,9 +1,13 @@
-use crate::ChunkOptions;
+use crate::adaptive_io::{AdaptiveIoController, IoDirection};
 use crate::cache::{CacheStore, PathChunkRecord, reusable_path_chunks};
+use crate::{ChunkOptions, Compression, codec};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -18,6 +22,19 @@ pub struct ScannedFile {
     pub content_hash: [u8; 32],
     pub hash_source: HashSource,
     pub cached_chunks: Option<Vec<PathChunkRecord>>,
+    #[serde(default, skip)]
+    pub hot_chunks: Option<Vec<HotChunkRecord>>,
+    #[serde(default, skip)]
+    pub raw_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotChunkRecord {
+    pub chunk_hash: [u8; 32],
+    pub file_offset: u64,
+    pub len: u64,
+    pub balanced_level: i32,
+    pub raw_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,10 +43,13 @@ pub enum HashSource {
     MetadataCache,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
     pub trust_metadata: bool,
     pub chunk: ChunkOptions,
+    pub hot_raw_bytes_budget: usize,
+    pub probe_chunk_levels: bool,
+    pub(crate) io_controller: Option<Arc<AdaptiveIoController>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -41,9 +61,20 @@ pub struct ScanStats {
     pub chunk_metadata_reuses: usize,
     pub chunk_metadata_misses: usize,
     pub trusted_bytes_skipped: u64,
+    #[serde(default)]
+    pub hot_raw_bytes_budget: u64,
+    pub hot_raw_bytes: u64,
+    pub hot_chunk_raw_bytes: u64,
+    pub hot_chunk_plans: usize,
     pub walk_us: u64,
     pub metadata_us: u64,
     pub hash_us: u64,
+    #[serde(default)]
+    pub read_us: u64,
+    #[serde(default)]
+    pub content_hash_us: u64,
+    #[serde(default)]
+    pub scan_wall_us: u64,
 }
 
 impl ScanStats {
@@ -70,6 +101,7 @@ pub fn scan_dir(
     cache: Option<&CacheStore>,
     options: ScanOptions,
 ) -> anyhow::Result<ScanReport> {
+    let scan_started = std::time::Instant::now();
     let input_dir = input_dir.canonicalize()?;
     let cache_dir = canonical_or_join(&input_dir, cache_dir);
     let output_file = output_file
@@ -90,7 +122,7 @@ pub fn scan_dir(
         .into_iter()
         .filter_entry(|entry| {
             let path = entry.path();
-            !same_or_inside(path, &cache_dir) && !is_hig_cache(path) && path != output_file
+            !same_or_inside(path, &cache_dir) && !is_hig_internal(path) && path != output_file
         })
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
@@ -98,9 +130,18 @@ pub fn scan_dir(
         .collect::<Vec<_>>();
     let walk_us = walk_started.elapsed().as_micros() as u64;
 
+    let hot_raw_budget = Arc::new(AtomicUsize::new(options.hot_raw_bytes_budget));
     let outcomes = paths
         .into_par_iter()
-        .map(|path| scan_file(&input_dir, path, cache, options))
+        .map(|path| {
+            scan_file(
+                &input_dir,
+                path,
+                cache,
+                options.clone(),
+                hot_raw_budget.clone(),
+            )
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut files = outcomes
         .iter()
@@ -111,6 +152,10 @@ pub fn scan_dir(
         walk_us,
         metadata_us: outcomes.iter().map(|outcome| outcome.metadata_us).sum(),
         hash_us: outcomes.iter().map(|outcome| outcome.hash_us).sum(),
+        read_us: outcomes.iter().map(|outcome| outcome.read_us).sum(),
+        content_hash_us: outcomes.iter().map(|outcome| outcome.content_hash_us).sum(),
+        scan_wall_us: scan_started.elapsed().as_micros() as u64,
+        hot_raw_bytes_budget: options.hot_raw_bytes_budget as u64,
         ..ScanStats::default()
     };
     for file in &files {
@@ -136,6 +181,17 @@ pub fn scan_dir(
                 stats.chunk_metadata_misses += 1;
             }
         }
+        if let Some(bytes) = &file.raw_bytes {
+            stats.hot_raw_bytes += bytes.len() as u64;
+        }
+        if let Some(chunks) = &file.hot_chunks {
+            stats.hot_chunk_plans += chunks.len();
+            stats.hot_chunk_raw_bytes += chunks
+                .iter()
+                .filter_map(|chunk| chunk.raw_bytes.as_ref())
+                .map(|bytes| bytes.len() as u64)
+                .sum::<u64>();
+        }
     }
     Ok(ScanReport { files, stats })
 }
@@ -144,6 +200,8 @@ struct ScanOutcome {
     file: ScannedFile,
     metadata_us: u64,
     hash_us: u64,
+    read_us: u64,
+    content_hash_us: u64,
 }
 
 fn scan_file(
@@ -151,6 +209,7 @@ fn scan_file(
     path: PathBuf,
     cache: Option<&CacheStore>,
     options: ScanOptions,
+    hot_raw_budget: Arc<AtomicUsize>,
 ) -> anyhow::Result<ScanOutcome> {
     let metadata_started = std::time::Instant::now();
     let metadata = fs::metadata(&path)?;
@@ -190,14 +249,36 @@ fn scan_file(
                 content_hash: record.content_hash,
                 hash_source: HashSource::MetadataCache,
                 cached_chunks,
+                hot_chunks: None,
+                raw_bytes: None,
             },
             metadata_us,
             hash_us: 0,
+            read_us: 0,
+            content_hash_us: 0,
         });
     }
-    let hash_started = std::time::Instant::now();
-    let content_hash = *blake3::hash(&fs::read(&path)?).as_bytes();
-    let hash_us = hash_started.elapsed().as_micros() as u64;
+    let read_started = std::time::Instant::now();
+    let bytes = read_file_adaptive(&path, size, options.io_controller.as_ref(), "scan-read")?;
+    let read_us = read_started.elapsed().as_micros() as u64;
+    let content_hash_started = std::time::Instant::now();
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    let content_hash_us = content_hash_started.elapsed().as_micros() as u64;
+    let hash_us = read_us.saturating_add(content_hash_us);
+    let keep_whole_raw = reserve_hot_raw_bytes(&hot_raw_budget, bytes.len());
+    let hot_chunks =
+        if options.chunk.enabled && size > 0 && size >= options.chunk.chunk_file_threshold {
+            Some(compute_hot_chunks(
+                &bytes,
+                options.chunk.chunk_size,
+                options.probe_chunk_levels,
+                &hot_raw_budget,
+                !keep_whole_raw,
+            )?)
+        } else {
+            None
+        };
+    let raw_bytes = if keep_whole_raw { Some(bytes) } else { None };
     Ok(ScanOutcome {
         file: ScannedFile {
             relative_path,
@@ -209,10 +290,99 @@ fn scan_file(
             content_hash,
             hash_source: HashSource::Computed,
             cached_chunks: None,
+            hot_chunks,
+            raw_bytes,
         },
         metadata_us,
         hash_us,
+        read_us,
+        content_hash_us,
     })
+}
+
+pub(crate) fn read_file_adaptive(
+    path: &Path,
+    expected_size: u64,
+    controller: Option<&Arc<AdaptiveIoController>>,
+    stage: &'static str,
+) -> anyhow::Result<Vec<u8>> {
+    let Some(controller) = controller else {
+        return Ok(fs::read(path)?);
+    };
+    let mut input = File::open(path)?;
+    let capacity = usize::try_from(expected_size).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    if expected_size <= 1024 * 1024 {
+        let permit = controller.acquire(stage, IoDirection::Read, expected_size);
+        input.read_to_end(&mut bytes)?;
+        permit.finish_with_bytes(bytes.len() as u64);
+        return Ok(bytes);
+    }
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let permit = controller.acquire(stage, IoDirection::Read, buffer.len() as u64);
+        let read = input.read(&mut buffer)?;
+        permit.finish_with_bytes(read as u64);
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(bytes)
+}
+
+fn compute_hot_chunks(
+    bytes: &[u8],
+    chunk_size: u64,
+    probe_chunk_levels: bool,
+    hot_raw_budget: &AtomicUsize,
+    retain_chunk_raw: bool,
+) -> anyhow::Result<Vec<HotChunkRecord>> {
+    anyhow::ensure!(chunk_size > 0, "chunk size must be greater than zero");
+    let chunk_size = usize::try_from(chunk_size)?;
+    let mut chunks = Vec::with_capacity(bytes.len().div_ceil(chunk_size));
+    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        let file_offset = u64::try_from(index.saturating_mul(chunk_size))?;
+        let raw_bytes = if retain_chunk_raw && reserve_hot_raw_bytes(hot_raw_budget, chunk.len()) {
+            Some(chunk.to_vec())
+        } else {
+            None
+        };
+        chunks.push(HotChunkRecord {
+            chunk_hash: *blake3::hash(chunk).as_bytes(),
+            file_offset,
+            len: chunk.len() as u64,
+            balanced_level: if probe_chunk_levels {
+                balanced_chunk_level(chunk)
+            } else {
+                1
+            },
+            raw_bytes,
+        });
+    }
+    Ok(chunks)
+}
+
+fn balanced_chunk_level(raw: &[u8]) -> i32 {
+    let probe_len = raw.len().min(64 * 1024);
+    if probe_len == 0 {
+        return 1;
+    }
+    match codec::compress(Compression::Zstd, &raw[..probe_len], 1) {
+        Ok(probe) if probe.len() * 100 <= probe_len * 90 => 3,
+        _ => 1,
+    }
+}
+
+fn reserve_hot_raw_bytes(budget: &AtomicUsize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    budget
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            remaining.checked_sub(len)
+        })
+        .is_ok()
 }
 
 pub fn unix_ns(time: SystemTime) -> i128 {
@@ -237,9 +407,9 @@ fn same_or_inside(path: &Path, parent: &Path) -> bool {
     path == parent || path.starts_with(parent)
 }
 
-fn is_hig_cache(path: &Path) -> bool {
+fn is_hig_internal(path: &Path) -> bool {
     path.file_name()
-        .map(|name| name == ".hig-cache")
+        .map(|name| name == ".hig-cache" || name == ".hig")
         .unwrap_or(false)
 }
 
@@ -314,6 +484,9 @@ mod tests {
             ScanOptions {
                 trust_metadata: true,
                 chunk: ChunkOptions::default(),
+                hot_raw_bytes_budget: 0,
+                probe_chunk_levels: false,
+                io_controller: None,
             },
         )
         .unwrap();
@@ -340,6 +513,9 @@ mod tests {
             ScanOptions {
                 trust_metadata: false,
                 chunk,
+                hot_raw_bytes_budget: 0,
+                probe_chunk_levels: true,
+                io_controller: None,
             },
         )
         .unwrap();
@@ -379,6 +555,9 @@ mod tests {
             ScanOptions {
                 trust_metadata: true,
                 chunk,
+                hot_raw_bytes_budget: 0,
+                probe_chunk_levels: false,
+                io_controller: None,
             },
         )
         .unwrap();
@@ -386,6 +565,71 @@ mod tests {
         assert_eq!(second.stats.chunk_metadata_reuses, 1);
         assert_eq!(second.stats.trusted_bytes_skipped, 16);
         assert_eq!(second.files[0].cached_chunks.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn computed_scan_keeps_hot_raw_bytes_within_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), b"aaaa").unwrap();
+        fs::write(temp.path().join("b.txt"), b"bbbb").unwrap();
+        let report = scan_dir(
+            temp.path(),
+            &temp.path().join(".hig-cache"),
+            &temp.path().join("out.hig"),
+            None,
+            ScanOptions {
+                trust_metadata: false,
+                chunk: ChunkOptions::default(),
+                hot_raw_bytes_budget: 4,
+                probe_chunk_levels: false,
+                io_controller: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.stats.hashed_files, 2);
+        assert_eq!(report.stats.hot_raw_bytes_budget, 4);
+        assert_eq!(report.stats.hot_raw_bytes, 4);
+        assert_eq!(
+            report
+                .files
+                .iter()
+                .filter(|file| file.raw_bytes.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn computed_scan_produces_hot_chunk_plan_for_large_file() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("large.bin"), b"aaaaaaaabbbbbbbb").unwrap();
+        let report = scan_dir(
+            temp.path(),
+            &temp.path().join(".hig-cache"),
+            &temp.path().join("out.hig"),
+            None,
+            ScanOptions {
+                trust_metadata: false,
+                chunk: ChunkOptions {
+                    enabled: true,
+                    chunk_file_threshold: 16,
+                    chunk_size: 8,
+                },
+                hot_raw_bytes_budget: 8,
+                probe_chunk_levels: true,
+                io_controller: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.hot_chunk_plans, 2);
+        assert_eq!(report.stats.hot_chunk_raw_bytes, 8);
+        let chunks = report.files[0].hot_chunks.as_ref().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chunk_hash, *blake3::hash(b"aaaaaaaa").as_bytes());
+        assert_eq!(chunks[0].balanced_level, 1);
+        assert_eq!(chunks[0].raw_bytes.as_deref(), Some(&b"aaaaaaaa"[..]));
+        assert!(chunks[1].raw_bytes.is_none());
     }
 
     #[test]
@@ -406,6 +650,9 @@ mod tests {
             ScanOptions {
                 trust_metadata: false,
                 chunk,
+                hot_raw_bytes_budget: 0,
+                probe_chunk_levels: true,
+                io_controller: None,
             },
         )
         .unwrap();
@@ -437,6 +684,9 @@ mod tests {
             ScanOptions {
                 trust_metadata: true,
                 chunk,
+                hot_raw_bytes_budget: 0,
+                probe_chunk_levels: false,
+                io_controller: None,
             },
         )
         .unwrap();
@@ -444,5 +694,34 @@ mod tests {
         assert_eq!(second.stats.chunk_metadata_reuses, 0);
         assert_eq!(second.stats.chunk_metadata_misses, 1);
         assert!(second.files[0].cached_chunks.is_none());
+    }
+
+    #[test]
+    fn adaptive_scan_reports_actual_read_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = vec![7_u8; 1024 * 1024 + 17];
+        fs::write(temp.path().join("large.bin"), &content).unwrap();
+        let controller = AdaptiveIoController::new(4);
+        let report = scan_dir(
+            temp.path(),
+            &temp.path().join(".hig-cache"),
+            &temp.path().join("out.hig"),
+            None,
+            ScanOptions {
+                io_controller: Some(controller.clone()),
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.stats.read_us > 0);
+        assert!(report.stats.content_hash_us > 0);
+        assert_eq!(
+            report.stats.hash_us,
+            report.stats.read_us + report.stats.content_hash_us
+        );
+        let adaptive = controller.report();
+        let stage = adaptive.stages.get("scan-read").unwrap();
+        assert_eq!(stage.bytes, content.len() as u64);
     }
 }

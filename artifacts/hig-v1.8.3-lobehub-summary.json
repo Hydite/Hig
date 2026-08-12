@@ -1,0 +1,187 @@
+{
+  "version": "1.8.3",
+  "input_dir": "/private/tmp/hig-lobehub-source-data",
+  "corpus_name": "lobehub-source",
+  "bench_suite": "Lobehub",
+  "file_count": 14330,
+  "input_bytes": 199203924,
+  "excluded_paths": [
+    ".git",
+    ".hig-cache",
+    "node_modules",
+    ".next",
+    "dist",
+    "build"
+  ],
+  "incremental_modified_files": [
+    "apps/cli/README.md",
+    "apps/cli/e2e/agent-fs-vfs.e2e.test.ts",
+    "apps/cli/e2e/agent-signal.e2e.test.ts",
+    "locales/ar/agent.json",
+    "public/.well-known/assetlinks.json"
+  ],
+  "solid_groups": 114,
+  "solid_files": 11019,
+  "cache_policy_misses": 0,
+  "journal_bytes_after": 365897,
+  "journal_entries_after": 2,
+  "environment_status": "QUALIFIED",
+  "copy_256_mib_median_mib_s": 827.5165412394566,
+  "copy_256_mib_p95_mib_s": 1238.2203766633495,
+  "pack_core_gate": true,
+  "cli_wall_gate": true,
+  "size_quality_gate": true,
+  "hig_pack_core": {
+    "median_ms": 542.466208,
+    "p95_ms": 727.515167,
+    "p99_ms": 727.515167,
+    "min_ms": 355.061375,
+    "max_ms": 727.515167
+  },
+  "hig_cli_wall": {
+    "median_ms": 583.96375,
+    "p95_ms": 834.340416,
+    "p99_ms": 834.340416,
+    "min_ms": 486.935333,
+    "max_ms": 834.340416
+  },
+  "zip_cli_wall": {
+    "median_ms": 4061.19475,
+    "p95_ms": 4209.469290999999,
+    "p99_ms": 4209.469290999999,
+    "min_ms": 3891.781125,
+    "max_ms": 4209.469290999999
+  },
+  "rows": [
+    {
+      "tool": "higv2 balanced first",
+      "input_bytes": 199203924,
+      "archive_bytes": 56729451,
+      "duration_ms": 20855,
+      "notes": "default HIGV2 batch/chunk format"
+    },
+    {
+      "tool": "higv2 balanced second",
+      "input_bytes": 199203924,
+      "archive_bytes": 56729437,
+      "duration_ms": 624,
+      "notes": "reuses batch/single/chunk cache but recomputes file hashes"
+    },
+    {
+      "tool": "higv2 balanced secure session",
+      "input_bytes": 199203924,
+      "archive_bytes": 56729475,
+      "duration_ms": 20771,
+      "notes": "secure session pack; unlock cost 13 ms reported separately"
+    },
+    {
+      "tool": "higv2 balanced secure daemon",
+      "input_bytes": 199203924,
+      "archive_bytes": 56729514,
+      "duration_ms": 804,
+      "notes": "secure hot daemon/session path; KDF skipped and cache index is warm"
+    },
+    {
+      "tool": "higv2 fastest secure",
+      "input_bytes": 199203924,
+      "archive_bytes": 64900109,
+      "duration_ms": 425,
+      "notes": "fastest mode with secure KDF and sealed block reuse"
+    },
+    {
+      "tool": "higv2 fastest interactive",
+      "input_bytes": 199203924,
+      "archive_bytes": 64900109,
+      "duration_ms": 433,
+      "notes": "explicit fastest mode; metadata trust and sealed encrypted cache enabled"
+    },
+    {
+      "tool": "higv2 fastest second --kdf-profile fast-bench",
+      "input_bytes": 199203924,
+      "archive_bytes": 64900109,
+      "duration_ms": 1617,
+      "notes": "fastest mode with benchmark-only KDF profile"
+    },
+    {
+      "tool": "higv2 --no-batch",
+      "input_bytes": 199203924,
+      "archive_bytes": 63630231,
+      "duration_ms": 42990,
+      "notes": "HIGV2 with batching disabled"
+    },
+    {
+      "tool": "higv2 --no-chunk first",
+      "input_bytes": 199203924,
+      "archive_bytes": 56424863,
+      "duration_ms": 21053,
+      "notes": "HIGV2 with large-file chunking disabled"
+    },
+    {
+      "tool": "higv2 --no-chunk second",
+      "input_bytes": 199203924,
+      "archive_bytes": 56424855,
+      "duration_ms": 619,
+      "notes": "HIGV2 second pack with large-file chunking disabled"
+    },
+    {
+      "tool": "higv2 no-encryption",
+      "input_bytes": 199203924,
+      "archive_bytes": 56720437,
+      "duration_ms": 21504,
+      "notes": "no confidentiality or AEAD; BLAKE3 corruption checks remain"
+    },
+    {
+      "tool": "higv1 legacy",
+      "input_bytes": 199203924,
+      "archive_bytes": 66111074,
+      "duration_ms": 40150,
+      "notes": "legacy one-file-per-block format"
+    },
+    {
+      "tool": "zip",
+      "input_bytes": 199203924,
+      "archive_bytes": 67642760,
+      "duration_ms": 4002,
+      "notes": "zip -qr"
+    },
+    {
+      "tool": "tar.gz",
+      "input_bytes": 199203924,
+      "archive_bytes": 61223862,
+      "duration_ms": 10246,
+      "notes": "tar -cf + gzip -6"
+    },
+    {
+      "tool": "tar.zst",
+      "input_bytes": 199203924,
+      "archive_bytes": 64878014,
+      "duration_ms": 7081,
+      "notes": "tar -cf + zstd -1"
+    },
+    {
+      "tool": "7z",
+      "input_bytes": 199203924,
+      "archive_bytes": null,
+      "duration_ms": null,
+      "notes": "skipped (not installed)"
+    }
+  ],
+  "incremental": {
+    "modified_files": [
+      "apps/cli/README.md",
+      "apps/cli/e2e/agent-fs-vfs.e2e.test.ts",
+      "apps/cli/e2e/agent-signal.e2e.test.ts",
+      "locales/ar/agent.json",
+      "public/.well-known/assetlinks.json"
+    ],
+    "hig_pack_core_ms": 990.997875,
+    "hig_cli_wall_ms": 695.268209,
+    "zip_cli_wall_ms": 4297.946290999999,
+    "cache_hit_rate": 100.0,
+    "cache_policy_misses": 3,
+    "solid_groups": 114,
+    "solid_files": 11019,
+    "journal_bytes_after": 365897,
+    "journal_entries_after": 2
+  }
+}

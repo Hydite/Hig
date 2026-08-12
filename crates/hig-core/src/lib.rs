@@ -1,11 +1,17 @@
+mod adaptive_io;
 mod archive;
 mod cache;
 mod codec;
 mod crypto;
 mod daemon;
+mod desktop;
+mod operation;
 mod pipeline;
+mod project;
+mod repository;
 mod scan;
 mod session;
+mod task;
 mod writer;
 
 use serde::{Deserialize, Serialize};
@@ -13,17 +19,42 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub use archive::{pack, unpack};
+pub use archive::{inspect_archive, pack, pack_with_control, unpack, unpack_with_control};
 pub use cache::{CacheMaintenanceReport, CacheStats, PathChunkRecord};
 pub use crypto::{derive_key, random_bytes};
 pub use daemon::{
-    DaemonRequest, DaemonResponse, DaemonStatus, JobKeyMaterial, PackJobRequest,
-    SerializablePackOptions, cache_writer_available, daemon_socket_path, daemon_status,
-    request_daemon, run_daemon_server, stop_daemon,
+    DaemonErrorCode, DaemonRequest, DaemonResponse, DaemonStatus, JobKeyMaterial, PackAuthMode,
+    PackJobRequest, ProjectRegistration, SerializablePackOptions, cache_writer_available,
+    daemon_socket_path, daemon_status, request_daemon, run_daemon_server, stop_daemon,
 };
+pub use desktop::{DesktopPackRequest, DesktopUnpackRequest};
+pub use operation::{OperationControl, OperationKind, OperationPhase, OperationProgress};
 pub use pipeline::{BufferPool, PipelineScheduler};
+pub use project::{
+    DEFAULT_PROJECT_EXCLUDES, ProjectConfig, ProjectFileRecord, ProjectJournalEntry,
+    ProjectSnapshot, ProjectStatusReport, SnapshotValidity, append_project_journal,
+    discover_project, init_project, load_project_config, load_snapshot, rebuild_snapshot,
+    resolve_project_cache_dir, save_snapshot, stable_read_record, verify_snapshot_metadata,
+};
+pub use repository::{
+    DEFAULT_REPOSITORY_EXCLUDES, RepositoryByteRange, RepositoryCacheProvenance, RepositoryChange,
+    RepositoryChangeKind, RepositoryCommitSummary, RepositoryConfig, RepositoryDiffReport,
+    RepositoryGcReport, RepositoryInitReport, RepositoryObjectId, RepositoryPathHistoryEntry,
+    RepositoryPathHistoryReport, RepositoryRangeRestoreReport, RepositoryRestoreReport,
+    RepositorySemanticChangeKind, RepositorySnapshotReport, RepositoryStoragePath,
+    RepositoryStorageTreeReport, RepositorySymbol, RepositorySymbolHistoryEntry,
+    RepositorySymbolHistoryReport, RepositorySymbolIndexReport, RepositorySymbolRestoreReport,
+    RepositoryVerifyReport, RepositoryWatcher, gc_repository, init_repository, repository_diff,
+    repository_log, repository_path_history, repository_storage_tree, repository_symbol_history,
+    repository_symbols, restore_repository, restore_repository_range, restore_repository_symbol,
+    snapshot_repository, verify_repository,
+};
 pub use scan::{ScanStats, ScannedFile};
 pub use session::{SessionBinding, default_session_ttl, derive_session_binding};
+pub use task::{
+    DaemonTaskError, SerializableUnpackOptions, TaskManager, TaskRequest, TaskResult, TaskState,
+    TaskStatusReport, TaskSubmitRequest, UnpackJobRequest,
+};
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
@@ -57,6 +88,24 @@ pub struct UnpackOptions {
     pub output_dir: PathBuf,
     pub password: Option<String>,
     pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveInspection {
+    pub format: ArchiveFormat,
+    pub encrypted: bool,
+    pub files: Vec<ArchiveFileInfo>,
+    pub input_bytes: u64,
+    pub archive_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveFileInfo {
+    pub relative_path: String,
+    pub size: u64,
+    pub modified_unix_ns: i128,
+    pub permissions: u32,
+    pub content_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +201,26 @@ pub enum WriterStrategy {
     OrderedPipeline,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PayloadMemoryMode {
+    #[default]
+    Adaptive,
+    Low,
+}
+
+impl std::str::FromStr for PayloadMemoryMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "adaptive" => Ok(Self::Adaptive),
+            "low" => Ok(Self::Low),
+            other => anyhow::bail!("unsupported payload memory mode: {other}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IoOptions {
     pub writer_buffer_bytes: usize,
@@ -163,20 +232,46 @@ pub struct IoOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipelineOptions {
     pub daemon_mode: DaemonMode,
+    pub project_mode: ProjectMode,
     pub cpu_queue_small_first: bool,
     pub memory_budget_bytes: usize,
     pub io_prefetch_bytes: usize,
     pub cache_pack_enabled: bool,
+    #[serde(default)]
+    pub payload_memory_mode: PayloadMemoryMode,
 }
 
 impl Default for PipelineOptions {
     fn default() -> Self {
         Self {
             daemon_mode: DaemonMode::Auto,
+            project_mode: ProjectMode::Auto,
             cpu_queue_small_first: true,
             memory_budget_bytes: 128 * 1024 * 1024,
             io_prefetch_bytes: 4 * 1024 * 1024,
             cache_pack_enabled: true,
+            payload_memory_mode: PayloadMemoryMode::Adaptive,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectMode {
+    #[default]
+    Auto,
+    Off,
+    Required,
+}
+
+impl std::str::FromStr for ProjectMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            "required" => Ok(Self::Required),
+            other => anyhow::bail!("unsupported project mode: {other}"),
         }
     }
 }
@@ -325,6 +420,102 @@ pub struct PackReport {
     pub l2: L2CacheReport,
     pub pipeline: PipelineReport,
     pub timings_us: PackTimingsUs,
+    #[serde(default)]
+    pub write_profile: WriteProfileReport,
+    #[serde(default)]
+    pub project: ProjectPackReport,
+    #[serde(default)]
+    pub adaptive_io: AdaptiveIoReport,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdaptiveIoReport {
+    pub enabled: bool,
+    pub initial_concurrency: usize,
+    pub min_concurrency: usize,
+    pub max_concurrency: usize,
+    pub final_concurrency: usize,
+    pub min_observed_concurrency: usize,
+    pub max_observed_concurrency: usize,
+    pub transitions: u64,
+    pub constrained_entries: u64,
+    pub recovery_steps: u64,
+    pub normal_us: u64,
+    pub constrained_us: u64,
+    pub total_us: u64,
+    pub final_constraint_stage: Option<String>,
+    pub final_constraint_direction: Option<String>,
+    pub stages: BTreeMap<String, AdaptiveIoStageReport>,
+    #[serde(default)]
+    pub transition_events: Vec<AdaptiveIoTransitionReport>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdaptiveIoStageReport {
+    pub samples: u64,
+    pub bytes: u64,
+    pub io_us: u64,
+    pub wait_us: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdaptiveIoTransitionReport {
+    pub at_us: u64,
+    pub stage: String,
+    pub direction: String,
+    pub reason: String,
+    pub from_concurrency: usize,
+    pub to_concurrency: usize,
+    pub throughput_mib_s: f64,
+    pub small_io_p95_us: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WriteProfileReport {
+    pub temp_create_us: u64,
+    pub preallocate_us: u64,
+    pub header_write_us: u64,
+    pub manifest_write_us: u64,
+    pub payload_read_us: u64,
+    pub payload_write_us: u64,
+    pub payload_memory_write_us: u64,
+    pub payload_cached_write_us: u64,
+    pub direct_write_us: u64,
+    pub buffered_write_us: u64,
+    pub writer_wait_us: u64,
+    pub flush_us: u64,
+    pub fsync_us: u64,
+    pub rename_us: u64,
+    pub memory_payload_count: usize,
+    pub memory_payload_bytes: u64,
+    pub cached_file_payload_count: usize,
+    pub cached_file_payload_bytes: u64,
+    pub cached_range_payload_count: usize,
+    pub cached_range_payload_bytes: u64,
+    pub direct_write_count: usize,
+    pub buffered_write_count: usize,
+    #[serde(default)]
+    pub coalesced_write_count: usize,
+    #[serde(default)]
+    pub coalesced_payload_count: usize,
+    #[serde(default)]
+    pub coalesced_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectPackReport {
+    pub project_mode_used: bool,
+    pub project_generation: u64,
+    pub project_snapshot_valid: bool,
+    pub project_metadata_verified_files: u64,
+    pub project_hash_reuses: u64,
+    pub project_prepared_object_hits: u64,
+    pub project_prepared_object_misses: u64,
+    pub project_dirty_files: u64,
+    pub project_dirty_groups: u64,
+    pub project_verify_us: u64,
+    pub project_freeze_us: u64,
+    pub project_retry_count: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -332,6 +523,12 @@ pub struct PackTimingsUs {
     pub total_us: u64,
     pub daemon_connect_us: u64,
     pub socket_request_us: u64,
+    pub socket_connect_us: u64,
+    pub socket_pack_roundtrip_us: u64,
+    pub daemon_auth_us: u64,
+    pub daemon_job_execute_us: u64,
+    pub daemon_response_bytes: u64,
+    pub client_decode_us: u64,
     pub queue_wait_us: u64,
     pub cache_hot_lookup_us: u64,
     pub walk_us: u64,
@@ -347,11 +544,79 @@ pub struct PackTimingsUs {
     pub manifest_compress_us: u64,
     pub manifest_encrypt_us: u64,
     pub output_create_us: u64,
+    pub output_preallocate_us: u64,
+    pub output_header_write_us: u64,
+    pub output_manifest_write_us: u64,
+    pub output_payload_read_us: u64,
+    pub output_payload_write_us: u64,
     pub output_write_us: u64,
     pub output_flush_us: u64,
+    pub output_fsync_us: u64,
     pub output_rename_us: u64,
     pub response_serialize_us: u64,
     pub unattributed_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PackResponseMode {
+    #[default]
+    Summary,
+    Full,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackSummary {
+    pub input_files: usize,
+    pub input_bytes: u64,
+    pub archive_bytes: u64,
+    pub duration_us: u64,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub cache_hit_rate: f64,
+    pub scan_cache_hit_rate: f64,
+    pub encryption_mode: EncryptionMode,
+    pub speed: SpeedMode,
+    pub kdf_profile: KdfProfile,
+    pub session_used: bool,
+    pub cache_index_commit_ms: u128,
+    pub cache_commit_mode: String,
+    pub cache_shards_written: usize,
+    pub solid_groups: usize,
+    pub solid_files: usize,
+    pub cache_policy_misses: usize,
+    pub timings_us: PackTimingsUs,
+    #[serde(default)]
+    pub project: ProjectPackReport,
+    #[serde(default)]
+    pub adaptive_io: AdaptiveIoReport,
+}
+
+impl From<&PackReport> for PackSummary {
+    fn from(report: &PackReport) -> Self {
+        Self {
+            input_files: report.input_files,
+            input_bytes: report.input_bytes,
+            archive_bytes: report.archive_bytes,
+            duration_us: report.duration.as_micros() as u64,
+            cache_hits: report.cache.hits,
+            cache_misses: report.cache.misses,
+            cache_hit_rate: report.cache.hit_rate() * 100.0,
+            scan_cache_hit_rate: report.scan.scan_cache_hit_rate() * 100.0,
+            encryption_mode: report.encryption_mode,
+            speed: report.speed,
+            kdf_profile: report.kdf_profile,
+            session_used: report.session.session_used,
+            cache_index_commit_ms: report.l2.cache_index_commit_ms,
+            cache_commit_mode: report.l2.cache_commit_mode.clone(),
+            cache_shards_written: report.l2.cache_shards_written,
+            solid_groups: report.blocks.solid_groups,
+            solid_files: report.blocks.solid_files,
+            cache_policy_misses: report.blocks.cache_policy_misses,
+            timings_us: report.timings_us.clone(),
+            project: report.project.clone(),
+            adaptive_io: report.adaptive_io.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -393,6 +658,11 @@ pub struct L2CacheReport {
     pub cache_shards_read: usize,
     pub cache_shards_written: usize,
     pub cache_shard_dirty_count: usize,
+    pub cache_commit_mode: String,
+    pub journal_upsert_records: u64,
+    pub journal_upsert_paths: u64,
+    pub journal_upsert_objects: u64,
+    pub journal_upsert_sealed: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -434,7 +704,11 @@ pub struct PackTimings {
     pub payload_write_ms: u128,
     pub payload_read_ms: u128,
     pub writer_wait_ms: u128,
+    pub output_preallocate_ms: u128,
+    pub output_header_write_ms: u128,
+    pub output_manifest_write_ms: u128,
     pub output_flush_ms: u128,
+    pub output_fsync_ms: u128,
     pub output_rename_ms: u128,
 }
 
@@ -459,6 +733,18 @@ pub struct BlockStats {
     pub reencrypted_cache_hits: usize,
     pub payload_source_cache_files: usize,
     pub payload_source_memory_bytes: u64,
+    pub payload_source_spool_payloads: usize,
+    pub payload_source_spool_bytes: u64,
+    #[serde(default)]
+    pub source_read_bytes: u64,
+    #[serde(default)]
+    pub source_hot_raw_bytes: u64,
+    #[serde(default)]
+    pub payload_memory_mode: PayloadMemoryMode,
+    #[serde(default)]
+    pub payload_memory_budget_bytes: u64,
+    #[serde(default)]
+    pub payload_memory_available_bytes: u64,
     pub cache_pack_hits: usize,
     pub cache_pack_misses: usize,
     pub cache_pack_fallbacks: usize,
