@@ -26,7 +26,7 @@ wire compatibility, remote synchronization, branch merge semantics, or rebase.
 - Tree-sitter indexes for Rust, Swift, JavaScript/JSX, TypeScript/TSX, and Python;
 - exact function, method, and class byte restoration;
 - constrained MCP stdio tools for IDE agents;
-- macOS universal and Linux x86_64 GNU CLI/MCP packages.
+- native macOS universal, Linux x86_64 GNU, and Windows x86_64 MSVC CLI/MCP packages.
 
 ## Platform Packages
 
@@ -34,10 +34,13 @@ wire compatibility, remote synchronization, branch merge semantics, or rebase.
 | --- | --- | --- |
 | `hig-v1.10.0-ide-mcp-macos-universal.tar.gz` | macOS arm64/x86_64 | `artifacts/hig-v1.10.0-ide-mcp-macos-universal.tar.gz.sha256` |
 | `hig-v1.10.0-ide-mcp-linux-x86_64-gnu.tar.gz` | Linux x86_64, glibc | `artifacts/hig-v1.10.0-ide-mcp-linux-x86_64-gnu.tar.gz.sha256` |
+| `hig-v1.10.0-ide-mcp-windows-x86_64-msvc.tar.gz` | Windows x86_64, MSVC | `artifacts/hig-v1.10.0-ide-mcp-windows-x86_64-msvc.tar.gz.sha256` |
 
-The Linux package was built natively on Ubuntu 24.04 x86_64 with Rust 1.97.1
-and passed CLI/core/FFI tests, Clippy, archive round-trip, repository verify,
-symbol restore, byte-range restore, and extracted MCP JSON-RPC checks.
+All three packages were built natively with Rust 1.97.1 by GitHub Actions run
+`31737147626` from commit `361e6ce2`. Each extracted package passed archive
+round-trip, historical archive/repository migration, branch/tag/reference
+workflows, automatic repository snapshots through MCP, path confinement,
+repository verification, exact restore, and the 50-tool protocol contract.
 
 ## Public Boundary
 
@@ -49,20 +52,15 @@ boundaries for future contributors.
 ## Verification
 
 - `cargo fmt --all --check`: passed;
-- workspace CLI/core tests: passed, including 153 `hig-core` tests and 18 CLI tests;
+- workspace CLI/core tests: passed, including 159 `hig-core` tests and 18 CLI tests;
 - CLI/core/FFI Clippy with warnings denied: passed;
-- macOS universal CLI/MCP smoke: passed;
-- Linux x86_64 native build and extracted package smoke: passed;
-- MCP `initialize`, `hig_version`, and constrained repository verification:
-  passed;
+- macOS universal, Linux x86_64 GNU, and Windows x86_64 MSVC native package QA: passed;
+- MCP protocol negotiation, 50 closed tool schemas, IDE automatic snapshot,
+  constrained repository operations, and path escape rejection: passed;
 - package SHA-256 manifests: passed.
 
-The macOS universal package was rebuilt from the post-release compatibility
-migration commit and its current SHA-256 is recorded in the repository
-checksum file. The Linux package listed above remains the previously validated
-native Linux build; rebuilding it requires access to the Ubuntu x86_64 build
-host and must be completed before publishing a package that includes the new
-repository migration tools.
+The packages and checksum manifests in `artifacts/` are the retained outputs
+of the same successful native CI run.
 
 The current enterprise-volume cold-path evidence is recorded in
 `artifacts/hig-v1.10.0-post-migration-cold-benchmark.md`. It reports stage

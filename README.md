@@ -31,25 +31,34 @@ excluded from this release.
 | macOS package SHA-256 | `artifacts/hig-v1.10.0-ide-mcp-macos-universal.tar.gz.sha256` |
 | Linux x86_64 GNU CLI/MCP | `artifacts/hig-v1.10.0-ide-mcp-linux-x86_64-gnu.tar.gz` |
 | Linux package SHA-256 | `artifacts/hig-v1.10.0-ide-mcp-linux-x86_64-gnu.tar.gz.sha256` |
+| Windows x86_64 MSVC CLI/MCP | `artifacts/hig-v1.10.0-ide-mcp-windows-x86_64-msvc.tar.gz` |
+| Windows package SHA-256 | `artifacts/hig-v1.10.0-ide-mcp-windows-x86_64-msvc.tar.gz.sha256` |
 | Linux release QA | `artifacts/hig-v1.10.0-linux-x86_64-gnu-release-qa.md` |
 
 The macOS app is signed with the locally available Apple Development identity. It is **not notarized** because Developer ID notarization credentials are not configured for this build.
 
-The macOS and Linux IDE packages bundle the platform-native CLI together with
-the constrained Node.js MCP stdio adapter. The Linux package is validated on
-Ubuntu 24.04 x86_64 with glibc 2.39 and Node.js 18 or later. The macOS package
-contains a universal arm64/x86_64 CLI.
+The macOS, Linux, and Windows IDE packages bundle the platform-native CLI with
+the constrained 50-tool Node.js MCP stdio adapter. They were built and tested
+natively by GitHub Actions run `31737147626` from commit `361e6ce2`. The Linux
+package targets Ubuntu 24.04 x86_64/glibc, the macOS package contains a
+universal arm64/x86_64 CLI, and the Windows package targets x86_64 MSVC.
 
 Linux package SHA-256:
 
 ```text
-5f2a239a87bd2a4af38e9e97f895516011b7e8f67c94964f3dbaeed79a56338f
+bcb031521927687ee474d228caa4c18de8a575d92b95db25d298faa6a47c02bf
 ```
 
 macOS package SHA-256:
 
 ```text
-1c09f052635e37e62094b46c4aaca5ff1f072f05fea657a855c22609e147056c
+cdf8070941daf22b5ad5618a682cdce2455ce65b1f855278d811df737bdf1c63
+```
+
+Windows package SHA-256:
+
+```text
+e0b639010aedea0d0fb153c48b63168835f8afd3a85953c5dd03d4bc05e07048
 ```
 
 ## Quick Start

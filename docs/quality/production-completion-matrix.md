@@ -11,8 +11,8 @@ are descriptive only; the `Complete` state requires every listed gate.
 - [x] Verification and reachability GC across every reference namespace.
 - [x] Legacy direct-HEAD migration without object rewriting.
 - [x] Golden legacy repository fixture passes verify, migrate, restore, and idempotence locally.
-- [ ] Golden legacy repository fixture passes the required CI gate.
-- [ ] Branch/tag/history/MCP workflow passes on macOS, Linux, and Windows packages.
+- [x] Golden legacy repository fixture passes the required CI gate.
+- [x] Branch/tag/history/MCP workflow passes on macOS, Linux, and Windows packages.
 - [ ] Long-running snapshot/restore/GC fault and interruption suite passes.
 
 ## IDE Automatic Snapshot
@@ -22,7 +22,7 @@ are descriptive only; the `Complete` state requires every listed gate.
 - [x] CLI and MCP policy/status control surface.
 - [x] Deterministic event-burst, queue-overflow, pressure pause/resume, restart, periodic, and corruption suite.
 - [ ] Multi-hour native macOS/Linux/Windows soak with exact repository verification.
-- [ ] IDE package integration verifies automatic snapshots without shell access.
+- [x] IDE package integration verifies automatic snapshots without shell access.
 
 ## Cold Path Performance
 
@@ -38,11 +38,11 @@ are descriptive only; the `Complete` state requires every listed gate.
 
 - [x] Current macOS universal package and 50-tool MCP protocol smoke.
 - [x] Previously released Linux x86_64 GNU package provenance.
-- [ ] Current-source native Linux x86_64 GNU package and extracted-package QA.
-- [ ] Current-source native Windows x86_64 MSVC package and extracted-package QA.
+- [x] Current-source native Linux x86_64 GNU package and extracted-package QA.
+- [x] Current-source native Windows x86_64 MSVC package and extracted-package QA.
 - [x] CI workflow generates checksums and retained artifacts for all native platforms.
-- [ ] The native package workflow has completed successfully on GitHub runners.
-- [ ] Native package MCP path-confinement and repository workflow pass on all platforms.
+- [x] The native package workflow has completed successfully on GitHub runners.
+- [x] Native package MCP path-confinement and repository workflow pass on all platforms.
 
 ## Long-Term Compatibility
 
@@ -51,8 +51,8 @@ are descriptive only; the `Complete` state requires every listed gate.
 - [x] Corruption, wrong-password, truncation, version, and atomic-publication tests.
 - [x] Immutable v1.9.6 archive and v1.10.0 direct-HEAD repository golden fixtures.
 - [x] Golden fixture SHA-256 manifests and current-reader migration gate implemented and passing locally.
-- [ ] Golden fixture gate has completed successfully in CI.
-- [ ] Native-platform compatibility matrix and MCP protocol-version gate.
+- [x] Golden fixture gate has completed successfully in CI.
+- [x] Native-platform compatibility matrix and MCP protocol-version gate.
 - [x] Documented fixture addition policy for every future format/schema release.
 
 ## Release Rule

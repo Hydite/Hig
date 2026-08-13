@@ -5,19 +5,14 @@
 - Package: `hig-v1.10.0-ide-mcp-linux-x86_64-gnu.tar.gz`
 - CLI: native Linux x86_64 GNU `hig` binary
 - Adapter: Node MCP stdio server with constrained filesystem tools
-- Validated host: Ubuntu 24.04 x86_64, glibc 2.39, Node.js 25.1.0
+- Validated host: GitHub-hosted Ubuntu 24.04 x86_64, glibc 2.39, Node.js 22
 - Minimum adapter runtime: Node.js 18
 
 ## Build Provenance
 
-The release binary is built natively from a source snapshot containing only
-the Cargo workspace and `packages/hig-mcp-server`. It intentionally excludes
-local build outputs, Git metadata, artifacts, benchmarks, caches, papers, and
-user data. The source snapshot SHA-256 is recorded with the final build run.
-
-The native build used Rust 1.97.1 (stable, 2026-07-14) on the Ubuntu 24.04
-x86_64 host. The source snapshot transferred to the host had SHA-256
-`4be7942ffecad7c3627fcaeafa9103f421a0288e7c18dbc50715c6045b47ab6e`.
+The release binary was built natively by GitHub Actions run `31737147626`
+from public source commit `361e6ce208588a5870f3cd3ecde1df67d409ac5e`
+using Rust 1.97.1. The same run retained the package and checksum manifest.
 
 ## Required Checks
 
@@ -27,9 +22,11 @@ x86_64 host. The source snapshot transferred to the host had SHA-256
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo build --release -p hig-cli`
 - archive pack/unpack byte-for-byte smoke test
-- repository snapshot, byte-range restore, symbol restore, and `repo verify`
+- historical archive/repository migration and immutable object-hash checks
+- repository branch/tag/refs, automatic snapshot, exact restore, and `repo verify`
 - extracted-package `bin/hig --version`
-- extracted-package MCP `--smoke`, `initialize`, and constrained tools call
+- extracted-package MCP `--smoke`, protocol negotiation, 50-tool contract,
+  automatic snapshot lifecycle, and path-confinement checks
 - `sha256sum -c` for the final tarball
 
 ## Status
@@ -37,14 +34,15 @@ x86_64 host. The source snapshot transferred to the host had SHA-256
 Completed. Evidence:
 
 - `cargo fmt --all --check`: pass;
-- `cargo test -p hig-cli -p hig-core`: pass; `hig-core` 143 tests passed;
+- `cargo test -p hig-cli -p hig-core`: pass; `hig-core` 159 tests and 18 CLI tests passed;
 - `cargo clippy -p hig-cli -p hig-core -p hig-ffi --all-targets -- -D warnings`: pass;
 - `cargo build --release -p hig-cli`: pass;
 - archive pack/unpack byte comparison: pass;
-- repository verify, symbol restore, commit diff, and byte-range restore: pass;
+- historical migration, repository verify, automatic snapshot, full restore,
+  symbol restore, commit diff, and byte-range restore: pass;
 - extracted package `bin/hig --version`: `hig 1.10.0`;
-- extracted package MCP smoke and JSON-RPC initialize/tools calls: pass;
-- final package SHA-256: `5f2a239a87bd2a4af38e9e97f895516011b7e8f67c94964f3dbaeed79a56338f`.
+- extracted package MCP smoke and 50-tool persistent JSON-RPC workflow: pass;
+- final package SHA-256: `bcb031521927687ee474d228caa4c18de8a575d92b95db25d298faa6a47c02bf`.
 
 The full workspace Clippy command is intentionally not a Linux CLI release
 gate because it includes the optional Tauri desktop crate. On this host it
