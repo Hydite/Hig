@@ -2,7 +2,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,8 +13,9 @@ const expected = fs.readFileSync(checksum, "utf8").trim().split(/\s+/)[0];
 const actual = createHash("sha256").update(fs.readFileSync(archive)).digest("hex");
 if (actual !== expected) throw new Error(`checksum mismatch: expected ${expected}, got ${actual}`);
 
-const extractRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hig-package-verify-"));
-run("tar", ["-xzf", archive, "-C", extractRoot]);
+const archiveDir = path.dirname(archive);
+const extractRoot = fs.mkdtempSync(path.join(archiveDir, ".hig-package-verify-"));
+run("tar", ["-xzf", path.basename(archive), "-C", path.basename(extractRoot)], { cwd: archiveDir });
 const packageRoot = path.join(extractRoot, "hig-mcp-server");
 const executableName = process.platform === "win32" ? "hig.exe" : "hig";
 const binary = path.join(packageRoot, "bin", executableName);
@@ -34,6 +34,7 @@ console.log(`hig-ide-package: PASS ${path.basename(archive)} sha256=${actual}`);
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
+    cwd: options.cwd,
     stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit",
     encoding: options.capture ? "utf8" : undefined,
     env: options.env || process.env

@@ -20,13 +20,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - name: Format
@@ -65,12 +65,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - name: Build native CLI
@@ -94,13 +94,13 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - name: Build both macOS architectures
@@ -112,7 +112,7 @@ jobs:
             target/aarch64-apple-darwin/release/hig \
             target/x86_64-apple-darwin/release/hig \
             -output target/release-universal/hig
-          lipo -verify_arch arm64 x86_64 target/release-universal/hig
+          lipo target/release-universal/hig -verify_arch arm64 x86_64
       - name: Assemble universal IDE/MCP package
         run: node scripts/package-ide-mcp.mjs --binary target/release-universal/hig --platform macos-universal --output-dir artifacts/ci
       - name: Verify extracted universal package

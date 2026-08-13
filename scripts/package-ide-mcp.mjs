@@ -2,7 +2,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,7 +15,8 @@ const version = args.version || packageJson.version;
 const executableName = platform.startsWith("windows-") ? "hig.exe" : "hig";
 const archiveName = `hig-v${version}-ide-mcp-${platform}.tar.gz`;
 const archive = path.join(outputDir, archiveName);
-const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hig-package-"));
+fs.mkdirSync(outputDir, { recursive: true });
+const stageRoot = fs.mkdtempSync(path.join(outputDir, ".hig-package-stage-"));
 const stage = path.join(stageRoot, "hig-mcp-server");
 
 assertFile(binary);
@@ -34,8 +34,10 @@ if (!platform.startsWith("windows-")) {
   fs.chmodSync(path.join(stage, "bin", "hig-mcp-server.js"), 0o755);
 }
 
-fs.mkdirSync(outputDir, { recursive: true });
-const tar = spawnSync("tar", ["-czf", archive, "-C", stageRoot, "hig-mcp-server"], { stdio: "inherit" });
+const tar = spawnSync("tar", ["-czf", path.join("..", archiveName), "hig-mcp-server"], {
+  cwd: stageRoot,
+  stdio: "inherit"
+});
 if (tar.status !== 0) process.exit(tar.status || 1);
 const digest = createHash("sha256").update(fs.readFileSync(archive)).digest("hex");
 fs.writeFileSync(`${archive}.sha256`, `${digest}  ${archiveName}\n`);

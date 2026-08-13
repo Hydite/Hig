@@ -617,7 +617,9 @@ fn available_memory_bytes() -> Option<u64> {
         let pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if pages > 0 && page_size > 0 {
-            return (pages as u64).checked_mul(page_size as u64);
+            (pages as u64).checked_mul(page_size as u64)
+        } else {
+            None
         }
     }
     #[cfg(target_os = "macos")]
