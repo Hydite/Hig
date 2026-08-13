@@ -104,8 +104,12 @@ async function tool(name, args = {}, expectSuccess = true) {
   assert.equal(response.error, undefined, `${name}: JSON-RPC error`);
   const result = response.result;
   assert.equal(typeof result?.isError, "boolean", `${name}: missing isError`);
-  assert.equal(result.isError, !expectSuccess, `${name}: unexpected MCP status`);
   const payload = JSON.parse(result.content[0].text);
+  assert.equal(
+    result.isError,
+    !expectSuccess,
+    `${name}: unexpected MCP status\n${JSON.stringify(payload, null, 2)}`
+  );
   if (expectSuccess) {
     assert.equal(payload.ok, true, `${name}: ${payload.stderr || payload.stdout}`);
     assert.equal(payload.code, 0, `${name}: nonzero CLI code`);
@@ -121,7 +125,8 @@ const requiredTools = [
   "hig_unpack", "hig_inspect", "hig_migrate", "hig_cache_status", "hig_cache_gc",
   "hig_cache_compact", "hig_task_list", "hig_task_status", "hig_task_cancel",
   "hig_task_result", "hig_repo_init", "hig_repo_snapshot", "hig_repo_refs",
-  "hig_repo_migrate", "hig_repo_branch_list", "hig_repo_branch_create",
+  "hig_repo_migrate", "hig_repo_watch_start", "hig_repo_watch_status",
+  "hig_repo_watch_stop", "hig_repo_branch_list", "hig_repo_branch_create",
   "hig_repo_branch_switch", "hig_repo_branch_delete", "hig_repo_tag_list",
   "hig_repo_tag_create", "hig_repo_tag_delete", "hig_repo_log", "hig_repo_diff",
   "hig_repo_path_history", "hig_repo_restore", "hig_repo_restore_range",
@@ -178,6 +183,33 @@ try {
   assert(refs.data.refs.some((entry) => entry.name === "mcp-baseline"));
   await tool("hig_repo_verify", { dir: workspace });
 
+  const watchStarted = await tool("hig_repo_watch_start", {
+    dir: workspace,
+    debounceMs: 100,
+    message: "MCP automatic snapshot",
+    author: "mcp-ci"
+  });
+  assert.equal(watchStarted.data.active, true);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const automaticContent = "pub fn mcp_fixture() -> u8 { 2 }\n";
+  fs.writeFileSync(path.join(workspace, "src", "lib.rs"), automaticContent);
+  const watchStatus = await waitFor(async () => {
+    const status = await tool("hig_repo_watch_status", { dir: workspace });
+    return status.data.snapshots >= 1 ? status : null;
+  }, 15000, "automatic repository snapshot");
+  assert.equal(watchStatus.data.last_snapshot.created, true);
+  const watchStopped = await tool("hig_repo_watch_stop", { dir: workspace });
+  assert.equal(watchStopped.data.active, false);
+  await tool("hig_repo_verify", { dir: workspace });
+
+  const automaticRestore = path.join(work, "automatic-restore");
+  await tool("hig_repo_restore", {
+    dir: workspace,
+    revision: "HEAD",
+    outputDir: automaticRestore
+  });
+  assert.equal(fs.readFileSync(path.join(automaticRestore, "src", "lib.rs"), "utf8"), automaticContent);
+
   const range = path.join(work, "range.bin");
   await tool("hig_repo_restore_range", {
     dir: workspace,
@@ -197,4 +229,14 @@ try {
 } finally {
   child.stdin.end();
   child.kill("SIGTERM");
+}
+
+async function waitFor(operation, timeoutMs, description) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await operation();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`timed out waiting for ${description}`);
 }

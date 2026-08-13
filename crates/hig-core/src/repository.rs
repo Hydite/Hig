@@ -1730,7 +1730,11 @@ impl Repository {
 
     fn sync_new_objects(&self, object_ids: &[RepositoryObjectId]) -> anyhow::Result<()> {
         object_ids.par_iter().try_for_each(|object_id| {
-            File::open(self.object_path(*object_id))?.sync_all()?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.object_path(*object_id))?
+                .sync_all()?;
             Ok::<_, anyhow::Error>(())
         })?;
         let directories = object_ids

@@ -75,6 +75,15 @@ jobs:
           node-version: 22
       - name: Build native CLI
         run: cargo build --release -p hig-cli
+      - name: Native repository snapshot diagnostic
+        shell: bash
+        run: |
+          mkdir -p target/native-repo-smoke/src
+          printf 'native package repository smoke\n' > target/native-repo-smoke/README.md
+          printf 'pub fn native_smoke() -> u8 { 1 }\n' > target/native-repo-smoke/src/lib.rs
+          "${{ matrix.binary }}" repo init target/native-repo-smoke --json
+          "${{ matrix.binary }}" repo snapshot target/native-repo-smoke --message native-smoke --json
+          "${{ matrix.binary }}" repo verify target/native-repo-smoke --json
       - name: Assemble native IDE/MCP package
         shell: bash
         run: node scripts/package-ide-mcp.mjs --binary "${{ matrix.binary }}" --platform "${{ matrix.platform }}" --output-dir artifacts/ci

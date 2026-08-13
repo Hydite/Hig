@@ -92,6 +92,9 @@ Use these with daemon-backed operations.
 
 - `hig_repo_init`: initialize independent immutable history.
 - `hig_repo_snapshot`: atomically record a version with byte and semantic indexes.
+- `hig_repo_watch_start`: start session-managed automatic snapshots for an IDE workspace.
+- `hig_repo_watch_status`: inspect watcher state and the latest automatic commit.
+- `hig_repo_watch_stop`: stop the managed watcher; repeated stops are safe.
 - `hig_repo_migrate`: upgrade legacy direct-HEAD refs to the explicit main branch model.
 - `hig_repo_log`: list commits.
 - `hig_repo_diff`: inspect file and exact byte-range changes.
@@ -116,6 +119,11 @@ hig_repo_restore_symbol(dir, revision="<commit>", symbol="Thing::method", output
 
 Repository GC defaults to preview. Set `apply=true` only after reviewing the
 dry-run result.
+
+An IDE should start one managed watcher after repository initialization, check
+status when it needs the latest automatic commit, and stop it before unloading
+the workspace. The MCP server also terminates all managed watchers when its
+stdio session closes.
 
 ## Benchmark
 
@@ -143,6 +151,9 @@ Use benchmark tools only when the user asks for performance validation. They can
 | `hig_cache_compact` | `hig cache compact` |
 | `hig_repo_init` | `hig repo init <dir> --json` |
 | `hig_repo_snapshot` | `hig repo snapshot <dir> --json` |
+| `hig_repo_watch_start` | managed `hig repo watch <dir> --json` |
+| `hig_repo_watch_status` | managed watcher status |
+| `hig_repo_watch_stop` | stop managed watcher |
 | `hig_repo_migrate` | `hig repo migrate <dir> --json` |
 | `hig_repo_diff` | `hig repo diff <dir> --json` |
 | `hig_repo_path_history` | `hig repo history <dir> --path <path> --json` |

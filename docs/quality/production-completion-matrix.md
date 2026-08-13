@@ -36,7 +36,7 @@ are descriptive only; the `Complete` state requires every listed gate.
 
 ## Native CLI and MCP Packages
 
-- [x] Current macOS universal package and 47-tool MCP protocol smoke.
+- [x] Current macOS universal package and 50-tool MCP protocol smoke.
 - [x] Previously released Linux x86_64 GNU package provenance.
 - [ ] Current-source native Linux x86_64 GNU package and extracted-package QA.
 - [ ] Current-source native Windows x86_64 MSVC package and extracted-package QA.

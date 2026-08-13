@@ -16,6 +16,8 @@ const MAX_OUTPUT_BYTES = Number(process.env.HIG_MCP_MAX_OUTPUT_BYTES || 1_000_00
 const DEFAULT_TIMEOUT_MS = Number(process.env.HIG_MCP_TIMEOUT_MS || 20 * 60 * 1000);
 const allowAnyPath = process.env.HIG_MCP_ALLOW_ANY_PATH === "1";
 const allowedRoots = computeAllowedRoots();
+const repositoryWatchers = new Map();
+let shuttingDown = false;
 
 const tools = [
   {
@@ -269,6 +271,30 @@ const tools = [
   {
     name: "hig_repo_migrate",
     description: "Upgrade a legacy direct-HEAD repository to HEAD plus refs/heads/main without rewriting objects.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root.")
+    })
+  },
+  {
+    name: "hig_repo_watch_start",
+    description: "Start IDE-managed automatic repository snapshots for an allowed workspace.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root."),
+      debounceMs: { type: "integer", minimum: 1, description: "Quiet period before snapshot. Defaults to 750 ms." },
+      message: { type: "string", minLength: 1, description: "Automatic snapshot message." },
+      author: { type: "string", minLength: 1, description: "Optional author identity." }
+    })
+  },
+  {
+    name: "hig_repo_watch_status",
+    description: "Return lifecycle state and the latest automatic snapshot for an IDE-managed repository watcher.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root.")
+    })
+  },
+  {
+    name: "hig_repo_watch_stop",
+    description: "Stop the IDE-managed repository watcher for a workspace. Repeated stops are safe.",
     inputSchema: objectSchema({
       dir: pathProp("Repository root. Defaults to workspace root.")
     })
@@ -638,6 +664,12 @@ async function callTool(name, args) {
       return runHig(["repo", "refs", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_repo_migrate":
       return runHig(["repo", "migrate", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
+    case "hig_repo_watch_start":
+      return startRepositoryWatcher(args);
+    case "hig_repo_watch_status":
+      return repositoryWatcherStatus(resolveInputPath(args.dir || "."));
+    case "hig_repo_watch_stop":
+      return stopRepositoryWatcher(resolveInputPath(args.dir || "."));
     case "hig_repo_branch_list":
       return runHig(["repo", "branch", "list", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_repo_branch_create":
@@ -819,6 +851,157 @@ async function runHig(args, options = {}) {
   });
 }
 
+async function startRepositoryWatcher(args) {
+  const root = resolveInputPath(args.dir || ".");
+  const existing = repositoryWatchers.get(root);
+  if (existing?.active) {
+    return watcherResult(existing, { reused: true });
+  }
+
+  const preflight = await runHig(["repo", "refs", root, "--json"], { parseJson: true });
+  if (preflight.code !== 0) return preflight;
+
+  const debounceMs = args.debounceMs ?? 750;
+  if (!Number.isInteger(debounceMs) || debounceMs < 1) {
+    throw new Error("debounceMs must be an integer >= 1");
+  }
+  const message = args.message || "IDE automatic snapshot";
+  const author = args.author || null;
+  const higBin = process.env.HIG_BIN || (fs.existsSync(bundledHig) ? bundledHig : "hig");
+  const command = [
+    "repo", "watch", root,
+    "--debounce-ms", String(debounceMs),
+    "--message", message,
+    ...(author ? ["--author", author] : []),
+    "--json"
+  ];
+  const child = spawn(higBin, command, {
+    cwd: process.env.HIG_MCP_WORKDIR || process.cwd(),
+    env: { ...process.env, NO_COLOR: "1" },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  const watcher = {
+    root,
+    child,
+    active: true,
+    stopping: false,
+    startedAt: new Date().toISOString(),
+    debounceMs,
+    message,
+    author,
+    snapshots: 0,
+    lastSnapshot: null,
+    stdout: Buffer.alloc(0),
+    stdoutLine: "",
+    stderr: Buffer.alloc(0),
+    exitCode: null,
+    signal: null
+  };
+  repositoryWatchers.set(root, watcher);
+  child.stdout.on("data", (chunk) => consumeWatcherOutput(watcher, chunk));
+  child.stderr.on("data", (chunk) => {
+    watcher.stderr = appendBounded(watcher.stderr, chunk);
+  });
+  child.on("error", (error) => {
+    watcher.active = false;
+    watcher.stderr = appendBounded(watcher.stderr, Buffer.from(String(error.message)));
+  });
+  child.on("close", (code, signal) => {
+    watcher.active = false;
+    watcher.exitCode = code;
+    watcher.signal = signal;
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  if (!watcher.active) return watcherResult(watcher, { code: watcher.exitCode ?? 1 });
+  return watcherResult(watcher);
+}
+
+function consumeWatcherOutput(watcher, chunk) {
+  watcher.stdout = appendBounded(watcher.stdout, chunk);
+  watcher.stdoutLine += Buffer.from(chunk).toString("utf8");
+  const lines = watcher.stdoutLine.split(/\r?\n/);
+  watcher.stdoutLine = lines.pop() || "";
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      watcher.lastSnapshot = JSON.parse(line);
+      watcher.snapshots += 1;
+    } catch {
+      watcher.stderr = appendBounded(
+        watcher.stderr,
+        Buffer.from(`invalid watcher JSON output: ${line}\n`)
+      );
+    }
+  }
+}
+
+function repositoryWatcherStatus(root) {
+  const watcher = repositoryWatchers.get(root);
+  if (!watcher) {
+    return { code: 0, stdout: "", stderr: "", data: { root, active: false, managed: false } };
+  }
+  return watcherResult(watcher);
+}
+
+async function stopRepositoryWatcher(root) {
+  const watcher = repositoryWatchers.get(root);
+  if (!watcher) {
+    return { code: 0, stdout: "", stderr: "", data: { root, active: false, managed: false } };
+  }
+  await terminateRepositoryWatcher(watcher);
+  const result = watcherResult(watcher);
+  repositoryWatchers.delete(root);
+  return result;
+}
+
+function watcherResult(watcher, overrides = {}) {
+  return {
+    code: overrides.code ?? 0,
+    signal: watcher.signal,
+    stdout: watcher.stdout.toString("utf8"),
+    stderr: watcher.stderr.toString("utf8"),
+    data: {
+      root: watcher.root,
+      managed: true,
+      active: watcher.active,
+      reused: overrides.reused || false,
+      started_at: watcher.startedAt,
+      debounce_ms: watcher.debounceMs,
+      message: watcher.message,
+      author: watcher.author,
+      snapshots: watcher.snapshots,
+      last_snapshot: watcher.lastSnapshot,
+      exit_code: watcher.exitCode,
+      signal: watcher.signal
+    }
+  };
+}
+
+async function terminateRepositoryWatcher(watcher) {
+  if (!watcher.active || watcher.stopping) return;
+  watcher.stopping = true;
+  const closed = new Promise((resolve) => watcher.child.once("close", resolve));
+  watcher.child.kill("SIGTERM");
+  const graceful = await Promise.race([
+    closed.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 2000))
+  ]);
+  if (!graceful && watcher.active) {
+    watcher.child.kill("SIGKILL");
+    await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2000))]);
+  }
+  watcher.active = false;
+  watcher.stopping = false;
+}
+
+async function shutdown(exitCode) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await Promise.all([...repositoryWatchers.values()].map(terminateRepositoryWatcher));
+  process.exit(exitCode);
+}
+
 function appendBounded(current, chunk) {
   const next = Buffer.concat([current, Buffer.from(chunk)]);
   if (next.length <= MAX_OUTPUT_BYTES) return next;
@@ -856,5 +1039,6 @@ process.on("uncaughtException", (error) => {
   sendError(id, -32603, String(error?.message || error));
 });
 
-process.on("SIGTERM", () => process.exit(0));
-process.on("SIGINT", () => process.exit(0));
+process.stdin.on("end", () => void shutdown(0));
+process.on("SIGTERM", () => void shutdown(0));
+process.on("SIGINT", () => void shutdown(0));

@@ -86,6 +86,7 @@ Linux example:
 - The adapter does not log passwords, but Hig CLI password commands still receive passwords as child-process arguments today. Prefer `hig_session_unlock` plus `hig_pack` with `useSession: true` for repeated operations.
 - `hig_bench` can be long-running and write large temporary files.
 - Repository GC is report-only unless an MCP caller explicitly sets `apply: true`.
+- Repository watcher children are confined to allowed roots and are terminated when the MCP stdio session closes.
 - Symbol restore rejects ambiguous names; call `hig_repo_symbols` to select a qualified name or ID.
 
 ## Tools

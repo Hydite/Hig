@@ -589,7 +589,10 @@ impl ProjectWatcher {
     #[cfg(test)]
     fn force_periodic_due(&mut self) {
         self.last_snapshot = Instant::now()
-            .checked_sub(Duration::from_millis(self.policy.periodic_interval_ms))
+            .checked_sub(
+                Duration::from_millis(self.policy.periodic_interval_ms)
+                    .saturating_add(Duration::from_secs(1)),
+            )
             .unwrap_or_else(Instant::now);
     }
 
