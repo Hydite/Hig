@@ -15,19 +15,20 @@ test -f "$REPOSITORY_ROOT/SHA256SUMS"
 
 verify_checksums() {
   local manifest=$1
-  if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$ROOT" && sha256sum -c "$manifest")
-  else
-    while read -r expected path; do
+  while read -r expected path; do
+      path=${path%$'\r'}
       local actual
+      if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$ROOT/$path" | awk '{print $1}')
+      else
       actual=$(shasum -a 256 "$ROOT/$path" | awk '{print $1}')
+      fi
       if [[ "$actual" != "$expected" ]]; then
         echo "$path: checksum mismatch" >&2
         return 1
       fi
       echo "$path: OK"
-    done < "$ROOT/$manifest"
-  fi
+  done < "$ROOT/$manifest"
 }
 
 verify_checksums "fixtures/archives/v1.9.6/SHA256SUMS"
