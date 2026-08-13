@@ -1,6 +1,9 @@
 /target/
 /.hig-cache/
 *.hig
+!fixtures/archives/**/*.hig
+!fixtures/repositories/v1.10.0-direct-head/workspace/.hig/
+!fixtures/repositories/v1.10.0-direct-head/workspace/.hig/**
 
 # Local JavaScript dependencies and generated frontend output.
 apps/hig-desktop/node_modules/

@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node ./bin/hig-mcp-server.js",
-    "smoke": "node ./bin/hig-mcp-server.js --smoke"
+    "smoke": "node ./bin/hig-mcp-server.js --smoke",
+    "test:integration": "node ../../scripts/mcp-integration-test.mjs"
   },
   "engines": {
     "node": ">=18"

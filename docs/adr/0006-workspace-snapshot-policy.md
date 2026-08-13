@@ -16,6 +16,12 @@ The default policy preserves responsive save behavior, performs a periodic full 
 
 The daemon watcher is the single policy executor for foreground and pack workflows. A queue overflow, watcher error, or rescan request invalidates the snapshot and forces a full rebuild when automatic policy is enabled. Memory pressure pauses automatic snapshot publication and exposes a structured pause reason; it never reports a stale snapshot as Ready. A disabled policy leaves changes Dirty or Invalid until an explicit rebuild.
 
+Full rebuilds and daemon/watcher restarts load the checked persisted snapshot
+and journal before scanning. Generation and event sequence therefore remain
+monotonic across process restarts. A missing initial snapshot is valid during
+first initialization; an existing snapshot that fails length, schema, identity,
+or checksum validation fails closed and is never silently replaced.
+
 ## Configuration and Failure Semantics
 
 project policy set validates the complete candidate policy, writes project.json atomically, and applies the same policy to the registered watcher. Invalid thresholds, unsupported policy schemas, and resource threshold inversions fail before state changes. Snapshot generations and event sequences are monotonic across full rebuilds.
@@ -24,3 +30,8 @@ project policy set validates the complete candidate policy, writes project.json 
 
 IDE clients can tune responsiveness and resource use without changing archive format or repository history. Status responses expose policy schema, pause state, resource pressure, and the last observed memory value. The policy is independent from archive encryption and compression settings, so automatic snapshot behavior cannot weaken secure archive defaults.
 
+Deterministic regression coverage injects watcher events and available-memory
+samples only under `cfg(test)`. It verifies event-burst coalescing, pending-file
+overflow rebuilds, pressure pause/resume without event loss, periodic rebuilds,
+restart monotonicity, and corruption failure semantics without adding a test
+override to production binaries.

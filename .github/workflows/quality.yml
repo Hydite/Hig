@@ -1,0 +1,126 @@
+name: HIG Quality Gates
+
+on:
+  push:
+    branches: [Public]
+  pull_request:
+    branches: [Public]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  correctness:
+    name: Core, CLI, compatibility, and MCP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Core and CLI tests
+        run: cargo test -p hig-core -p hig-cli
+      - name: Strict Clippy
+        run: cargo clippy -p hig-core -p hig-cli -p hig-ffi --all-targets -- -D warnings
+      - name: Release CLI
+        run: cargo build --release -p hig-cli
+      - name: Runtime format matrix
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release/hig
+        run: bash scripts/hig-compatibility-matrix.sh
+      - name: Historical golden fixtures
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release/hig
+        run: bash scripts/verify-golden-fixtures.sh
+      - name: MCP protocol and constrained workflow
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release/hig
+        run: node scripts/mcp-integration-test.mjs
+
+  native-package:
+    name: Native package (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64-gnu
+            binary: target/release/hig
+          - os: windows-2025
+            platform: windows-x86_64-msvc
+            binary: target/release/hig.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build native CLI
+        run: cargo build --release -p hig-cli
+      - name: Assemble native IDE/MCP package
+        shell: bash
+        run: node scripts/package-ide-mcp.mjs --binary "${{ matrix.binary }}" --platform "${{ matrix.platform }}" --output-dir artifacts/ci
+      - name: Verify extracted native package
+        shell: bash
+        run: node scripts/verify-ide-package.mjs "artifacts/ci/hig-v1.10.0-ide-mcp-${{ matrix.platform }}.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hig-v1.10.0-ide-mcp-${{ matrix.platform }}
+          path: |
+            artifacts/ci/hig-v1.10.0-ide-mcp-${{ matrix.platform }}.tar.gz
+            artifacts/ci/hig-v1.10.0-ide-mcp-${{ matrix.platform }}.tar.gz.sha256
+          if-no-files-found: error
+
+  macos-universal-package:
+    name: Native package (macOS universal)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build both macOS architectures
+        run: |
+          cargo build --release -p hig-cli --target aarch64-apple-darwin
+          cargo build --release -p hig-cli --target x86_64-apple-darwin
+          mkdir -p target/release-universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/hig \
+            target/x86_64-apple-darwin/release/hig \
+            -output target/release-universal/hig
+          lipo -verify_arch arm64 x86_64 target/release-universal/hig
+      - name: Assemble universal IDE/MCP package
+        run: node scripts/package-ide-mcp.mjs --binary target/release-universal/hig --platform macos-universal --output-dir artifacts/ci
+      - name: Verify extracted universal package
+        run: node scripts/verify-ide-package.mjs artifacts/ci/hig-v1.10.0-ide-mcp-macos-universal.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hig-v1.10.0-ide-mcp-macos-universal
+          path: |
+            artifacts/ci/hig-v1.10.0-ide-mcp-macos-universal.tar.gz
+            artifacts/ci/hig-v1.10.0-ide-mcp-macos-universal.tar.gz.sha256
+          if-no-files-found: error

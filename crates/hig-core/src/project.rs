@@ -1,6 +1,8 @@
 use crate::PathChunkRecord;
 use crate::cache::CacheStore;
 use crate::{BatchOptions, ChunkOptions, PipelineOptions, SolidMode};
+#[cfg(test)]
+use crossbeam_channel::Sender;
 use crossbeam_channel::{Receiver, TryRecvError, bounded};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rayon::prelude::*;
@@ -204,6 +206,8 @@ pub struct ProjectWatcher {
     snapshot: ProjectSnapshot,
     watcher: RecommendedWatcher,
     receiver: Receiver<notify::Result<Event>>,
+    #[cfg(test)]
+    test_sender: Sender<notify::Result<Event>>,
     overflowed: Arc<AtomicBool>,
     pending: BTreeSet<PathBuf>,
     last_event: Option<Instant>,
@@ -220,6 +224,8 @@ pub struct ProjectWatcher {
     resource_available_memory_bytes: Option<u64>,
     resource_pressure: bool,
     last_resource_check: Option<Instant>,
+    #[cfg(test)]
+    resource_memory_override: Option<u64>,
 }
 
 impl ProjectWatcher {
@@ -240,6 +246,8 @@ impl ProjectWatcher {
         );
         let overflowed = Arc::new(AtomicBool::new(false));
         let callback_overflow = overflowed.clone();
+        #[cfg(test)]
+        let test_sender = sender.clone();
         let mut watcher = notify::recommended_watcher(move |event| {
             if sender.try_send(event).is_err() {
                 callback_overflow.store(true, Ordering::Release);
@@ -266,6 +274,8 @@ impl ProjectWatcher {
             snapshot,
             watcher,
             receiver,
+            #[cfg(test)]
+            test_sender,
             overflowed,
             pending: BTreeSet::new(),
             last_event: None,
@@ -282,6 +292,8 @@ impl ProjectWatcher {
             resource_available_memory_bytes: None,
             resource_pressure: false,
             last_resource_check: None,
+            #[cfg(test)]
+            resource_memory_override: None,
         })
     }
 
@@ -359,7 +371,9 @@ impl ProjectWatcher {
         }
         if received {
             self.last_event = Some(Instant::now());
-            self.snapshot.validity = SnapshotValidity::Dirty;
+            if self.snapshot.validity != SnapshotValidity::Invalid {
+                self.snapshot.validity = SnapshotValidity::Dirty;
+            }
         }
         if self.snapshot_paused || !self.policy.enabled {
             return Ok(false);
@@ -532,7 +546,7 @@ impl ProjectWatcher {
             return;
         }
         self.last_resource_check = Some(Instant::now());
-        self.resource_available_memory_bytes = available_memory_bytes();
+        self.resource_available_memory_bytes = self.sample_available_memory_bytes();
         let Some(available) = self.resource_available_memory_bytes else {
             self.resource_pressure = false;
             if self.snapshot_paused {
@@ -559,6 +573,32 @@ impl ProjectWatcher {
     #[cfg(test)]
     fn force_overflow(&self) {
         self.overflowed.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn enqueue_event(&self, event: Event) {
+        self.test_sender.try_send(Ok(event)).unwrap();
+    }
+
+    #[cfg(test)]
+    fn set_available_memory(&mut self, available: u64) {
+        self.resource_memory_override = Some(available);
+        self.last_resource_check = None;
+    }
+
+    #[cfg(test)]
+    fn force_periodic_due(&mut self) {
+        self.last_snapshot = Instant::now()
+            .checked_sub(Duration::from_millis(self.policy.periodic_interval_ms))
+            .unwrap_or_else(Instant::now);
+    }
+
+    fn sample_available_memory_bytes(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(available) = self.resource_memory_override {
+            return Some(available);
+        }
+        available_memory_bytes()
     }
 }
 
@@ -728,10 +768,24 @@ pub fn rebuild_snapshot(
 ) -> anyhow::Result<ProjectSnapshot> {
     config.snapshot_policy.validate()?;
     let root = root.canonicalize()?;
+    let previous_path = snapshot_path(cache_root, &config.project_id);
+    let previous = if previous_path.exists() {
+        Some(load_snapshot(cache_root, &config.project_id)?)
+    } else {
+        None
+    };
+    let generation = previous
+        .as_ref()
+        .map(|snapshot| snapshot.generation.saturating_add(1))
+        .unwrap_or(1);
+    let event_sequence = previous
+        .as_ref()
+        .map(|snapshot| snapshot.event_sequence.saturating_add(1))
+        .unwrap_or(0);
     let paths = project_file_paths(&root, &config.excludes);
     let records = paths
         .into_par_iter()
-        .map(|path| stable_read_record(&root, &path, 1))
+        .map(|path| stable_read_record(&root, &path, generation))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let files = records
         .into_iter()
@@ -740,8 +794,8 @@ pub fn rebuild_snapshot(
     let snapshot = ProjectSnapshot {
         schema: PROJECT_SCHEMA,
         project_id: config.project_id,
-        generation: 1,
-        event_sequence: 0,
+        generation,
+        event_sequence,
         validity: SnapshotValidity::Ready,
         files,
     };
@@ -1046,6 +1100,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::EventKind;
+    use notify::event::{DataChange, ModifyKind};
+
+    fn modified(path: PathBuf) -> Event {
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(path)
+    }
 
     #[test]
     fn project_init_and_snapshot_roundtrip_are_safe() {
@@ -1199,5 +1259,183 @@ mod tests {
         let rebuilt = watcher.status();
         assert!(rebuilt.generation > initial.generation);
         assert!(rebuilt.event_sequence > initial.event_sequence);
+    }
+
+    #[test]
+    fn watcher_restart_preserves_monotonic_generation_and_rebuilds_exact_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"one").unwrap();
+        let config = init_project(&root, Some(cache_dir.clone()), Vec::new()).unwrap();
+        let mut cache = CacheStore::open(&cache_dir).unwrap();
+        let first = ProjectWatcher::start(
+            &root,
+            config.clone(),
+            &mut cache,
+            PipelineOptions::default(),
+        )
+        .unwrap();
+        let first_status = first.status();
+        drop(first);
+
+        fs::write(root.join("a.txt"), b"two").unwrap();
+        fs::write(root.join("b.txt"), b"restart").unwrap();
+        let restarted =
+            ProjectWatcher::start(&root, config, &mut cache, PipelineOptions::default()).unwrap();
+        let restarted_status = restarted.status();
+        assert!(restarted_status.generation > first_status.generation);
+        assert!(restarted_status.event_sequence > first_status.event_sequence);
+        assert_eq!(restarted.snapshot().files.len(), 2);
+        assert_eq!(
+            restarted.snapshot().files["a.txt"].content_hash,
+            *blake3::hash(b"two").as_bytes()
+        );
+        assert_eq!(restarted.snapshot().validity, SnapshotValidity::Ready);
+    }
+
+    #[test]
+    fn watcher_restart_fails_closed_on_corrupted_persisted_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"one").unwrap();
+        let config = init_project(&root, Some(cache_dir.clone()), Vec::new()).unwrap();
+        let snapshot = snapshot_path(&cache_dir, &config.project_id);
+        fs::write(&snapshot, b"corrupted-project-snapshot").unwrap();
+        let mut cache = CacheStore::open(&cache_dir).unwrap();
+        let error =
+            match ProjectWatcher::start(&root, config, &mut cache, PipelineOptions::default()) {
+                Ok(_) => panic!("corrupted persisted snapshot was silently replaced"),
+                Err(error) => error,
+            };
+        assert!(
+            error.to_string().contains("project state"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(snapshot).unwrap(), b"corrupted-project-snapshot");
+    }
+
+    #[test]
+    fn resource_pressure_pauses_without_losing_events_and_resumes_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"one").unwrap();
+        let mut config = init_project(&root, Some(cache_dir.clone()), Vec::new()).unwrap();
+        config.snapshot_policy.quiescence_ms = 0;
+        config.snapshot_policy.resource.min_available_memory_bytes = 100;
+        config
+            .snapshot_policy
+            .resource
+            .resume_available_memory_bytes = 200;
+        atomic_write_json(&project_config_path(&root), &config).unwrap();
+        let mut cache = CacheStore::open(&cache_dir).unwrap();
+        let mut watcher =
+            ProjectWatcher::start(&root, config, &mut cache, PipelineOptions::default()).unwrap();
+        let initial_generation = watcher.snapshot().generation;
+
+        fs::write(root.join("a.txt"), b"two").unwrap();
+        watcher.enqueue_event(modified(watcher.root().join("a.txt")));
+        watcher.set_available_memory(50);
+        assert!(
+            !watcher
+                .poll(&mut cache, PipelineOptions::default())
+                .unwrap()
+        );
+        let paused = watcher.status();
+        assert!(paused.snapshot_paused);
+        assert!(paused.resource_pressure);
+        assert_eq!(paused.pause_reason.as_deref(), Some("low_available_memory"));
+        assert_eq!(watcher.snapshot().validity, SnapshotValidity::Dirty);
+        assert_eq!(watcher.snapshot().generation, initial_generation);
+
+        watcher.set_available_memory(250);
+        assert!(
+            watcher
+                .poll(&mut cache, PipelineOptions::default())
+                .unwrap()
+        );
+        let resumed = watcher.status();
+        assert!(!resumed.snapshot_paused);
+        assert!(!resumed.resource_pressure);
+        assert!(resumed.generation > initial_generation);
+        assert_eq!(
+            watcher.snapshot().files["a.txt"].content_hash,
+            *blake3::hash(b"two").as_bytes()
+        );
+    }
+
+    #[test]
+    fn event_burst_is_coalesced_and_pending_file_overflow_recovers_by_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"one").unwrap();
+        let mut config = init_project(&root, Some(cache_dir.clone()), Vec::new()).unwrap();
+        config.snapshot_policy.quiescence_ms = 0;
+        config.snapshot_policy.max_pending_files = 2;
+        config.snapshot_policy.resource.enabled = false;
+        atomic_write_json(&project_config_path(&root), &config).unwrap();
+        let mut cache = CacheStore::open(&cache_dir).unwrap();
+        let mut watcher =
+            ProjectWatcher::start(&root, config, &mut cache, PipelineOptions::default()).unwrap();
+        let initial_generation = watcher.snapshot().generation;
+
+        fs::write(root.join("a.txt"), b"two").unwrap();
+        for _ in 0..32 {
+            watcher.enqueue_event(modified(watcher.root().join("a.txt")));
+        }
+        assert!(
+            watcher
+                .poll(&mut cache, PipelineOptions::default())
+                .unwrap()
+        );
+        assert_eq!(watcher.status().dirty_files, 1);
+
+        for name in ["b.txt", "c.txt", "d.txt"] {
+            fs::write(root.join(name), name.as_bytes()).unwrap();
+            watcher.enqueue_event(modified(watcher.root().join(name)));
+        }
+        assert!(
+            watcher
+                .poll(&mut cache, PipelineOptions::default())
+                .unwrap()
+        );
+        assert!(watcher.snapshot().generation > initial_generation);
+        assert_eq!(watcher.snapshot().files.len(), 4);
+        assert_eq!(watcher.status().watcher_overflow_count, 1);
+        assert_eq!(watcher.snapshot().validity, SnapshotValidity::Ready);
+    }
+
+    #[test]
+    fn periodic_policy_forces_full_rebuild_without_pending_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"one").unwrap();
+        let mut config = init_project(&root, Some(cache_dir.clone()), Vec::new()).unwrap();
+        config.snapshot_policy.periodic_interval_ms = 1_000;
+        config.snapshot_policy.resource.enabled = false;
+        atomic_write_json(&project_config_path(&root), &config).unwrap();
+        let mut cache = CacheStore::open(&cache_dir).unwrap();
+        let mut watcher =
+            ProjectWatcher::start(&root, config, &mut cache, PipelineOptions::default()).unwrap();
+        let initial = watcher.status();
+        watcher.force_periodic_due();
+        assert!(
+            watcher
+                .poll(&mut cache, PipelineOptions::default())
+                .unwrap()
+        );
+        let rebuilt = watcher.status();
+        assert!(rebuilt.generation > initial.generation);
+        assert!(rebuilt.event_sequence > initial.event_sequence);
+        assert!(rebuilt.last_full_rebuild_unix_ns >= initial.last_full_rebuild_unix_ns);
     }
 }
