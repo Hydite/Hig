@@ -553,7 +553,7 @@ async function handleMessage(message) {
     switch (message.method) {
       case "initialize":
         sendResult(message.id, {
-          protocolVersion: message.params?.protocolVersion || PROTOCOL_VERSION,
+          protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: {} },
           serverInfo: { name: "hig-mcp-server", version: VERSION }
         });

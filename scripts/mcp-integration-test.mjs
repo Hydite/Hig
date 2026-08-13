@@ -144,6 +144,17 @@ try {
   assert.equal(initialized.result.serverInfo.name, "hig-mcp-server");
   assert.equal(initialized.result.serverInfo.version, "1.10.0");
 
+  const unsupported = await request("initialize", {
+    protocolVersion: "2099-01-01",
+    capabilities: {},
+    clientInfo: { name: "hig-compatibility-probe", version: "1" }
+  });
+  assert.equal(
+    unsupported.result.protocolVersion,
+    "2024-11-05",
+    "server must not claim an unsupported MCP protocol version"
+  );
+
   const listed = await request("tools/list");
   const names = listed.result.tools.map((entry) => entry.name).sort();
   assert.deepEqual(names, [...requiredTools].sort(), "MCP tool contract changed");

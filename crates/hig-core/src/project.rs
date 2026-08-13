@@ -378,7 +378,7 @@ impl ProjectWatcher {
         if self.snapshot_paused || !self.policy.enabled {
             return Ok(false);
         }
-        if self.periodic_due() && self.pending.is_empty() {
+        if self.periodic_due() {
             self.rebuild(cache, pipeline)?;
             return Ok(true);
         }
@@ -1442,5 +1442,36 @@ mod tests {
         assert!(rebuilt.generation > initial.generation);
         assert!(rebuilt.event_sequence > initial.event_sequence);
         assert!(rebuilt.last_full_rebuild_unix_ns >= initial.last_full_rebuild_unix_ns);
+    }
+
+    #[test]
+    fn periodic_rebuild_supersedes_pending_debounce_and_captures_current_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"one").unwrap();
+        let mut config = init_project(&root, Some(cache_dir.clone()), Vec::new()).unwrap();
+        config.snapshot_policy.quiescence_ms = 60_000;
+        config.snapshot_policy.periodic_interval_ms = 1_000;
+        config.snapshot_policy.resource.enabled = false;
+        atomic_write_json(&project_config_path(&root), &config).unwrap();
+        let mut cache = CacheStore::open(&cache_dir).unwrap();
+        let mut watcher =
+            ProjectWatcher::start(&root, config, &mut cache, PipelineOptions::default()).unwrap();
+
+        fs::write(root.join("a.txt"), b"two").unwrap();
+        watcher.enqueue_event(modified(watcher.root().join("a.txt")));
+        watcher.force_periodic_due();
+        assert!(
+            watcher
+                .poll(&mut cache, PipelineOptions::default())
+                .unwrap()
+        );
+        assert!(watcher.status().pending_events == 0);
+        assert_eq!(
+            watcher.snapshot().files["a.txt"].content_hash,
+            *blake3::hash(b"two").as_bytes()
+        );
     }
 }

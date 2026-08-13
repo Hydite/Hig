@@ -84,6 +84,11 @@ jobs:
           "${{ matrix.binary }}" repo init target/native-repo-smoke --json
           "${{ matrix.binary }}" repo snapshot target/native-repo-smoke --message native-smoke --json
           "${{ matrix.binary }}" repo verify target/native-repo-smoke --json
+      - name: Native historical fixture migration
+        shell: bash
+        env:
+          HIG_BIN: ${{ matrix.binary }}
+        run: bash scripts/verify-golden-fixtures.sh
       - name: Assemble native IDE/MCP package
         shell: bash
         run: node scripts/package-ide-mcp.mjs --binary "${{ matrix.binary }}" --platform "${{ matrix.platform }}" --output-dir artifacts/ci
@@ -124,6 +129,10 @@ jobs:
           lipo target/release-universal/hig -verify_arch arm64 x86_64
       - name: Assemble universal IDE/MCP package
         run: node scripts/package-ide-mcp.mjs --binary target/release-universal/hig --platform macos-universal --output-dir artifacts/ci
+      - name: Universal historical fixture migration
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release-universal/hig
+        run: bash scripts/verify-golden-fixtures.sh
       - name: Verify extracted universal package
         run: node scripts/verify-ide-package.mjs artifacts/ci/hig-v1.10.0-ide-mcp-macos-universal.tar.gz
       - uses: actions/upload-artifact@v4
