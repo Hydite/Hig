@@ -1909,11 +1909,7 @@ impl Repository {
             if !entry.file_type().is_file() {
                 continue;
             }
-            let name = entry
-                .path()
-                .strip_prefix(&root)?
-                .to_string_lossy()
-                .to_string();
+            let name = normalize_relative_path(entry.path().strip_prefix(&root)?)?;
             if (name == "HEAD" || name.starts_with("heads/") || name.starts_with("tags/"))
                 && let Some(value) = read_ref_value(entry.path())?
             {
@@ -1951,11 +1947,7 @@ impl Repository {
                 if !entry.file_type().is_file() {
                     continue;
                 }
-                let name = entry
-                    .path()
-                    .strip_prefix(&directory)?
-                    .to_string_lossy()
-                    .to_string();
+                let name = normalize_relative_path(entry.path().strip_prefix(&directory)?)?;
                 validate_ref_component(&name, display_kind)?;
                 if let Some(commit_id) = read_ref_value(entry.path())? {
                     refs.push(RepositoryRef {
