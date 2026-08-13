@@ -10,10 +10,10 @@ use crate::scan::{HotChunkRecord, ScanOptions, read_file_adaptive, scan_dir, uni
 use crate::writer::{ArchiveWriter, PayloadSource, PayloadStager, WriterReport};
 use crate::{
     ArchiveFileInfo, ArchiveFormat, ArchiveInspection, ArchiveSizeBreakdown, BatchOptions,
-    BlockStats, ChunkOptions, Compression, DaemonMode, EncryptionMode, IoOptions, L1CacheReport,
-    L2CacheReport, ManifestFormat, OperationControl, OperationKind, OperationPhase,
-    PackCriticalTimings, PackOptions, PackReport, PackTimings, PackTimingsUs, PipelineReport,
-    SessionReport, SolidMode, SpeedMode, UnpackOptions, WriteProfileReport,
+    BlockStats, ChunkOptions, Compression, DaemonMode, EncryptionMode, IoOptions, KdfProfile,
+    L1CacheReport, L2CacheReport, ManifestFormat, OperationControl, OperationKind, OperationPhase,
+    PackCriticalTimings, PackOptions, PackReport, PackTimings, PackTimingsUs, PipelineOptions,
+    PipelineReport, SessionReport, SolidMode, SpeedMode, UnpackOptions, WriteProfileReport,
 };
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
@@ -745,6 +745,131 @@ pub fn unpack_with_control(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveMigrationReport {
+    pub source_archive: String,
+    pub target_archive: String,
+    pub source_format: ArchiveFormat,
+    pub target_format: ArchiveFormat,
+    pub source_files: usize,
+    pub target_files: usize,
+    pub source_bytes: u64,
+    pub target_bytes: u64,
+    pub source_archive_bytes: u64,
+    pub target_archive_bytes: u64,
+    pub content_verified: bool,
+    pub published: bool,
+}
+
+pub fn migrate_archive(
+    source_archive: &Path,
+    target_archive: &Path,
+    source_password: Option<&str>,
+    target_password: Option<&str>,
+    target_encryption: EncryptionMode,
+    overwrite: bool,
+) -> anyhow::Result<ArchiveMigrationReport> {
+    let source_archive = source_archive.canonicalize()?;
+    let target_archive = absolute_path_for_archive(target_archive)?;
+    anyhow::ensure!(
+        source_archive != target_archive,
+        "migration source and target must be different files"
+    );
+    anyhow::ensure!(
+        source_archive.is_file(),
+        "migration source is not a regular file: {}",
+        source_archive.display()
+    );
+    if target_archive.exists() {
+        anyhow::ensure!(
+            target_archive.is_file(),
+            "migration target is not a regular file: {}",
+            target_archive.display()
+        );
+        anyhow::ensure!(
+            overwrite,
+            "migration target already exists; use --overwrite to replace it"
+        );
+    }
+    validate_migration_passwords(source_password, target_password, target_encryption)?;
+    let source_inspection = inspect_archive(&source_archive, source_password)?;
+    let parent = target_archive
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("migration target has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let staging = unique_migration_path(&target_archive, "stage");
+    let staged_archive = unique_migration_path(&target_archive, "archive");
+    let verification = unique_migration_path(&target_archive, "verify");
+    let effective_target_password = match target_encryption {
+        EncryptionMode::Password => target_password.or(source_password),
+        EncryptionMode::None => None,
+    };
+    let result = (|| -> anyhow::Result<ArchiveMigrationReport> {
+        fs::create_dir_all(&staging)?;
+        unpack(UnpackOptions {
+            archive_file: source_archive.clone(),
+            output_dir: staging.clone(),
+            password: source_password.map(str::to_string),
+            overwrite: false,
+        })?;
+
+        let pack_report = pack(PackOptions {
+            input_dir: staging.clone(),
+            output_file: staged_archive.clone(),
+            password: effective_target_password.map(str::to_string),
+            encryption: target_encryption,
+            cache_dir: None,
+            threads: None,
+            compression: Compression::Zstd,
+            level: None,
+            use_cache: false,
+            trust_metadata: false,
+            format: ArchiveFormat::HigV2,
+            batch: BatchOptions::default(),
+            chunk: ChunkOptions::default(),
+            speed: SpeedMode::Balanced,
+            kdf_profile: KdfProfile::Secure,
+            sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Auto,
+            pipeline: PipelineOptions::default(),
+        })?;
+        let target_inspection = inspect_archive(&staged_archive, effective_target_password)?;
+        ensure_migration_entries_equal(&source_inspection, &target_inspection)?;
+        unpack(UnpackOptions {
+            archive_file: staged_archive.clone(),
+            output_dir: verification.clone(),
+            password: effective_target_password.map(str::to_string),
+            overwrite: false,
+        })?;
+        verify_migration_content(&staging, &verification)?;
+        publish_migrated_archive(&staged_archive, &target_archive, overwrite)?;
+        Ok(ArchiveMigrationReport {
+            source_archive: source_archive.display().to_string(),
+            target_archive: target_archive.display().to_string(),
+            source_format: source_inspection.format,
+            target_format: target_inspection.format,
+            source_files: source_inspection.files.len(),
+            target_files: target_inspection.files.len(),
+            source_bytes: source_inspection.input_bytes,
+            target_bytes: target_inspection.input_bytes,
+            source_archive_bytes: source_inspection.archive_bytes,
+            target_archive_bytes: pack_report.archive_bytes,
+            content_verified: true,
+            published: true,
+        })
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    let _ = fs::remove_dir_all(&verification);
+    if result.is_err() {
+        let _ = fs::remove_file(&staged_archive);
+    }
+    result
+}
+
 pub fn inspect_archive(path: &Path, password: Option<&str>) -> anyhow::Result<ArchiveInspection> {
     let archive_bytes = fs::metadata(path)?.len();
     let mut archive = fs::File::open(path)?;
@@ -834,6 +959,166 @@ pub fn inspect_archive(path: &Path, password: Option<&str>) -> anyhow::Result<Ar
         }
         _ => anyhow::bail!("not a hig archive"),
     }
+}
+
+fn validate_migration_passwords(
+    source_password: Option<&str>,
+    target_password: Option<&str>,
+    target_encryption: EncryptionMode,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        source_password.is_none_or(|password| !password.is_empty()),
+        "source password must not be empty"
+    );
+    match target_encryption {
+        EncryptionMode::Password => anyhow::ensure!(
+            target_password
+                .or(source_password)
+                .is_some_and(|password| !password.is_empty()),
+            "target password is required for password encryption"
+        ),
+        EncryptionMode::None => anyhow::ensure!(
+            target_password.is_none(),
+            "target password cannot be used with encryption none"
+        ),
+    }
+    Ok(())
+}
+
+fn ensure_migration_entries_equal(
+    source: &ArchiveInspection,
+    target: &ArchiveInspection,
+) -> anyhow::Result<()> {
+    let mut source_files = source.files.iter().collect::<Vec<_>>();
+    let mut target_files = target.files.iter().collect::<Vec<_>>();
+    source_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    target_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    anyhow::ensure!(
+        source_files.len() == target_files.len() && source.input_bytes == target.input_bytes,
+        "migration file count or byte total changed"
+    );
+    for (source, target) in source_files.iter().zip(target_files) {
+        anyhow::ensure!(
+            source.relative_path == target.relative_path && source.size == target.size,
+            "migration content mismatch at {}",
+            source.relative_path
+        );
+    }
+    Ok(())
+}
+
+fn verify_migration_content(source_dir: &Path, target_dir: &Path) -> anyhow::Result<()> {
+    let source = directory_content_index(source_dir)?;
+    let target = directory_content_index(target_dir)?;
+    anyhow::ensure!(source.len() == target.len(), "migration file count changed");
+    for (path, (source_size, source_hash)) in &source {
+        let (target_size, target_hash) = target
+            .get(path)
+            .ok_or_else(|| anyhow::anyhow!("migration file missing after repack: {path}"))?;
+        anyhow::ensure!(
+            source_size == target_size && source_hash == target_hash,
+            "migration content mismatch at {path}"
+        );
+    }
+    Ok(())
+}
+
+fn directory_content_index(
+    root: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, (u64, [u8; 32])>> {
+    let mut index = std::collections::BTreeMap::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)?
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("migration path is not valid UTF-8"))?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let mut file = fs::File::open(entry.path())?;
+        let mut hasher = blake3::Hasher::new();
+        let mut bytes = 0_u64;
+        let mut buffer = [0_u8; 128 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            bytes = bytes
+                .checked_add(read as u64)
+                .ok_or_else(|| anyhow::anyhow!("migration byte count overflow"))?;
+        }
+        index.insert(relative, (bytes, *hasher.finalize().as_bytes()));
+    }
+    Ok(index)
+}
+
+fn absolute_path_for_archive(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.exists() {
+        return Ok(path.canonicalize()?);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if let Some(parent) = absolute.parent()
+        && parent.exists()
+    {
+        return Ok(parent.canonicalize()?.join(
+            absolute
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("migration target has no file name"))?,
+        ));
+    }
+    Ok(absolute)
+}
+
+fn unique_migration_path(target: &Path, kind: &str) -> PathBuf {
+    let random = hex::encode(crate::random_bytes::<8>());
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("archive.hig");
+    target.with_file_name(format!(
+        ".{name}.migrate-{kind}-{}-{random}",
+        std::process::id()
+    ))
+}
+
+fn publish_migrated_archive(staged: &Path, target: &Path, overwrite: bool) -> anyhow::Result<()> {
+    if !overwrite && target.exists() {
+        anyhow::bail!("migration target appeared during migration");
+    }
+    if overwrite {
+        let backup = unique_migration_path(target, "backup");
+        if target.exists() {
+            fs::rename(target, &backup)?;
+            if let Err(error) = fs::rename(staged, target) {
+                let _ = fs::rename(&backup, target);
+                return Err(error.into());
+            }
+            let _ = fs::remove_file(backup);
+        } else {
+            fs::rename(staged, target)?;
+        }
+    } else {
+        fs::rename(staged, target)?;
+    }
+    if let Some(parent) = target.parent() {
+        sync_archive_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_archive_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
 }
 
 fn pack_v2(options: PackOptions, control: &OperationControl) -> anyhow::Result<PackReport> {
@@ -3830,6 +4115,132 @@ mod tests {
         let bytes = bincode::serialize(&manifest).unwrap();
         let decoded: Manifest = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_verifies_content_and_publishes_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("a.txt"), b"alpha").unwrap();
+        fs::create_dir_all(source_dir.join("nested")).unwrap();
+        fs::write(source_dir.join("nested/b.txt"), b"beta").unwrap();
+        let source = temp.path().join("legacy.hig");
+        pack(PackOptions {
+            input_dir: source_dir.clone(),
+            output_file: source.clone(),
+            password: Some("source-password".to_string()),
+            encryption: EncryptionMode::Password,
+            cache_dir: None,
+            threads: None,
+            compression: Compression::Zstd,
+            level: None,
+            use_cache: false,
+            trust_metadata: false,
+            format: ArchiveFormat::HigV1,
+            batch: BatchOptions::default(),
+            chunk: ChunkOptions::default(),
+            speed: SpeedMode::Balanced,
+            kdf_profile: KdfProfile::Secure,
+            sealed_cache: false,
+            manifest_format: ManifestFormat::Legacy,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
+            pipeline: PipelineOptions::default(),
+        })
+        .unwrap();
+        let target = temp.path().join("migrated.hig");
+        let report = migrate_archive(
+            &source,
+            &target,
+            Some("source-password"),
+            Some("target-password"),
+            EncryptionMode::Password,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.source_format, ArchiveFormat::HigV1);
+        assert_eq!(report.target_format, ArchiveFormat::HigV2);
+        assert!(report.content_verified);
+        assert!(report.published);
+        let inspection = inspect_archive(&target, Some("target-password")).unwrap();
+        assert_eq!(inspection.input_bytes, 9);
+        assert_eq!(inspection.files.len(), 2);
+        let unpacked = temp.path().join("unpacked");
+        unpack(UnpackOptions {
+            archive_file: target,
+            output_dir: unpacked.clone(),
+            password: Some("target-password".to_string()),
+            overwrite: false,
+        })
+        .unwrap();
+        assert_eq!(fs::read(unpacked.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(fs::read(unpacked.join("nested/b.txt")).unwrap(), b"beta");
+    }
+
+    #[test]
+    fn failed_migration_preserves_existing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("a.txt"), b"alpha").unwrap();
+        let source = temp.path().join("source.hig");
+        pack(PackOptions {
+            input_dir: source_dir,
+            output_file: source.clone(),
+            password: Some("source-password".to_string()),
+            encryption: EncryptionMode::Password,
+            cache_dir: None,
+            threads: None,
+            compression: Compression::Zstd,
+            level: None,
+            use_cache: false,
+            trust_metadata: false,
+            format: ArchiveFormat::HigV2,
+            batch: BatchOptions::default(),
+            chunk: ChunkOptions::default(),
+            speed: SpeedMode::Balanced,
+            kdf_profile: KdfProfile::Secure,
+            sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Off,
+            pipeline: PipelineOptions::default(),
+        })
+        .unwrap();
+        let target = temp.path().join("existing.hig");
+        fs::write(&target, b"existing-target").unwrap();
+        assert!(
+            migrate_archive(
+                &source,
+                &target,
+                Some("source-password"),
+                None,
+                EncryptionMode::None,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"existing-target");
+        assert!(
+            migrate_archive(
+                &source,
+                &target,
+                Some("wrong"),
+                None,
+                EncryptionMode::None,
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(temp.path().join("existing.hig")).unwrap(),
+            b"existing-target"
+        );
     }
 
     #[test]

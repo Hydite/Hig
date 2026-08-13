@@ -1,11 +1,11 @@
-use crate::{RepositoryBranchCommand, RepositoryCommand, RepositoryTagCommand};
+use crate::cli::{RepositoryBranchCommand, RepositoryCommand, RepositoryTagCommand};
 use hig_core::{
     RepositoryObjectId, RepositoryWatcher, create_repository_branch, create_repository_tag,
     delete_repository_branch, delete_repository_tag, gc_repository, init_repository,
-    repository_branch_names, repository_diff, repository_log, repository_path_history,
-    repository_refs, repository_storage_tree, repository_symbol_history, repository_symbols,
-    restore_repository, restore_repository_range, restore_repository_symbol, snapshot_repository,
-    switch_repository_branch, verify_repository,
+    migrate_repository, repository_branch_names, repository_diff, repository_log,
+    repository_path_history, repository_refs, repository_storage_tree, repository_symbol_history,
+    repository_symbols, restore_repository, restore_repository_range, restore_repository_symbol,
+    snapshot_repository, switch_repository_branch, verify_repository,
 };
 use std::time::Duration;
 
@@ -84,6 +84,24 @@ pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
                         reference.active
                     );
                 }
+            }
+        }
+        RepositoryCommand::Migrate { dir, json } => {
+            let report = migrate_repository(&dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "repo: migrated root={} active_branch={} commit={} changed={} objects_rewritten={}",
+                    report.root,
+                    report.active_branch,
+                    report
+                        .commit_id
+                        .map(short_id)
+                        .unwrap_or_else(|| "none".to_string()),
+                    report.changed,
+                    report.objects_rewritten
+                );
             }
         }
         RepositoryCommand::Branch { command } => handle_branch(command)?,

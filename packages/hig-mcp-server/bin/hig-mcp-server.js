@@ -176,6 +176,18 @@ const tools = [
     }, ["archiveFile"])
   },
   {
+    name: "hig_migrate",
+    description: "Verify and atomically migrate an HIGV1 or HIGV2 archive to a new HIGV2 archive.",
+    inputSchema: objectSchema({
+      source: pathProp("Source .hig archive."),
+      output: pathProp("Target .hig archive."),
+      password: { type: "string", description: "Source password; also used as target password when targetPassword is omitted." },
+      targetPassword: { type: "string", description: "Optional target password." },
+      encryption: { type: "string", enum: ["password", "none"] },
+      overwrite: { type: "boolean", description: "Replace an existing target only after successful verification." }
+    }, ["source", "output"])
+  },
+  {
     name: "hig_cache_status",
     description: "Return Hig cache status.",
     inputSchema: objectSchema({
@@ -250,6 +262,13 @@ const tools = [
   {
     name: "hig_repo_refs",
     description: "List HEAD, branches, and tags with full commit IDs and active state.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root.")
+    })
+  },
+  {
+    name: "hig_repo_migrate",
+    description: "Upgrade a legacy direct-HEAD repository to HEAD plus refs/heads/main without rewriting objects.",
     inputSchema: objectSchema({
       dir: pathProp("Repository root. Defaults to workspace root.")
     })
@@ -585,6 +604,18 @@ async function callTool(name, args) {
       return runHig(["unpack", resolveInputPath(args.archiveFile), "--output-dir", resolveOutputPath(args.outputDir), ...optionValue("--password", args.password), ...(args.overwrite ? ["--overwrite"] : [])]);
     case "hig_inspect":
       return runHig(["inspect", resolveInputPath(args.archiveFile), ...optionValue("--password", args.password), ...(args.json === false ? [] : ["--json"])], { parseJson: args.json !== false });
+    case "hig_migrate":
+      return runHig([
+        "migrate",
+        resolveInputPath(args.source),
+        "--output",
+        resolveOutputPath(args.output),
+        ...optionValue("--password", args.password),
+        ...optionValue("--target-password", args.targetPassword),
+        ...optionValue("--encryption", args.encryption),
+        ...(args.overwrite ? ["--overwrite"] : []),
+        "--json"
+      ], { parseJson: true });
     case "hig_cache_status":
       return runHig(["cache", "status", ...optionPath("--cache-dir", args.cacheDir)]);
     case "hig_cache_gc":
@@ -605,6 +636,8 @@ async function callTool(name, args) {
       return runHig(["repo", "snapshot", resolveInputPath(args.dir || "."), ...optionValue("--message", args.message), ...optionValue("--author", args.author), "--json"], { parseJson: true });
     case "hig_repo_refs":
       return runHig(["repo", "refs", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
+    case "hig_repo_migrate":
+      return runHig(["repo", "migrate", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_repo_branch_list":
       return runHig(["repo", "branch", "list", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_repo_branch_create":

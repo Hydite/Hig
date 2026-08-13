@@ -19,7 +19,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub use archive::{inspect_archive, pack, pack_with_control, unpack, unpack_with_control};
+pub use archive::{
+    ArchiveMigrationReport, inspect_archive, migrate_archive, pack, pack_with_control, unpack,
+    unpack_with_control,
+};
 pub use cache::{CacheMaintenanceReport, CacheStats, PathChunkRecord};
 pub use crypto::{derive_key, random_bytes};
 pub use daemon::{
@@ -41,18 +44,18 @@ pub use repository::{
     DEFAULT_REPOSITORY_EXCLUDES, RepositoryBranchReport, RepositoryByteRange,
     RepositoryCacheProvenance, RepositoryChange, RepositoryChangeKind, RepositoryCommitSummary,
     RepositoryConfig, RepositoryDiffReport, RepositoryGcReport, RepositoryInitReport,
-    RepositoryObjectId, RepositoryPathHistoryEntry, RepositoryPathHistoryReport,
-    RepositoryRangeRestoreReport, RepositoryRef, RepositoryRefDeleteReport, RepositoryRefKind,
-    RepositoryRefsReport, RepositoryRestoreReport, RepositorySemanticChangeKind,
-    RepositorySnapshotReport, RepositoryStoragePath, RepositoryStorageTreeReport, RepositorySymbol,
-    RepositorySymbolHistoryEntry, RepositorySymbolHistoryReport, RepositorySymbolIndexReport,
-    RepositorySymbolRestoreReport, RepositoryTagReport, RepositoryVerifyReport, RepositoryWatcher,
-    create_repository_branch, create_repository_tag, delete_repository_branch,
-    delete_repository_tag, gc_repository, init_repository, repository_branch_names,
-    repository_diff, repository_log, repository_path_history, repository_refs,
-    repository_storage_tree, repository_symbol_history, repository_symbols, repository_tag_names,
-    restore_repository, restore_repository_range, restore_repository_symbol, snapshot_repository,
-    switch_repository_branch, verify_repository,
+    RepositoryMigrationReport, RepositoryObjectId, RepositoryPathHistoryEntry,
+    RepositoryPathHistoryReport, RepositoryRangeRestoreReport, RepositoryRef,
+    RepositoryRefDeleteReport, RepositoryRefKind, RepositoryRefsReport, RepositoryRestoreReport,
+    RepositorySemanticChangeKind, RepositorySnapshotReport, RepositoryStoragePath,
+    RepositoryStorageTreeReport, RepositorySymbol, RepositorySymbolHistoryEntry,
+    RepositorySymbolHistoryReport, RepositorySymbolIndexReport, RepositorySymbolRestoreReport,
+    RepositoryTagReport, RepositoryVerifyReport, RepositoryWatcher, create_repository_branch,
+    create_repository_tag, delete_repository_branch, delete_repository_tag, gc_repository,
+    init_repository, migrate_repository, repository_branch_names, repository_diff, repository_log,
+    repository_path_history, repository_refs, repository_storage_tree, repository_symbol_history,
+    repository_symbols, repository_tag_names, restore_repository, restore_repository_range,
+    restore_repository_symbol, snapshot_repository, switch_repository_branch, verify_repository,
 };
 pub use scan::{ScanStats, ScannedFile};
 pub use session::{SessionBinding, default_session_ttl, derive_session_binding};

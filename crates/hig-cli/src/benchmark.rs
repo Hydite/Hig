@@ -1,7 +1,6 @@
-use crate::{
-    BenchSuite, ReportMode, ensure_daemon, output::print_report, pack_with_daemon_policy,
-    unlock_session_for_cache,
-};
+use crate::cli::{BenchSuite, ReportMode};
+use crate::output::print_report;
+use crate::runtime::{ensure_daemon, pack_with_daemon_policy, unlock_session_for_cache};
 use anyhow::Context;
 use hig_core::{
     ArchiveFormat, BatchOptions, ChunkOptions, Compression, DaemonMode, DaemonRequest,

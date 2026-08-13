@@ -92,6 +92,7 @@ Use these with daemon-backed operations.
 
 - `hig_repo_init`: initialize independent immutable history.
 - `hig_repo_snapshot`: atomically record a version with byte and semantic indexes.
+- `hig_repo_migrate`: upgrade legacy direct-HEAD refs to the explicit main branch model.
 - `hig_repo_log`: list commits.
 - `hig_repo_diff`: inspect file and exact byte-range changes.
 - `hig_repo_path_history`: query rename-aware path history.
@@ -142,6 +143,7 @@ Use benchmark tools only when the user asks for performance validation. They can
 | `hig_cache_compact` | `hig cache compact` |
 | `hig_repo_init` | `hig repo init <dir> --json` |
 | `hig_repo_snapshot` | `hig repo snapshot <dir> --json` |
+| `hig_repo_migrate` | `hig repo migrate <dir> --json` |
 | `hig_repo_diff` | `hig repo diff <dir> --json` |
 | `hig_repo_path_history` | `hig repo history <dir> --path <path> --json` |
 | `hig_repo_restore_range` | `hig repo restore-range <dir> --path <path> --start <n> -o <file> --json` |

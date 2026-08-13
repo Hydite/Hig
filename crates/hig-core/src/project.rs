@@ -1140,8 +1140,10 @@ mod tests {
         let config = init_project(temp.path(), None, Vec::new()).unwrap();
         assert_eq!(config.snapshot_policy, WorkspaceSnapshotPolicy::default());
 
-        let mut invalid = WorkspaceSnapshotPolicy::default();
-        invalid.quiescence_ms = 60_001;
+        let mut invalid = WorkspaceSnapshotPolicy {
+            quiescence_ms: 60_001,
+            ..WorkspaceSnapshotPolicy::default()
+        };
         assert!(invalid.validate().is_err());
         invalid = WorkspaceSnapshotPolicy::default();
         invalid.resource.resume_available_memory_bytes = 1;

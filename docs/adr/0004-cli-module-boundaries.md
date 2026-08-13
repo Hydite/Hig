@@ -13,10 +13,12 @@ platform packaging work unnecessarily risky.
 
 ## Decision
 
-Keep `main.rs` as the command-line schema, top-level dispatcher, and parser
-test boundary. Move implementation code to modules with a single primary
-responsibility:
+Keep `main.rs` as the process entrypoint only. Keep `cli.rs` as the command-line
+schema, top-level dispatcher, and parser test boundary. Move implementation
+code to modules with a single primary responsibility:
 
+- `commands/archive.rs`: archive command argument schemas and pack, unpack,
+  inspect, migrate, and benchmark execution;
 - `commands/repository.rs`: HIG-native repository command execution and output;
 - `runtime.rs`: project, daemon, session, cache, task, and daemon-backed pack
   coordination;
@@ -38,7 +40,6 @@ explicitly `pub(crate)` and must not expose new public library APIs.
 
 ## Consequences
 
-Future work can move the Clap model into `cli.rs` or group command handlers
-under `commands/` without moving benchmark or daemon implementation back into
-the entrypoint. Cross-platform packaging should invoke the unchanged binary and
-MCP adapter, so this refactor has no release-package compatibility impact.
+The entrypoint is intentionally inert, and the Clap model is grouped by command
+domain. Cross-platform packaging invokes the unchanged binary and MCP adapter,
+so this refactor has no release-package compatibility impact.

@@ -45,11 +45,13 @@ hig session unlock --cache-dir /path/to/cache --password "$HIG_PASSWORD"
 hig pack /path/to/project -o /path/to/out.hig --cache-dir /path/to/cache --use-session --daemon required --project auto --json
 hig inspect /path/to/out.hig --json
 hig unpack /path/to/out.hig -d /path/to/restored --password "$HIG_PASSWORD"
+hig migrate /path/to/legacy.hig -o /path/to/migrated.hig --password "$HIG_PASSWORD" --json
 hig cache status --cache-dir /path/to/cache
 
 hig repo init /path/to/project
 hig repo snapshot /path/to/project -m "before refactor"
 hig repo refs /path/to/project --json
+hig repo migrate /path/to/project --json
 hig repo branch list /path/to/project --json
 hig repo branch create feature/refactor /path/to/project --from HEAD --json
 hig repo branch switch feature/refactor /path/to/project --json
@@ -95,6 +97,9 @@ Repository references use the following model:
   addition to full or unique 8+ character commit IDs.
 - Legacy repositories containing only refs/HEAD remain readable and can
   continue recording snapshots.
+- `hig repo migrate` upgrades a legacy repository in place, preserves every
+  object ID, and is idempotent. A conflicting existing `refs/heads/main` is
+  rejected before the selector changes.
 
 ## MCP Adapter
 
@@ -148,6 +153,7 @@ unrestricted shell boundary.
 | `hig_pack` | create archive |
 | `hig_unpack` | restore archive |
 | `hig_inspect` | inspect archive metadata |
+| `hig_migrate` | verify and atomically migrate an archive to HIGV2 |
 | `hig_cache_status` | check cache |
 | `hig_cache_gc` | preview/run GC |
 | `hig_cache_compact` | preview/run compaction |
@@ -158,6 +164,7 @@ unrestricted shell boundary.
 | `hig_repo_init` | initialize immutable repository history |
 | `hig_repo_snapshot` | record an atomic byte/semantic snapshot |
 | `hig_repo_refs` | list HEAD, branches, and tags |
+| `hig_repo_migrate` | upgrade legacy refs to the explicit main branch model |
 | `hig_repo_branch_list` | list branches |
 | `hig_repo_branch_create` | create a branch at a revision |
 | `hig_repo_branch_switch` | switch the active branch |

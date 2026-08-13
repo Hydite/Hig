@@ -123,6 +123,17 @@ pub struct RepositoryInitReport {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryMigrationReport {
+    pub root: String,
+    pub repository_dir: String,
+    pub from_legacy: bool,
+    pub active_branch: String,
+    pub commit_id: Option<RepositoryObjectId>,
+    pub objects_rewritten: u64,
+    pub changed: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryRefKind {
@@ -737,6 +748,58 @@ pub fn init_repository(root: &Path, excludes: Vec<String>) -> anyhow::Result<Rep
 pub fn repository_refs(start: &Path) -> anyhow::Result<RepositoryRefsReport> {
     let repository = Repository::discover(start)?;
     repository.refs_report()
+}
+
+pub fn migrate_repository(start: &Path) -> anyhow::Result<RepositoryMigrationReport> {
+    let repository = Repository::discover(start)?;
+    let _lock = repository.lock_writer()?;
+    let root = repository.root.display().to_string();
+    let repository_dir = repository.state.display().to_string();
+    if let Some(active_branch) = repository.active_branch()? {
+        let commit_id = repository.read_branch(&active_branch)?;
+        return Ok(RepositoryMigrationReport {
+            root,
+            repository_dir,
+            from_legacy: false,
+            active_branch,
+            commit_id,
+            objects_rewritten: 0,
+            changed: false,
+        });
+    }
+
+    let legacy_head = read_ref_value(&repository.state.join("refs").join("HEAD"))?;
+    let commit_id = legacy_head;
+    if let Some(commit_id) = commit_id {
+        repository.ensure_commit(commit_id)?;
+    }
+    let main_path = repository.branch_path("main");
+    if let Some(commit_id) = commit_id {
+        if let Some(existing) = read_ref_value(&main_path)? {
+            anyhow::ensure!(
+                existing == commit_id,
+                "legacy migration found conflicting refs/heads/main"
+            );
+        } else {
+            repository.update_ref_path(&main_path, commit_id)?;
+        }
+    } else {
+        anyhow::ensure!(
+            !main_path.exists(),
+            "legacy migration found refs/heads/main without a legacy HEAD"
+        );
+    }
+    atomic_write(&repository.state.join("HEAD"), b"ref: refs/heads/main\n")?;
+    sync_directory(&repository.state)?;
+    Ok(RepositoryMigrationReport {
+        root,
+        repository_dir,
+        from_legacy: true,
+        active_branch: "main".to_string(),
+        commit_id,
+        objects_rewritten: 0,
+        changed: true,
+    })
 }
 
 pub fn create_repository_branch(
@@ -4175,6 +4238,88 @@ mod tests {
                 .refs
                 .iter()
                 .any(|reference| { reference.kind == RepositoryRefKind::LegacyHead })
+        );
+    }
+
+    #[test]
+    fn legacy_repository_migration_preserves_objects_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), b"legacy").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "first".to_string(), None).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        let before = repository
+            .list_objects()
+            .unwrap()
+            .into_iter()
+            .map(|(object_id, _, _)| object_id)
+            .collect::<BTreeSet<_>>();
+        fs::remove_file(repository.state.join("HEAD")).unwrap();
+        fs::remove_dir_all(repository.state.join("refs").join("heads")).unwrap();
+
+        let report = migrate_repository(temp.path()).unwrap();
+        assert!(report.from_legacy);
+        assert!(report.changed);
+        assert_eq!(report.active_branch, "main");
+        assert_eq!(report.commit_id, Some(first.commit_id));
+        assert_eq!(report.objects_rewritten, 0);
+        let migrated = Repository::discover(temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(migrated.state.join("HEAD")).unwrap(),
+            "ref: refs/heads/main\n"
+        );
+        assert_eq!(migrated.read_branch("main").unwrap(), Some(first.commit_id));
+        let after = migrated
+            .list_objects()
+            .unwrap()
+            .into_iter()
+            .map(|(object_id, _, _)| object_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(before, after);
+
+        let repeated = migrate_repository(temp.path()).unwrap();
+        assert!(!repeated.from_legacy);
+        assert!(!repeated.changed);
+        assert_eq!(repeated.commit_id, Some(first.commit_id));
+        assert_eq!(
+            Repository::discover(temp.path())
+                .unwrap()
+                .list_objects()
+                .unwrap()
+                .into_iter()
+                .map(|(object_id, _, _)| object_id)
+                .collect::<BTreeSet<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn legacy_repository_migration_rejects_conflicting_main_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), b"first").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "first".to_string(), None).unwrap();
+        fs::write(temp.path().join("a.txt"), b"second").unwrap();
+        let second = snapshot_repository(temp.path(), "second".to_string(), None).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        fs::remove_file(repository.state.join("HEAD")).unwrap();
+        fs::remove_dir_all(repository.state.join("refs").join("heads")).unwrap();
+        atomic_write(
+            &repository.state.join("refs").join("HEAD"),
+            format!("{}\n", first.commit_id).as_bytes(),
+        )
+        .unwrap();
+        atomic_write(
+            &repository.state.join("refs").join("heads").join("main"),
+            format!("{}\n", second.commit_id).as_bytes(),
+        )
+        .unwrap();
+
+        assert!(migrate_repository(temp.path()).is_err());
+        assert!(!repository.state.join("HEAD").exists());
+        assert_eq!(
+            read_ref_value(&repository.state.join("refs").join("HEAD")).unwrap(),
+            Some(first.commit_id)
         );
     }
 }

@@ -1,4 +1,4 @@
-use crate::ReportMode;
+use crate::cli::ReportMode;
 use hig_core::PackReport;
 
 pub(crate) fn print_report(
