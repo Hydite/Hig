@@ -1,4 +1,7 @@
-use crate::{CacheCommand, DaemonCommand, ProjectCommand, ReportMode, SessionCommand, TaskCommand};
+use crate::{
+    CacheCommand, DaemonCommand, ProjectCommand, ProjectPolicyCommand, ReportMode, SessionCommand,
+    TaskCommand,
+};
 use hig_core::{
     ArchiveFormat, DaemonMode, DaemonRequest, DaemonResponse, EncryptionMode, JobKeyMaterial,
     KdfProfile, PackAuthMode, PackJobRequest, PackOptions, PackReport, PackResponseMode,
@@ -183,7 +186,105 @@ pub(crate) fn handle_project(command: ProjectCommand) -> anyhow::Result<()> {
                 _ => anyhow::bail!("daemon did not rebuild project"),
             }
         }
+        ProjectCommand::Policy { command } => handle_project_policy(command),
     }
+}
+
+fn handle_project_policy(command: ProjectPolicyCommand) -> anyhow::Result<()> {
+    match command {
+        ProjectPolicyCommand::Show { dir, json } => {
+            let (root, _, config) = project_registration(&dir, None)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&config.snapshot_policy)?);
+            } else {
+                println!(
+                    "project-policy: root={} enabled={} quiescence_ms={} periodic_interval_ms={} max_pending_events={} max_pending_files={} resource_enabled={} min_available_memory_bytes={} resume_available_memory_bytes={} resource_poll_interval_ms={}",
+                    root.display(),
+                    config.snapshot_policy.enabled,
+                    config.snapshot_policy.quiescence_ms,
+                    config.snapshot_policy.periodic_interval_ms,
+                    config.snapshot_policy.max_pending_events,
+                    config.snapshot_policy.max_pending_files,
+                    config.snapshot_policy.resource.enabled,
+                    config.snapshot_policy.resource.min_available_memory_bytes,
+                    config
+                        .snapshot_policy
+                        .resource
+                        .resume_available_memory_bytes,
+                    config.snapshot_policy.resource.poll_interval_ms
+                );
+            }
+        }
+        ProjectPolicyCommand::Set {
+            dir,
+            enabled,
+            quiescence_ms,
+            periodic_interval_ms,
+            max_pending_events,
+            max_pending_files,
+            resource_enabled,
+            min_available_memory_bytes,
+            resume_available_memory_bytes,
+            resource_poll_interval_ms,
+            json,
+        } => {
+            let (root, cache, config) = project_registration(&dir, None)?;
+            let mut policy = config.snapshot_policy.clone();
+            if let Some(value) = enabled {
+                policy.enabled = value;
+            }
+            if let Some(value) = quiescence_ms {
+                policy.quiescence_ms = value;
+            }
+            if let Some(value) = periodic_interval_ms {
+                policy.periodic_interval_ms = value;
+            }
+            if let Some(value) = max_pending_events {
+                policy.max_pending_events = value;
+            }
+            if let Some(value) = max_pending_files {
+                policy.max_pending_files = value;
+            }
+            if let Some(value) = resource_enabled {
+                policy.resource.enabled = value;
+            }
+            if let Some(value) = min_available_memory_bytes {
+                policy.resource.min_available_memory_bytes = value;
+            }
+            if let Some(value) = resume_available_memory_bytes {
+                policy.resource.resume_available_memory_bytes = value;
+            }
+            if let Some(value) = resource_poll_interval_ms {
+                policy.resource.poll_interval_ms = value;
+            }
+            ensure_daemon(&cache, default_session_ttl(None))?;
+            register_project(&root, &cache, &config)?;
+            match request_daemon(
+                &cache,
+                DaemonRequest::ProjectPolicyUpdate {
+                    project_id: config.project_id,
+                    policy,
+                },
+            )? {
+                Some(DaemonResponse::ProjectStatus(status)) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    } else {
+                        println!(
+                            "project-policy: updated root={} policy_schema={} paused={} state={:?}",
+                            root.display(),
+                            status.policy_schema,
+                            status.snapshot_paused,
+                            status.snapshot_validity
+                        );
+                    }
+                }
+                Some(DaemonResponse::Error { message, .. }) => anyhow::bail!(message),
+                _ => anyhow::bail!("daemon did not update project policy"),
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn handle_cache(command: CacheCommand) -> anyhow::Result<()> {

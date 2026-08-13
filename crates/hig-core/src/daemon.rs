@@ -11,7 +11,7 @@ use crate::{
     DaemonTaskError, TaskManager, TaskRequest, TaskResult, TaskState, TaskStatusReport,
     TaskSubmitRequest,
 };
-use crate::{ProjectConfig, ProjectStatusReport};
+use crate::{ProjectConfig, ProjectStatusReport, WorkspaceSnapshotPolicy};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +29,7 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
-const PROTOCOL_VERSION: u16 = 4;
+const PROTOCOL_VERSION: u16 = 5;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +213,10 @@ pub enum DaemonRequest {
     },
     ProjectRebuild {
         project_id: [u8; 16],
+    },
+    ProjectPolicyUpdate {
+        project_id: [u8; 16],
+        policy: WorkspaceSnapshotPolicy,
     },
     ProjectWatchForeground(ProjectRegistration),
     SubmitTask(TaskSubmitRequest),
@@ -480,6 +484,15 @@ impl DaemonRuntime {
                     .get_mut(&project_id)
                     .ok_or_else(|| anyhow::anyhow!("project is not registered with this daemon"))?;
                 project.rebuild(&mut self.engine.cache, PipelineOptions::default())?;
+                Ok(DaemonResponse::ProjectStatus(project.status()))
+            }
+            DaemonRequest::ProjectPolicyUpdate { project_id, policy } => {
+                policy.validate()?;
+                let project = self
+                    .projects
+                    .get_mut(&project_id)
+                    .ok_or_else(|| anyhow::anyhow!("project is not registered with this daemon"))?;
+                project.update_policy(policy)?;
                 Ok(DaemonResponse::ProjectStatus(project.status()))
             }
             DaemonRequest::SubmitTask(submission) => {

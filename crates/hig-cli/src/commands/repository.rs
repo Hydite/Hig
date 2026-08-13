@@ -1,9 +1,11 @@
-use crate::RepositoryCommand;
+use crate::{RepositoryBranchCommand, RepositoryCommand, RepositoryTagCommand};
 use hig_core::{
-    RepositoryObjectId, RepositoryWatcher, gc_repository, init_repository, repository_diff,
-    repository_log, repository_path_history, repository_storage_tree, repository_symbol_history,
-    repository_symbols, restore_repository, restore_repository_range, restore_repository_symbol,
-    snapshot_repository, verify_repository,
+    RepositoryObjectId, RepositoryWatcher, create_repository_branch, create_repository_tag,
+    delete_repository_branch, delete_repository_tag, gc_repository, init_repository,
+    repository_branch_names, repository_diff, repository_log, repository_path_history,
+    repository_refs, repository_storage_tree, repository_symbol_history, repository_symbols,
+    restore_repository, restore_repository_range, restore_repository_symbol, snapshot_repository,
+    switch_repository_branch, verify_repository,
 };
 use std::time::Duration;
 
@@ -60,6 +62,32 @@ pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
                 );
             }
         }
+        RepositoryCommand::Refs { dir, json } => {
+            let report = repository_refs(&dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "repo: refs head={} active_branch={}",
+                    report
+                        .head
+                        .map(short_id)
+                        .unwrap_or_else(|| "none".to_string()),
+                    report.active_branch.as_deref().unwrap_or("none")
+                );
+                for reference in report.refs {
+                    println!(
+                        "{:?}\t{}\t{}\tactive={}",
+                        reference.kind,
+                        reference.name,
+                        short_id(reference.commit_id),
+                        reference.active
+                    );
+                }
+            }
+        }
+        RepositoryCommand::Branch { command } => handle_branch(command)?,
+        RepositoryCommand::Tag { command } => handle_tag(command)?,
         RepositoryCommand::Log { dir, limit, json } => {
             anyhow::ensure!(limit > 0, "--limit must be greater than zero");
             let commits = repository_log(&dir, limit)?;
@@ -382,4 +410,110 @@ pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
 
 fn short_id(id: RepositoryObjectId) -> String {
     id.to_hex()[..12].to_string()
+}
+
+fn handle_branch(command: RepositoryBranchCommand) -> anyhow::Result<()> {
+    match command {
+        RepositoryBranchCommand::List { dir, json } => {
+            let report = repository_branch_names(&dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for reference in report {
+                    println!(
+                        "{}\t{}\tactive={}",
+                        reference.name,
+                        short_id(reference.commit_id),
+                        reference.active
+                    );
+                }
+            }
+        }
+        RepositoryBranchCommand::Create {
+            name,
+            dir,
+            from_revision,
+            json,
+        } => {
+            let report = create_repository_branch(&dir, &name, from_revision.as_deref())?;
+            print_ref_report(&report, json)?;
+        }
+        RepositoryBranchCommand::Switch { name, dir, json } => {
+            let report = switch_repository_branch(&dir, &name)?;
+            print_ref_report(&report, json)?;
+        }
+        RepositoryBranchCommand::Delete { name, dir, json } => {
+            let report = delete_repository_branch(&dir, &name)?;
+            print_delete_report(&report, json)?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_tag(command: RepositoryTagCommand) -> anyhow::Result<()> {
+    match command {
+        RepositoryTagCommand::List { dir, json } => {
+            let report = hig_core::repository_tag_names(&dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for reference in report {
+                    println!("{}\t{}", reference.name, short_id(reference.commit_id));
+                }
+            }
+        }
+        RepositoryTagCommand::Create {
+            name,
+            dir,
+            from_revision,
+            json,
+        } => {
+            let report = create_repository_tag(&dir, &name, from_revision.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "repo: tag name={} commit={} created={}",
+                    report.name,
+                    short_id(report.commit_id),
+                    report.created
+                );
+            }
+        }
+        RepositoryTagCommand::Delete { name, dir, json } => {
+            let report = delete_repository_tag(&dir, &name)?;
+            print_delete_report(&report, json)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_ref_report(report: &hig_core::RepositoryBranchReport, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!(
+            "repo: branch name={} commit={} active={} created={}",
+            report.name,
+            short_id(report.commit_id),
+            report.active,
+            report.created
+        );
+    }
+    Ok(())
+}
+
+fn print_delete_report(
+    report: &hig_core::RepositoryRefDeleteReport,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!(
+            "repo: deleted {:?} name={} deleted={}",
+            report.kind, report.name, report.deleted
+        );
+    }
+    Ok(())
 }

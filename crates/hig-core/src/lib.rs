@@ -32,22 +32,27 @@ pub use operation::{OperationControl, OperationKind, OperationPhase, OperationPr
 pub use pipeline::{BufferPool, PipelineScheduler};
 pub use project::{
     DEFAULT_PROJECT_EXCLUDES, ProjectConfig, ProjectFileRecord, ProjectJournalEntry,
-    ProjectSnapshot, ProjectStatusReport, SnapshotValidity, append_project_journal,
-    discover_project, init_project, load_project_config, load_snapshot, rebuild_snapshot,
-    resolve_project_cache_dir, save_snapshot, stable_read_record, verify_snapshot_metadata,
+    ProjectSnapshot, ProjectStatusReport, SnapshotResourcePolicy, SnapshotValidity,
+    WorkspaceSnapshotPolicy, append_project_journal, discover_project, init_project,
+    load_project_config, load_snapshot, rebuild_snapshot, resolve_project_cache_dir, save_snapshot,
+    stable_read_record, update_snapshot_policy, verify_snapshot_metadata,
 };
 pub use repository::{
-    DEFAULT_REPOSITORY_EXCLUDES, RepositoryByteRange, RepositoryCacheProvenance, RepositoryChange,
-    RepositoryChangeKind, RepositoryCommitSummary, RepositoryConfig, RepositoryDiffReport,
-    RepositoryGcReport, RepositoryInitReport, RepositoryObjectId, RepositoryPathHistoryEntry,
-    RepositoryPathHistoryReport, RepositoryRangeRestoreReport, RepositoryRestoreReport,
-    RepositorySemanticChangeKind, RepositorySnapshotReport, RepositoryStoragePath,
-    RepositoryStorageTreeReport, RepositorySymbol, RepositorySymbolHistoryEntry,
-    RepositorySymbolHistoryReport, RepositorySymbolIndexReport, RepositorySymbolRestoreReport,
-    RepositoryVerifyReport, RepositoryWatcher, gc_repository, init_repository, repository_diff,
-    repository_log, repository_path_history, repository_storage_tree, repository_symbol_history,
-    repository_symbols, restore_repository, restore_repository_range, restore_repository_symbol,
-    snapshot_repository, verify_repository,
+    DEFAULT_REPOSITORY_EXCLUDES, RepositoryBranchReport, RepositoryByteRange,
+    RepositoryCacheProvenance, RepositoryChange, RepositoryChangeKind, RepositoryCommitSummary,
+    RepositoryConfig, RepositoryDiffReport, RepositoryGcReport, RepositoryInitReport,
+    RepositoryObjectId, RepositoryPathHistoryEntry, RepositoryPathHistoryReport,
+    RepositoryRangeRestoreReport, RepositoryRef, RepositoryRefDeleteReport, RepositoryRefKind,
+    RepositoryRefsReport, RepositoryRestoreReport, RepositorySemanticChangeKind,
+    RepositorySnapshotReport, RepositoryStoragePath, RepositoryStorageTreeReport, RepositorySymbol,
+    RepositorySymbolHistoryEntry, RepositorySymbolHistoryReport, RepositorySymbolIndexReport,
+    RepositorySymbolRestoreReport, RepositoryTagReport, RepositoryVerifyReport, RepositoryWatcher,
+    create_repository_branch, create_repository_tag, delete_repository_branch,
+    delete_repository_tag, gc_repository, init_repository, repository_branch_names,
+    repository_diff, repository_log, repository_path_history, repository_refs,
+    repository_storage_tree, repository_symbol_history, repository_symbols, repository_tag_names,
+    restore_repository, restore_repository_range, restore_repository_symbol, snapshot_repository,
+    switch_repository_branch, verify_repository,
 };
 pub use scan::{ScanStats, ScannedFile};
 pub use session::{SessionBinding, default_session_ttl, derive_session_binding};

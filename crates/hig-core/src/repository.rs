@@ -123,6 +123,52 @@ pub struct RepositoryInitReport {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryRefKind {
+    Head,
+    Branch,
+    Tag,
+    LegacyHead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryRef {
+    pub name: String,
+    pub kind: RepositoryRefKind,
+    pub commit_id: RepositoryObjectId,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryRefsReport {
+    pub head: Option<RepositoryObjectId>,
+    pub active_branch: Option<String>,
+    pub refs: Vec<RepositoryRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryBranchReport {
+    pub name: String,
+    pub commit_id: RepositoryObjectId,
+    pub active: bool,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryTagReport {
+    pub name: String,
+    pub commit_id: RepositoryObjectId,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryRefDeleteReport {
+    pub name: String,
+    pub kind: RepositoryRefKind,
+    pub deleted: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepositorySnapshotReport {
     pub root: String,
@@ -644,7 +690,8 @@ pub fn init_repository(root: &Path, excludes: Vec<String>) -> anyhow::Result<Rep
     }
 
     fs::create_dir_all(state.join("objects"))?;
-    fs::create_dir_all(state.join("refs"))?;
+    fs::create_dir_all(state.join("refs").join("heads"))?;
+    fs::create_dir_all(state.join("refs").join("tags"))?;
     fs::create_dir_all(state.join("locks"))?;
     let init_lock = OpenOptions::new()
         .create(true)
@@ -675,6 +722,9 @@ pub fn init_repository(root: &Path, excludes: Vec<String>) -> anyhow::Result<Rep
         },
     };
     atomic_write(&config_path, &serde_json::to_vec_pretty(&config)?)?;
+    // Keep the symbolic active-branch selector outside refs/. The direct
+    // refs/HEAD compatibility view remains readable by older HIG versions.
+    atomic_write(&state.join("HEAD"), b"ref: refs/heads/main\n")?;
     sync_directory(&state)?;
     Ok(RepositoryInitReport {
         root: root.display().to_string(),
@@ -682,6 +732,137 @@ pub fn init_repository(root: &Path, excludes: Vec<String>) -> anyhow::Result<Rep
         repository_id: config.repository_id,
         created: true,
     })
+}
+
+pub fn repository_refs(start: &Path) -> anyhow::Result<RepositoryRefsReport> {
+    let repository = Repository::discover(start)?;
+    repository.refs_report()
+}
+
+pub fn create_repository_branch(
+    start: &Path,
+    name: &str,
+    from_revision: Option<&str>,
+) -> anyhow::Result<RepositoryBranchReport> {
+    let repository = Repository::discover(start)?;
+    let _lock = repository.lock_writer()?;
+    validate_ref_component(name, "branch")?;
+    let path = repository.branch_path(name);
+    anyhow::ensure!(!path.exists(), "branch already exists: {name}");
+    let commit_id = match from_revision {
+        Some(revision) => repository.resolve_revision(revision)?,
+        None => repository
+            .read_head()?
+            .ok_or_else(|| anyhow::anyhow!("repository has no snapshots; --from is required"))?,
+    };
+    repository.ensure_commit(commit_id)?;
+    repository.update_branch(name, commit_id)?;
+    Ok(RepositoryBranchReport {
+        name: name.to_string(),
+        commit_id,
+        active: repository.active_branch()?.as_deref() == Some(name),
+        created: true,
+    })
+}
+
+pub fn switch_repository_branch(
+    start: &Path,
+    name: &str,
+) -> anyhow::Result<RepositoryBranchReport> {
+    let repository = Repository::discover(start)?;
+    let _lock = repository.lock_writer()?;
+    validate_ref_component(name, "branch")?;
+    let commit_id = repository
+        .read_branch(name)?
+        .ok_or_else(|| anyhow::anyhow!("branch not found: {name}"))?;
+    repository.write_symbolic_head(name)?;
+    Ok(RepositoryBranchReport {
+        name: name.to_string(),
+        commit_id,
+        active: true,
+        created: false,
+    })
+}
+
+pub fn delete_repository_branch(
+    start: &Path,
+    name: &str,
+) -> anyhow::Result<RepositoryRefDeleteReport> {
+    let repository = Repository::discover(start)?;
+    let _lock = repository.lock_writer()?;
+    validate_ref_component(name, "branch")?;
+    anyhow::ensure!(
+        repository.read_branch(name)?.is_some(),
+        "branch not found: {name}"
+    );
+    anyhow::ensure!(
+        repository.active_branch()?.as_deref() != Some(name),
+        "cannot delete the active branch: {name}"
+    );
+    repository.delete_ref_file(&repository.branch_path(name))?;
+    Ok(RepositoryRefDeleteReport {
+        name: name.to_string(),
+        kind: RepositoryRefKind::Branch,
+        deleted: true,
+    })
+}
+
+pub fn create_repository_tag(
+    start: &Path,
+    name: &str,
+    from_revision: Option<&str>,
+) -> anyhow::Result<RepositoryTagReport> {
+    let repository = Repository::discover(start)?;
+    let _lock = repository.lock_writer()?;
+    validate_ref_component(name, "tag")?;
+    let path = repository.tag_path(name);
+    anyhow::ensure!(!path.exists(), "tag already exists: {name}");
+    let commit_id = match from_revision {
+        Some(revision) => repository.resolve_revision(revision)?,
+        None => repository
+            .read_head()?
+            .ok_or_else(|| anyhow::anyhow!("repository has no snapshots; --from is required"))?,
+    };
+    repository.ensure_commit(commit_id)?;
+    repository.update_ref_path(&path, commit_id)?;
+    Ok(RepositoryTagReport {
+        name: name.to_string(),
+        commit_id,
+        created: true,
+    })
+}
+
+pub fn delete_repository_tag(
+    start: &Path,
+    name: &str,
+) -> anyhow::Result<RepositoryRefDeleteReport> {
+    let repository = Repository::discover(start)?;
+    let _lock = repository.lock_writer()?;
+    validate_ref_component(name, "tag")?;
+    let path = repository.tag_path(name);
+    anyhow::ensure!(path.exists(), "tag not found: {name}");
+    repository.delete_ref_file(&path)?;
+    Ok(RepositoryRefDeleteReport {
+        name: name.to_string(),
+        kind: RepositoryRefKind::Tag,
+        deleted: true,
+    })
+}
+
+pub fn repository_branch_names(start: &Path) -> anyhow::Result<Vec<RepositoryRef>> {
+    Ok(repository_refs(start)?
+        .refs
+        .into_iter()
+        .filter(|reference| matches!(reference.kind, RepositoryRefKind::Branch))
+        .collect())
+}
+
+pub fn repository_tag_names(start: &Path) -> anyhow::Result<Vec<RepositoryRef>> {
+    Ok(repository_refs(start)?
+        .refs
+        .into_iter()
+        .filter(|reference| matches!(reference.kind, RepositoryRefKind::Tag))
+        .collect())
 }
 
 pub fn snapshot_repository(
@@ -836,7 +1017,7 @@ pub fn snapshot_repository(
         stats.new_objects.push(commit_id);
     }
     repository.sync_new_objects(&stats.new_objects)?;
-    repository.update_ref("HEAD", commit_id)?;
+    repository.publish_head(commit_id)?;
     Ok(RepositorySnapshotReport {
         root: repository.root.display().to_string(),
         commit_id,
@@ -1573,20 +1754,85 @@ impl Repository {
     }
 
     fn read_head(&self) -> anyhow::Result<Option<RepositoryObjectId>> {
-        let path = self.state.join("refs").join("HEAD");
-        match fs::read_to_string(path) {
-            Ok(value) => Ok(Some(value.trim().parse()?)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
+        if let Some(branch) = self.active_branch()? {
+            return self.read_branch(&branch);
         }
+        read_ref_value(&self.state.join("refs").join("HEAD"))
     }
 
-    fn update_ref(&self, name: &str, object_id: RepositoryObjectId) -> anyhow::Result<()> {
-        validate_ref_name(name)?;
+    fn active_branch(&self) -> anyhow::Result<Option<String>> {
+        let path = self.state.join("HEAD");
+        let value = match fs::read_to_string(path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let target = value
+            .trim()
+            .strip_prefix("ref: refs/heads/")
+            .ok_or_else(|| anyhow::anyhow!("invalid repository HEAD selector"))?;
+        validate_ref_component(target, "branch")?;
+        Ok(Some(target.to_string()))
+    }
+
+    fn branch_path(&self, name: &str) -> PathBuf {
+        self.state.join("refs").join("heads").join(name)
+    }
+
+    fn tag_path(&self, name: &str) -> PathBuf {
+        self.state.join("refs").join("tags").join(name)
+    }
+
+    fn read_branch(&self, name: &str) -> anyhow::Result<Option<RepositoryObjectId>> {
+        validate_ref_component(name, "branch")?;
+        read_ref_value(&self.branch_path(name))
+    }
+
+    fn update_branch(&self, name: &str, object_id: RepositoryObjectId) -> anyhow::Result<()> {
+        validate_ref_component(name, "branch")?;
+        self.update_ref_path(&self.branch_path(name), object_id)
+    }
+
+    fn write_symbolic_head(&self, branch: &str) -> anyhow::Result<()> {
+        validate_ref_component(branch, "branch")?;
+        let commit_id = self
+            .read_branch(branch)?
+            .ok_or_else(|| anyhow::anyhow!("branch not found: {branch}"))?;
         atomic_write(
-            &self.state.join("refs").join(name),
-            format!("{object_id}\n").as_bytes(),
-        )
+            &self.state.join("HEAD"),
+            format!("ref: refs/heads/{branch}\n").as_bytes(),
+        )?;
+        self.update_ref_path(&self.state.join("refs").join("HEAD"), commit_id)
+    }
+
+    fn publish_head(&self, object_id: RepositoryObjectId) -> anyhow::Result<()> {
+        if let Some(branch) = self.active_branch()? {
+            self.update_branch(&branch, object_id)?;
+        }
+        // Direct refs/HEAD is the compatibility view consumed by v1.10 and
+        // older tooling. The symbolic selector is the source of truth for new
+        // repositories, and both files are updated while the writer lock is held.
+        self.update_ref_path(&self.state.join("refs").join("HEAD"), object_id)
+    }
+
+    fn update_ref_path(&self, path: &Path, object_id: RepositoryObjectId) -> anyhow::Result<()> {
+        atomic_write(path, format!("{object_id}\n").as_bytes())
+    }
+
+    fn delete_ref_file(&self, path: &Path) -> anyhow::Result<()> {
+        fs::remove_file(path)?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_commit(&self, object_id: RepositoryObjectId) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.read_raw(object_id)?.0 == ObjectKind::Commit,
+            "repository ref does not point to a commit"
+        );
+        Ok(())
     }
 
     fn read_refs(&self) -> anyhow::Result<BTreeMap<String, RepositoryObjectId>> {
@@ -1601,19 +1847,83 @@ impl Repository {
                 .strip_prefix(&root)?
                 .to_string_lossy()
                 .to_string();
-            let value = fs::read_to_string(entry.path())?;
-            refs.insert(name, value.trim().parse()?);
+            if (name == "HEAD" || name.starts_with("heads/") || name.starts_with("tags/"))
+                && let Some(value) = read_ref_value(entry.path())?
+            {
+                refs.insert(name, value);
+            }
         }
         Ok(refs)
     }
 
+    fn refs_report(&self) -> anyhow::Result<RepositoryRefsReport> {
+        let head = self.read_head()?;
+        let active_branch = self.active_branch()?;
+        let mut refs = Vec::new();
+        if let Some(commit_id) = head {
+            refs.push(RepositoryRef {
+                name: "HEAD".to_string(),
+                kind: if active_branch.is_some() {
+                    RepositoryRefKind::Head
+                } else {
+                    RepositoryRefKind::LegacyHead
+                },
+                commit_id,
+                active: true,
+            });
+        }
+        for (kind, directory_name, display_kind) in [
+            (RepositoryRefKind::Branch, "heads", "branch"),
+            (RepositoryRefKind::Tag, "tags", "tag"),
+        ] {
+            let directory = self.state.join("refs").join(directory_name);
+            if !directory.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&directory).into_iter().filter_map(Result::ok) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let name = entry
+                    .path()
+                    .strip_prefix(&directory)?
+                    .to_string_lossy()
+                    .to_string();
+                validate_ref_component(&name, display_kind)?;
+                if let Some(commit_id) = read_ref_value(entry.path())? {
+                    refs.push(RepositoryRef {
+                        name: name.clone(),
+                        kind,
+                        commit_id,
+                        active: kind == RepositoryRefKind::Branch
+                            && active_branch.as_deref() == Some(name.as_str()),
+                    });
+                }
+            }
+        }
+        refs.sort_by(|left, right| {
+            format!("{:?}:{}", left.kind, left.name)
+                .cmp(&format!("{:?}:{}", right.kind, right.name))
+        });
+        Ok(RepositoryRefsReport {
+            head,
+            active_branch,
+            refs,
+        })
+    }
+
     fn resolve_revision(&self, revision: &str) -> anyhow::Result<RepositoryObjectId> {
+        let revision = revision.trim();
+        anyhow::ensure!(!revision.is_empty(), "revision must not be empty");
         if revision.eq_ignore_ascii_case("head") {
             return self
                 .read_head()?
                 .ok_or_else(|| anyhow::anyhow!("repository has no snapshots"));
         }
-        let revision = revision.trim().to_ascii_lowercase();
+        if let Some(object_id) = self.resolve_ref_alias(revision)? {
+            return Ok(object_id);
+        }
+        let revision = revision.to_ascii_lowercase();
         anyhow::ensure!(
             revision.len() >= MIN_REVISION_PREFIX && revision.len() <= 64,
             "revision prefix must contain 8 to 64 hex characters"
@@ -1642,6 +1952,45 @@ impl Repository {
         anyhow::ensure!(!matches.is_empty(), "revision not found");
         anyhow::ensure!(matches.len() == 1, "revision prefix is ambiguous");
         Ok(matches[0])
+    }
+
+    fn resolve_ref_alias(&self, revision: &str) -> anyhow::Result<Option<RepositoryObjectId>> {
+        let explicit = if let Some(name) = revision.strip_prefix("refs/heads/") {
+            Some((RepositoryRefKind::Branch, name))
+        } else if let Some(name) = revision.strip_prefix("heads/") {
+            Some((RepositoryRefKind::Branch, name))
+        } else if let Some(name) = revision.strip_prefix("refs/tags/") {
+            Some((RepositoryRefKind::Tag, name))
+        } else {
+            revision
+                .strip_prefix("tags/")
+                .map(|name| (RepositoryRefKind::Tag, name))
+        };
+        if let Some((kind, name)) = explicit {
+            validate_ref_component(
+                name,
+                match kind {
+                    RepositoryRefKind::Branch => "branch",
+                    RepositoryRefKind::Tag => "tag",
+                    _ => "ref",
+                },
+            )?;
+            let object_id = match kind {
+                RepositoryRefKind::Branch => self.read_branch(name)?,
+                RepositoryRefKind::Tag => read_ref_value(&self.tag_path(name))?,
+                _ => None,
+            };
+            return object_id
+                .ok_or_else(|| anyhow::anyhow!("revision ref not found: {revision}"))
+                .map(Some);
+        }
+        let branch = self.read_branch(revision)?;
+        let tag = read_ref_value(&self.tag_path(revision))?;
+        match (branch, tag) {
+            (Some(_), Some(_)) => anyhow::bail!("revision ref is ambiguous: {revision}"),
+            (Some(object_id), None) | (None, Some(object_id)) => Ok(Some(object_id)),
+            (None, None) => Ok(None),
+        }
     }
 
     fn list_objects(&self) -> anyhow::Result<Vec<(RepositoryObjectId, PathBuf, u64)>> {
@@ -3021,17 +3370,33 @@ fn safe_join(root: &Path, relative: &str) -> anyhow::Result<PathBuf> {
     Ok(root.join(normalized))
 }
 
-fn validate_ref_name(name: &str) -> anyhow::Result<()> {
+fn validate_ref_component(name: &str, kind: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !name.is_empty()
             && name != "."
             && name != ".."
+            && !name.starts_with('/')
+            && !name.ends_with('/')
+            && !name.contains("//")
+            && !name.contains('\\')
+            && !name.contains('\0')
             && name
-                .chars()
-                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '/')),
-        "invalid repository ref name"
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != "..")
+            && name.chars().all(
+                |value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '/' | '.')
+            ),
+        "invalid repository {kind} name"
     );
     Ok(())
+}
+
+fn read_ref_value(path: &Path) -> anyhow::Result<Option<RepositoryObjectId>> {
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(Some(value.trim().parse()?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn repository_state_dir(root: &Path) -> PathBuf {
@@ -3681,7 +4046,13 @@ mod tests {
             .unwrap();
         legacy_commit.semantic_index = Some(legacy_index_id);
         let (legacy_commit_id, _, _) = repository.put(ObjectKind::Commit, &legacy_commit).unwrap();
-        repository.update_ref("HEAD", legacy_commit_id).unwrap();
+        fs::remove_file(repository.state.join("HEAD")).unwrap();
+        repository
+            .update_ref_path(
+                &repository.state.join("refs").join("HEAD"),
+                legacy_commit_id,
+            )
+            .unwrap();
 
         let upgraded =
             snapshot_repository(temp.path(), "parser upgrade".to_string(), None).unwrap();
@@ -3693,5 +4064,117 @@ mod tests {
             .unwrap();
         let index = read_semantic_index(&repository, &commit).unwrap();
         assert_eq!(index.parser_schema, SEMANTIC_PARSER_SCHEMA);
+    }
+
+    #[test]
+    fn new_repositories_use_main_branch_and_keep_legacy_head_view() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), b"first").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(repository.state.join("HEAD")).unwrap(),
+            "ref: refs/heads/main\n"
+        );
+        let first = snapshot_repository(temp.path(), "first".to_string(), None).unwrap();
+        assert_eq!(
+            fs::read_to_string(repository.state.join("refs").join("HEAD")).unwrap(),
+            format!("{}\n", first.commit_id)
+        );
+        let refs = repository_refs(temp.path()).unwrap();
+        assert_eq!(refs.active_branch.as_deref(), Some("main"));
+        assert!(refs.refs.iter().any(|reference| {
+            reference.kind == RepositoryRefKind::Branch
+                && reference.name == "main"
+                && reference.active
+                && reference.commit_id == first.commit_id
+        }));
+    }
+
+    #[test]
+    fn branches_tags_and_revision_aliases_are_atomic_and_immutable() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), b"first").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "first".to_string(), None).unwrap();
+
+        let feature = create_repository_branch(temp.path(), "feature/x", None).unwrap();
+        assert_eq!(feature.commit_id, first.commit_id);
+        assert_eq!(
+            Repository::discover(temp.path())
+                .unwrap()
+                .resolve_revision("feature/x")
+                .unwrap(),
+            first.commit_id
+        );
+        switch_repository_branch(temp.path(), "feature/x").unwrap();
+        fs::write(temp.path().join("a.txt"), b"feature").unwrap();
+        let feature_commit = snapshot_repository(temp.path(), "feature".to_string(), None).unwrap();
+        assert_eq!(feature_commit.parent_id, Some(first.commit_id));
+        assert_eq!(
+            repository_refs(temp.path())
+                .unwrap()
+                .active_branch
+                .as_deref(),
+            Some("feature/x")
+        );
+
+        switch_repository_branch(temp.path(), "main").unwrap();
+        assert_eq!(
+            Repository::discover(temp.path())
+                .unwrap()
+                .resolve_revision("refs/heads/main")
+                .unwrap(),
+            first.commit_id
+        );
+        let tag = create_repository_tag(temp.path(), "v1.0.0", Some("main")).unwrap();
+        assert_eq!(tag.commit_id, first.commit_id);
+        assert_eq!(
+            Repository::discover(temp.path())
+                .unwrap()
+                .resolve_revision("tags/v1.0.0")
+                .unwrap(),
+            first.commit_id
+        );
+        assert!(create_repository_tag(temp.path(), "v1.0.0", None).is_err());
+        assert!(delete_repository_branch(temp.path(), "main").is_err());
+        delete_repository_branch(temp.path(), "feature/x").unwrap();
+        delete_repository_tag(temp.path(), "v1.0.0").unwrap();
+        assert!(
+            repository_refs(temp.path())
+                .unwrap()
+                .refs
+                .iter()
+                .all(|reference| { reference.name != "feature/x" && reference.name != "v1.0.0" })
+        );
+    }
+
+    #[test]
+    fn legacy_direct_head_repositories_continue_to_snapshot_and_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), b"legacy").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "first".to_string(), None).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        fs::remove_file(repository.state.join("HEAD")).unwrap();
+        fs::remove_dir_all(repository.state.join("refs").join("heads")).unwrap();
+        fs::write(temp.path().join("a.txt"), b"legacy second").unwrap();
+        let second = snapshot_repository(temp.path(), "second".to_string(), None).unwrap();
+        assert_eq!(second.parent_id, Some(first.commit_id));
+        assert_eq!(
+            Repository::discover(temp.path())
+                .unwrap()
+                .resolve_revision("HEAD")
+                .unwrap(),
+            second.commit_id
+        );
+        assert_eq!(repository_refs(temp.path()).unwrap().active_branch, None);
+        assert!(
+            repository_refs(temp.path())
+                .unwrap()
+                .refs
+                .iter()
+                .any(|reference| { reference.kind == RepositoryRefKind::LegacyHead })
+        );
     }
 }

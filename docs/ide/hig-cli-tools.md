@@ -37,6 +37,8 @@ hig --version
 hig init /path/to/project --cache-dir /path/to/cache
 hig project rebuild /path/to/project --wait
 hig project status /path/to/project --json
+hig project policy show /path/to/project --json
+hig project policy set /path/to/project --quiescence-ms 15 --periodic-interval-ms 900000 --json
 
 hig daemon start --cache-dir /path/to/cache
 hig session unlock --cache-dir /path/to/cache --password "$HIG_PASSWORD"
@@ -47,6 +49,14 @@ hig cache status --cache-dir /path/to/cache
 
 hig repo init /path/to/project
 hig repo snapshot /path/to/project -m "before refactor"
+hig repo refs /path/to/project --json
+hig repo branch list /path/to/project --json
+hig repo branch create feature/refactor /path/to/project --from HEAD --json
+hig repo branch switch feature/refactor /path/to/project --json
+hig repo branch delete feature/refactor /path/to/project --json
+hig repo tag create v1.10.0 /path/to/project --from HEAD --json
+hig repo tag list /path/to/project --json
+hig repo tag delete v1.10.0 /path/to/project --json
 hig repo log /path/to/project --json
 hig repo diff /path/to/project --from <commit> --to HEAD --json
 hig repo history /path/to/project --path src/lib.rs --json
@@ -71,6 +81,20 @@ and is encoding-independent. `repo storage-tree` additionally reports the
 committed compression tree and, when available, its project/cache provenance.
 Function and symbol lookup use the committed Phase 3 semantic index; restore
 returns the exact source bytes from the file/chunk DAG.
+
+Repository references use the following model:
+
+- New repositories have an active main branch selected by
+  .hig/repository/HEAD and stored at refs/heads/main.
+- refs/HEAD remains a direct, atomically updated compatibility view for older
+  HIG CLI versions.
+- Branches are mutable pointers; snapshots advance only the active branch.
+- Tags are immutable pointers and duplicate tag creation is rejected.
+- Revision aliases include HEAD, an unqualified branch or tag name,
+  heads/<name>, tags/<name>, refs/heads/<name>, and refs/tags/<name>, in
+  addition to full or unique 8+ character commit IDs.
+- Legacy repositories containing only refs/HEAD remain readable and can
+  continue recording snapshots.
 
 ## MCP Adapter
 
@@ -113,6 +137,8 @@ unrestricted shell boundary.
 | `hig_init_project` | initialize project metadata/index config |
 | `hig_project_status` | read project status JSON |
 | `hig_project_rebuild` | rebuild project snapshot/index |
+| `hig_project_policy_show` | read automatic snapshot policy |
+| `hig_project_policy_set` | atomically update automatic snapshot policy |
 | `hig_daemon_start` | start daemon |
 | `hig_daemon_status` | check daemon |
 | `hig_daemon_stop` | stop daemon |
@@ -131,6 +157,14 @@ unrestricted shell boundary.
 | `hig_task_result` | task result |
 | `hig_repo_init` | initialize immutable repository history |
 | `hig_repo_snapshot` | record an atomic byte/semantic snapshot |
+| `hig_repo_refs` | list HEAD, branches, and tags |
+| `hig_repo_branch_list` | list branches |
+| `hig_repo_branch_create` | create a branch at a revision |
+| `hig_repo_branch_switch` | switch the active branch |
+| `hig_repo_branch_delete` | delete an inactive branch |
+| `hig_repo_tag_list` | list tags |
+| `hig_repo_tag_create` | create an immutable tag |
+| `hig_repo_tag_delete` | delete a tag |
 | `hig_repo_diff` | inspect byte-range changes |
 | `hig_repo_path_history` | query rename-aware path history |
 | `hig_repo_restore` | restore a revision or path |

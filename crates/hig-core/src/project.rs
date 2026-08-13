@@ -19,6 +19,7 @@ const PROJECT_SCHEMA: u16 = 1;
 const SNAPSHOT_MAGIC: &[u8; 4] = b"HPS1";
 const JOURNAL_MAGIC: &[u8; 4] = b"HPJ1";
 const MAX_STABLE_READ_RETRIES: usize = 3;
+const SNAPSHOT_POLICY_SCHEMA: u16 = 1;
 
 pub const DEFAULT_PROJECT_EXCLUDES: &[&str] = &[
     ".git",
@@ -37,6 +38,85 @@ pub struct ProjectConfig {
     pub cache_dir: Option<PathBuf>,
     pub excludes: Vec<String>,
     pub compression_policy_version: u16,
+    #[serde(default)]
+    pub snapshot_policy: WorkspaceSnapshotPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotResourcePolicy {
+    pub enabled: bool,
+    pub min_available_memory_bytes: u64,
+    pub resume_available_memory_bytes: u64,
+    pub poll_interval_ms: u64,
+}
+
+impl Default for SnapshotResourcePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_available_memory_bytes: 64 * 1024 * 1024,
+            resume_available_memory_bytes: 128 * 1024 * 1024,
+            poll_interval_ms: 250,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSnapshotPolicy {
+    pub schema: u16,
+    pub enabled: bool,
+    pub quiescence_ms: u64,
+    pub periodic_interval_ms: u64,
+    pub max_pending_events: u64,
+    pub max_pending_files: u64,
+    pub resource: SnapshotResourcePolicy,
+}
+
+impl Default for WorkspaceSnapshotPolicy {
+    fn default() -> Self {
+        Self {
+            schema: SNAPSHOT_POLICY_SCHEMA,
+            enabled: true,
+            quiescence_ms: 15,
+            periodic_interval_ms: 15 * 60 * 1000,
+            max_pending_events: 8192,
+            max_pending_files: 4096,
+            resource: SnapshotResourcePolicy::default(),
+        }
+    }
+}
+
+impl WorkspaceSnapshotPolicy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema == SNAPSHOT_POLICY_SCHEMA,
+            "unsupported workspace snapshot policy schema {}",
+            self.schema
+        );
+        anyhow::ensure!(
+            self.quiescence_ms <= 60_000,
+            "snapshot quiescence must not exceed 60000 ms"
+        );
+        anyhow::ensure!(
+            self.periodic_interval_ms == 0 || self.periodic_interval_ms >= 1000,
+            "snapshot periodic interval must be zero or at least 1000 ms"
+        );
+        anyhow::ensure!(
+            self.max_pending_events > 0 && self.max_pending_files > 0,
+            "snapshot pending budgets must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.resource.poll_interval_ms > 0,
+            "snapshot resource poll interval must be greater than zero"
+        );
+        anyhow::ensure!(
+            !self.resource.enabled
+                || self.resource.resume_available_memory_bytes
+                    >= self.resource.min_available_memory_bytes,
+            "snapshot resource resume threshold must be at least the pressure threshold"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +185,16 @@ pub struct ProjectStatusReport {
     pub prepared_bytes: u64,
     pub last_event_age_ms: u64,
     pub last_full_rebuild_unix_ns: i128,
+    #[serde(default)]
+    pub policy_schema: u16,
+    #[serde(default)]
+    pub snapshot_paused: bool,
+    #[serde(default)]
+    pub pause_reason: Option<String>,
+    #[serde(default)]
+    pub resource_available_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub resource_pressure: bool,
 }
 
 pub struct ProjectWatcher {
@@ -122,6 +212,14 @@ pub struct ProjectWatcher {
     prepared_bytes: u64,
     dirty_files: u64,
     dirty_groups: u64,
+    policy: WorkspaceSnapshotPolicy,
+    last_snapshot: Instant,
+    pending_events_count: u64,
+    snapshot_paused: bool,
+    pause_reason: Option<String>,
+    resource_available_memory_bytes: Option<u64>,
+    resource_pressure: bool,
+    last_resource_check: Option<Instant>,
 }
 
 impl ProjectWatcher {
@@ -132,8 +230,14 @@ impl ProjectWatcher {
         pipeline: PipelineOptions,
     ) -> anyhow::Result<Self> {
         let root = root.canonicalize()?;
+        config.snapshot_policy.validate()?;
         let cache_root = resolve_project_cache_dir(&root, &config);
-        let (sender, receiver) = bounded(8192);
+        let (sender, receiver) = bounded(
+            config
+                .snapshot_policy
+                .max_pending_events
+                .min(usize::MAX as u64) as usize,
+        );
         let overflowed = Arc::new(AtomicBool::new(false));
         let callback_overflow = overflowed.clone();
         let mut watcher = notify::recommended_watcher(move |event| {
@@ -154,6 +258,7 @@ impl ProjectWatcher {
         )?;
         let (_, warmed_bytes) = cache.warm_parameterized_payloads()?;
         cache.save_with_options(crate::cache::CacheSaveOptions { refresh_l1: false })?;
+        let policy = config.snapshot_policy.clone();
         Ok(Self {
             root,
             cache_root,
@@ -169,6 +274,14 @@ impl ProjectWatcher {
             prepared_bytes: prepared_bytes.max(warmed_bytes),
             dirty_files: 0,
             dirty_groups: 0,
+            policy,
+            last_snapshot: Instant::now(),
+            pending_events_count: 0,
+            snapshot_paused: false,
+            pause_reason: None,
+            resource_available_memory_bytes: None,
+            resource_pressure: false,
+            last_resource_check: None,
         })
     }
 
@@ -184,17 +297,33 @@ impl ProjectWatcher {
         &self.snapshot
     }
 
+    pub fn update_policy(&mut self, policy: WorkspaceSnapshotPolicy) -> anyhow::Result<()> {
+        policy.validate()?;
+        update_snapshot_policy(&self.root, policy.clone())?;
+        self.policy = policy.clone();
+        self.config.snapshot_policy = policy;
+        Ok(())
+    }
+
     pub fn poll(
         &mut self,
         cache: &mut CacheStore,
         pipeline: PipelineOptions,
     ) -> anyhow::Result<bool> {
+        self.refresh_resource_state();
         let mut received = false;
         loop {
             match self.receiver.try_recv() {
                 Ok(Ok(event)) => {
                     received = true;
+                    self.pending_events_count = self.pending_events_count.saturating_add(1);
+                    if self.pending_events_count > self.policy.max_pending_events {
+                        self.watcher_overflow_count = self.watcher_overflow_count.saturating_add(1);
+                        self.invalidate();
+                        break;
+                    }
                     if event.need_rescan() {
+                        self.watcher_overflow_count = self.watcher_overflow_count.saturating_add(1);
                         self.invalidate();
                         break;
                     }
@@ -205,13 +334,20 @@ impl ProjectWatcher {
                             self.pending.insert(path);
                         }
                     }
+                    if self.pending.len() as u64 > self.policy.max_pending_files {
+                        self.watcher_overflow_count = self.watcher_overflow_count.saturating_add(1);
+                        self.invalidate();
+                        break;
+                    }
                 }
                 Ok(Err(_)) => {
+                    self.watcher_overflow_count = self.watcher_overflow_count.saturating_add(1);
                     self.invalidate();
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    self.watcher_overflow_count = self.watcher_overflow_count.saturating_add(1);
                     self.invalidate();
                     break;
                 }
@@ -225,14 +361,21 @@ impl ProjectWatcher {
             self.last_event = Some(Instant::now());
             self.snapshot.validity = SnapshotValidity::Dirty;
         }
+        if self.snapshot_paused || !self.policy.enabled {
+            return Ok(false);
+        }
+        if self.periodic_due() && self.pending.is_empty() {
+            self.rebuild(cache, pipeline)?;
+            return Ok(true);
+        }
         if self.snapshot.validity == SnapshotValidity::Invalid {
             self.rebuild(cache, pipeline)?;
             return Ok(true);
         }
         if self.pending.is_empty()
-            || self
-                .last_event
-                .is_some_and(|last| last.elapsed() < Duration::from_millis(5))
+            || self.last_event.is_some_and(|last| {
+                last.elapsed() < Duration::from_millis(self.policy.quiescence_ms)
+            })
         {
             return Ok(false);
         }
@@ -287,6 +430,8 @@ impl ProjectWatcher {
         self.snapshot.validity = SnapshotValidity::Ready;
         self.dirty_files = dirty;
         self.dirty_groups = dirty;
+        self.pending_events_count = 0;
+        self.last_snapshot = Instant::now();
         append_project_journal(
             &self.cache_root,
             &self.config.project_id,
@@ -306,8 +451,17 @@ impl ProjectWatcher {
         cache: &mut CacheStore,
         pipeline: PipelineOptions,
     ) -> anyhow::Result<()> {
+        let previous_generation = self.snapshot.generation;
+        let previous_event_sequence = self.snapshot.event_sequence;
         self.snapshot.validity = SnapshotValidity::Building;
-        self.snapshot = rebuild_snapshot(&self.root, &self.cache_root, &self.config)?;
+        let mut rebuilt = rebuild_snapshot(&self.root, &self.cache_root, &self.config)?;
+        rebuilt.generation = previous_generation
+            .saturating_add(1)
+            .max(rebuilt.generation);
+        rebuilt.event_sequence = previous_event_sequence.saturating_add(1);
+        rebuilt.validity = SnapshotValidity::Ready;
+        save_snapshot(&self.cache_root, &rebuilt)?;
+        self.snapshot = rebuilt;
         let (_, prepared_bytes) = crate::archive::prewarm_project_snapshot(
             &self.root,
             &self.snapshot,
@@ -319,6 +473,9 @@ impl ProjectWatcher {
         )?;
         self.prepared_bytes = prepared_bytes;
         self.last_full_rebuild_unix_ns = now_unix_ns();
+        self.last_snapshot = Instant::now();
+        self.pending_events_count = 0;
+        self.last_event = None;
         self.pending.clear();
         cache.save_with_options(crate::cache::CacheSaveOptions { refresh_l1: false })?;
         Ok(())
@@ -346,12 +503,57 @@ impl ProjectWatcher {
                 .map(|event| event.elapsed().as_millis() as u64)
                 .unwrap_or_default(),
             last_full_rebuild_unix_ns: self.last_full_rebuild_unix_ns,
+            policy_schema: self.policy.schema,
+            snapshot_paused: self.snapshot_paused,
+            pause_reason: self.pause_reason.clone(),
+            resource_available_memory_bytes: self.resource_available_memory_bytes,
+            resource_pressure: self.resource_pressure,
         }
     }
 
     fn invalidate(&mut self) {
         self.snapshot.validity = SnapshotValidity::Invalid;
         self.pending.clear();
+    }
+
+    fn periodic_due(&self) -> bool {
+        self.policy.enabled
+            && self.policy.periodic_interval_ms > 0
+            && self.last_snapshot.elapsed()
+                >= Duration::from_millis(self.policy.periodic_interval_ms)
+    }
+
+    fn refresh_resource_state(&mut self) {
+        if !self.policy.resource.enabled
+            || self.last_resource_check.is_some_and(|last| {
+                last.elapsed() < Duration::from_millis(self.policy.resource.poll_interval_ms)
+            })
+        {
+            return;
+        }
+        self.last_resource_check = Some(Instant::now());
+        self.resource_available_memory_bytes = available_memory_bytes();
+        let Some(available) = self.resource_available_memory_bytes else {
+            self.resource_pressure = false;
+            if self.snapshot_paused {
+                self.snapshot_paused = false;
+                self.pause_reason = None;
+            }
+            return;
+        };
+        if self.snapshot_paused {
+            if available >= self.policy.resource.resume_available_memory_bytes {
+                self.snapshot_paused = false;
+                self.resource_pressure = false;
+                self.pause_reason = None;
+            }
+        } else if available < self.policy.resource.min_available_memory_bytes {
+            self.snapshot_paused = true;
+            self.resource_pressure = true;
+            self.pause_reason = Some("low_available_memory".to_string());
+        } else {
+            self.resource_pressure = false;
+        }
     }
 
     #[cfg(test)]
@@ -367,6 +569,44 @@ fn watcher_backend() -> &'static str {
     return "inotify";
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     return "unsupported";
+}
+
+fn available_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if pages > 0 && page_size > 0 {
+            return (pages as u64).checked_mul(page_size as u64);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        fn sysctl_u64(name: &str) -> Option<u64> {
+            let name = std::ffi::CString::new(name).ok()?;
+            let mut value = 0_u64;
+            let mut length = std::mem::size_of_val(&value);
+            let result = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    (&mut value as *mut u64).cast(),
+                    &mut length,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            (result == 0 && length == std::mem::size_of_val(&value)).then_some(value)
+        }
+        let pages = sysctl_u64("vm.stats.vm.v_free_count")?
+            .saturating_add(sysctl_u64("vm.stats.vm.v_inactive_count")?)
+            .saturating_add(sysctl_u64("vm.stats.vm.v_speculative_count")?);
+        let page_size = sysctl_u64("hw.pagesize")?;
+        pages.checked_mul(page_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 fn now_unix_ns() -> i128 {
@@ -421,6 +661,7 @@ pub fn init_project(
         cache_dir,
         excludes: excludes.into_iter().collect(),
         compression_policy_version: 2,
+        snapshot_policy: WorkspaceSnapshotPolicy::default(),
     };
     atomic_write_json(&config_path, &config)?;
     let cache_root = resolve_project_cache_dir(&root, &config);
@@ -456,6 +697,19 @@ pub fn load_project_config(root: &Path) -> anyhow::Result<ProjectConfig> {
         "unsupported Hig project schema {}",
         config.schema
     );
+    config.snapshot_policy.validate()?;
+    Ok(config)
+}
+
+pub fn update_snapshot_policy(
+    root: &Path,
+    policy: WorkspaceSnapshotPolicy,
+) -> anyhow::Result<ProjectConfig> {
+    let root = root.canonicalize()?;
+    let mut config = load_project_config(&root)?;
+    policy.validate()?;
+    config.snapshot_policy = policy;
+    atomic_write_json(&project_config_path(&root), &config)?;
     Ok(config)
 }
 
@@ -472,6 +726,7 @@ pub fn rebuild_snapshot(
     cache_root: &Path,
     config: &ProjectConfig,
 ) -> anyhow::Result<ProjectSnapshot> {
+    config.snapshot_policy.validate()?;
     let root = root.canonicalize()?;
     let paths = project_file_paths(&root, &config.excludes);
     let records = paths
@@ -877,5 +1132,70 @@ mod tests {
             .unwrap();
         assert_eq!(watcher.snapshot().validity, SnapshotValidity::Ready);
         assert_eq!(watcher.status().watcher_overflow_count, 1);
+    }
+
+    #[test]
+    fn snapshot_policy_validates_bounds_and_legacy_config_uses_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = init_project(temp.path(), None, Vec::new()).unwrap();
+        assert_eq!(config.snapshot_policy, WorkspaceSnapshotPolicy::default());
+
+        let mut invalid = WorkspaceSnapshotPolicy::default();
+        invalid.quiescence_ms = 60_001;
+        assert!(invalid.validate().is_err());
+        invalid = WorkspaceSnapshotPolicy::default();
+        invalid.resource.resume_available_memory_bytes = 1;
+        assert!(invalid.validate().is_err());
+        invalid = WorkspaceSnapshotPolicy::default();
+        invalid.max_pending_files = 0;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn disabled_snapshot_policy_keeps_changes_dirty_until_explicit_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"one").unwrap();
+        let mut config = init_project(&root, Some(cache_dir.clone()), Vec::new()).unwrap();
+        config.snapshot_policy.enabled = false;
+        atomic_write_json(&project_config_path(&root), &config).unwrap();
+        let mut cache = CacheStore::open(&cache_dir).unwrap();
+        let mut watcher =
+            ProjectWatcher::start(&root, config, &mut cache, PipelineOptions::default()).unwrap();
+        let initial_generation = watcher.snapshot().generation;
+        fs::write(root.join("a.txt"), b"two").unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        watcher
+            .poll(&mut cache, PipelineOptions::default())
+            .unwrap();
+        assert_eq!(watcher.snapshot().generation, initial_generation);
+        assert_eq!(watcher.snapshot().validity, SnapshotValidity::Dirty);
+        watcher
+            .rebuild(&mut cache, PipelineOptions::default())
+            .unwrap();
+        assert!(watcher.snapshot().generation > initial_generation);
+        assert_eq!(watcher.snapshot().validity, SnapshotValidity::Ready);
+    }
+
+    #[test]
+    fn full_rebuild_keeps_generation_and_event_sequence_monotonic() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"one").unwrap();
+        let config = init_project(&root, Some(cache_dir.clone()), Vec::new()).unwrap();
+        let mut cache = CacheStore::open(&cache_dir).unwrap();
+        let mut watcher =
+            ProjectWatcher::start(&root, config, &mut cache, PipelineOptions::default()).unwrap();
+        let initial = watcher.status();
+        watcher
+            .rebuild(&mut cache, PipelineOptions::default())
+            .unwrap();
+        let rebuilt = watcher.status();
+        assert!(rebuilt.generation > initial.generation);
+        assert!(rebuilt.event_sequence > initial.event_sequence);
     }
 }

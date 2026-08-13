@@ -63,6 +63,29 @@ const tools = [
     })
   },
   {
+    name: "hig_project_policy_show",
+    description: "Return the versioned IDE automatic snapshot policy.",
+    inputSchema: objectSchema({
+      dir: pathProp("Project directory. Defaults to workspace root.")
+    })
+  },
+  {
+    name: "hig_project_policy_set",
+    description: "Atomically update IDE automatic snapshot policy and apply it to the daemon.",
+    inputSchema: objectSchema({
+      dir: pathProp("Project directory. Defaults to workspace root."),
+      enabled: { type: "boolean" },
+      quiescenceMs: { type: "integer", minimum: 0 },
+      periodicIntervalMs: { type: "integer", minimum: 0 },
+      maxPendingEvents: { type: "integer", minimum: 1 },
+      maxPendingFiles: { type: "integer", minimum: 1 },
+      resourceEnabled: { type: "boolean" },
+      minAvailableMemoryBytes: { type: "integer", minimum: 0 },
+      resumeAvailableMemoryBytes: { type: "integer", minimum: 0 },
+      resourcePollIntervalMs: { type: "integer", minimum: 1 }
+    })
+  },
+  {
     name: "hig_daemon_status",
     description: "Return daemon status for a cache directory.",
     inputSchema: objectSchema({
@@ -223,6 +246,69 @@ const tools = [
       message: { type: "string", description: "Snapshot message." },
       author: { type: "string", description: "Optional author identity." }
     })
+  },
+  {
+    name: "hig_repo_refs",
+    description: "List HEAD, branches, and tags with full commit IDs and active state.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root.")
+    })
+  },
+  {
+    name: "hig_repo_branch_list",
+    description: "List repository branches.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root.")
+    })
+  },
+  {
+    name: "hig_repo_branch_create",
+    description: "Create a branch at a revision. Defaults to the current HEAD.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root."),
+      name: { type: "string", minLength: 1, description: "Branch name." },
+      from: { type: "string", description: "Optional source revision." }
+    }, ["name"])
+  },
+  {
+    name: "hig_repo_branch_switch",
+    description: "Switch the active repository branch.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root."),
+      name: { type: "string", minLength: 1, description: "Branch name." }
+    }, ["name"])
+  },
+  {
+    name: "hig_repo_branch_delete",
+    description: "Delete an inactive repository branch.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root."),
+      name: { type: "string", minLength: 1, description: "Branch name." }
+    }, ["name"])
+  },
+  {
+    name: "hig_repo_tag_list",
+    description: "List immutable repository tags.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root.")
+    })
+  },
+  {
+    name: "hig_repo_tag_create",
+    description: "Create an immutable tag at a revision. Defaults to the current HEAD.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root."),
+      name: { type: "string", minLength: 1, description: "Tag name." },
+      from: { type: "string", description: "Optional source revision." }
+    }, ["name"])
+  },
+  {
+    name: "hig_repo_tag_delete",
+    description: "Delete an immutable repository tag.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root."),
+      name: { type: "string", minLength: 1, description: "Tag name." }
+    }, ["name"])
   },
   {
     name: "hig_repo_log",
@@ -465,6 +551,22 @@ async function callTool(name, args) {
       return runHig(["project", "status", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_project_rebuild":
       return runHig(["project", "rebuild", resolveInputPath(args.dir || "."), ...(args.wait ? ["--wait"] : [])]);
+    case "hig_project_policy_show":
+      return runHig(["project", "policy", "show", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
+    case "hig_project_policy_set":
+      return runHig([
+        "project", "policy", "set", resolveInputPath(args.dir || "."),
+        ...optionValue("--enabled", args.enabled),
+        ...optionValue("--quiescence-ms", args.quiescenceMs),
+        ...optionValue("--periodic-interval-ms", args.periodicIntervalMs),
+        ...optionValue("--max-pending-events", args.maxPendingEvents),
+        ...optionValue("--max-pending-files", args.maxPendingFiles),
+        ...optionValue("--resource-enabled", args.resourceEnabled),
+        ...optionValue("--min-available-memory-bytes", args.minAvailableMemoryBytes),
+        ...optionValue("--resume-available-memory-bytes", args.resumeAvailableMemoryBytes),
+        ...optionValue("--resource-poll-interval-ms", args.resourcePollIntervalMs),
+        "--json"
+      ], { parseJson: true });
     case "hig_daemon_status":
       return runHig(["daemon", "status", ...optionPath("--cache-dir", args.cacheDir)]);
     case "hig_daemon_start":
@@ -501,6 +603,22 @@ async function callTool(name, args) {
       return runHig(["repo", "init", resolveInputPath(args.dir || "."), ...repeatOption("--exclude", args.excludes), "--json"], { parseJson: true });
     case "hig_repo_snapshot":
       return runHig(["repo", "snapshot", resolveInputPath(args.dir || "."), ...optionValue("--message", args.message), ...optionValue("--author", args.author), "--json"], { parseJson: true });
+    case "hig_repo_refs":
+      return runHig(["repo", "refs", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
+    case "hig_repo_branch_list":
+      return runHig(["repo", "branch", "list", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
+    case "hig_repo_branch_create":
+      return runHig(["repo", "branch", "create", stringArg(args.name, "name"), resolveInputPath(args.dir || "."), ...optionValue("--from", args.from), "--json"], { parseJson: true });
+    case "hig_repo_branch_switch":
+      return runHig(["repo", "branch", "switch", stringArg(args.name, "name"), resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
+    case "hig_repo_branch_delete":
+      return runHig(["repo", "branch", "delete", stringArg(args.name, "name"), resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
+    case "hig_repo_tag_list":
+      return runHig(["repo", "tag", "list", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
+    case "hig_repo_tag_create":
+      return runHig(["repo", "tag", "create", stringArg(args.name, "name"), resolveInputPath(args.dir || "."), ...optionValue("--from", args.from), "--json"], { parseJson: true });
+    case "hig_repo_tag_delete":
+      return runHig(["repo", "tag", "delete", stringArg(args.name, "name"), resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_repo_log":
       return runHig(["repo", "log", resolveInputPath(args.dir || "."), ...optionValue("--limit", args.limit), "--json"], { parseJson: true });
     case "hig_repo_diff":

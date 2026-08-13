@@ -422,6 +422,44 @@ enum ProjectCommand {
         #[arg(long)]
         wait: bool,
     },
+    Policy {
+        #[command(subcommand)]
+        command: ProjectPolicyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectPolicyCommand {
+    Show {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Set {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long)]
+        quiescence_ms: Option<u64>,
+        #[arg(long)]
+        periodic_interval_ms: Option<u64>,
+        #[arg(long)]
+        max_pending_events: Option<u64>,
+        #[arg(long)]
+        max_pending_files: Option<u64>,
+        #[arg(long)]
+        resource_enabled: Option<bool>,
+        #[arg(long)]
+        min_available_memory_bytes: Option<u64>,
+        #[arg(long)]
+        resume_available_memory_bytes: Option<u64>,
+        #[arg(long)]
+        resource_poll_interval_ms: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -443,6 +481,20 @@ pub(crate) enum RepositoryCommand {
         author: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    Refs {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Branch {
+        #[command(subcommand)]
+        command: RepositoryBranchCommand,
+    },
+    Tag {
+        #[command(subcommand)]
+        command: RepositoryTagCommand,
     },
     Log {
         #[arg(default_value = ".")]
@@ -569,6 +621,65 @@ pub(crate) enum RepositoryCommand {
         dir: PathBuf,
         #[arg(long, help = "Delete unreachable objects; default is report-only")]
         apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RepositoryBranchCommand {
+    List {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Create {
+        name: String,
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long = "from")]
+        from_revision: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Switch {
+        name: String,
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Delete {
+        name: String,
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RepositoryTagCommand {
+    List {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Create {
+        name: String,
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long = "from")]
+        from_revision: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Delete {
+        name: String,
+        #[arg(default_value = ".")]
+        dir: PathBuf,
         #[arg(long)]
         json: bool,
     },
