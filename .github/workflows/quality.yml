@@ -49,6 +49,16 @@ jobs:
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
         run: node scripts/mcp-integration-test.mjs
+      - name: Repository recovery and interruption smoke
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release/hig
+        run: node scripts/repository-soak-test.mjs --mode ci --duration-minutes 0.25 --report artifacts/repository-soak-ci.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repository-soak-ci-${{ github.sha }}
+          path: artifacts/repository-soak-ci.json
+          if-no-files-found: error
 
   native-package:
     name: Native package (${{ matrix.platform }})

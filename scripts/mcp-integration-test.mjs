@@ -213,13 +213,30 @@ try {
   assert.equal(watchStopped.data.active, false);
   await tool("hig_repo_verify", { dir: workspace });
 
+  const offlineContent = "pub fn mcp_fixture() -> u8 { 3 }\n";
+  fs.writeFileSync(path.join(workspace, "src", "lib.rs"), offlineContent);
+  const restarted = await tool("hig_repo_watch_start", {
+    dir: workspace,
+    debounceMs: 100,
+    message: "MCP restarted snapshot",
+    author: "mcp-ci"
+  });
+  assert.equal(restarted.data.active, true);
+  const catchUp = await waitFor(async () => {
+    const status = await tool("hig_repo_watch_status", { dir: workspace });
+    return status.data.snapshots >= 1 ? status : null;
+  }, 15000, "repository catch-up snapshot");
+  assert.equal(catchUp.data.last_snapshot.created, true);
+  await tool("hig_repo_watch_stop", { dir: workspace });
+  await tool("hig_repo_verify", { dir: workspace });
+
   const automaticRestore = path.join(work, "automatic-restore");
   await tool("hig_repo_restore", {
     dir: workspace,
     revision: "HEAD",
     outputDir: automaticRestore
   });
-  assert.equal(fs.readFileSync(path.join(automaticRestore, "src", "lib.rs"), "utf8"), automaticContent);
+  assert.equal(fs.readFileSync(path.join(automaticRestore, "src", "lib.rs"), "utf8"), offlineContent);
 
   const range = path.join(work, "range.bin");
   await tool("hig_repo_restore_range", {

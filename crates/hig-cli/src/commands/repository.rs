@@ -7,6 +7,11 @@ use hig_core::{
     repository_symbols, restore_repository, restore_repository_range, restore_repository_symbol,
     snapshot_repository, switch_repository_branch, verify_repository,
 };
+use std::io::Read;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
@@ -350,33 +355,49 @@ pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
             debounce_ms,
             message,
             author,
+            catch_up,
+            lifecycle_stdin,
             json,
         } => {
             anyhow::ensure!(debounce_ms > 0, "--debounce-ms must be greater than zero");
             let mut watcher = RepositoryWatcher::start(&dir, Duration::from_millis(debounce_ms))?;
+            let lifecycle_closed = lifecycle_stdin.then(|| {
+                let closed = Arc::new(AtomicBool::new(false));
+                let signal = Arc::clone(&closed);
+                std::thread::spawn(move || {
+                    let mut input = std::io::stdin().lock();
+                    let mut buffer = [0_u8; 1];
+                    while matches!(input.read(&mut buffer), Ok(1)) {}
+                    signal.store(true, Ordering::Release);
+                });
+                closed
+            });
             if !json {
                 println!(
-                    "repo: watch active root={} debounce_ms={}",
+                    "repo: watch active root={} debounce_ms={} catch_up={}",
                     watcher.root().display(),
-                    debounce_ms
+                    debounce_ms,
+                    catch_up
                 );
             }
+            if catch_up {
+                let report =
+                    snapshot_repository(&dir, format!("{message} (catch-up)"), author.clone())?;
+                if report.created {
+                    print_watcher_snapshot(&report, json)?;
+                }
+            }
             loop {
+                if lifecycle_closed
+                    .as_ref()
+                    .is_some_and(|closed| closed.load(Ordering::Acquire))
+                {
+                    break;
+                }
                 if let Some(report) = watcher.poll(&message, author.as_deref())?
                     && report.created
                 {
-                    if json {
-                        println!("{}", serde_json::to_string(&report)?);
-                    } else {
-                        println!(
-                            "repo: automatic-snapshot commit={} files={} bytes={} chunks_written={} chunks_reused={}",
-                            short_id(report.commit_id),
-                            report.files,
-                            report.input_bytes,
-                            report.chunks_written,
-                            report.chunks_reused
-                        );
-                    }
+                    print_watcher_snapshot(&report, json)?;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -422,6 +443,25 @@ pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn print_watcher_snapshot(
+    report: &hig_core::RepositorySnapshotReport,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(report)?);
+    } else {
+        println!(
+            "repo: automatic-snapshot commit={} files={} bytes={} chunks_written={} chunks_reused={}",
+            short_id(report.commit_id),
+            report.files,
+            report.input_bytes,
+            report.chunks_written,
+            report.chunks_reused
+        );
     }
     Ok(())
 }

@@ -412,6 +412,10 @@ pub(crate) enum RepositoryCommand {
         message: String,
         #[arg(long)]
         author: Option<String>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        catch_up: bool,
+        #[arg(long, hide = true)]
+        lifecycle_stdin: bool,
         #[arg(long)]
         json: bool,
     },
@@ -705,6 +709,8 @@ mod tests {
                 command: RepositoryCommand::Watch {
                     dir,
                     debounce_ms: 750,
+                    catch_up: true,
+                    lifecycle_stdin: false,
                     json: false,
                     ..
                 }

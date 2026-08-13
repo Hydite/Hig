@@ -873,12 +873,14 @@ async function startRepositoryWatcher(args) {
     "--debounce-ms", String(debounceMs),
     "--message", message,
     ...(author ? ["--author", author] : []),
+    "--catch-up", "true",
+    "--lifecycle-stdin",
     "--json"
   ];
   const child = spawn(higBin, command, {
     cwd: process.env.HIG_MCP_WORKDIR || process.cwd(),
     env: { ...process.env, NO_COLOR: "1" },
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"]
   });
   const watcher = {
     root,
