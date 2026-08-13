@@ -53,11 +53,19 @@ jobs:
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
         run: node scripts/repository-soak-test.mjs --mode ci --duration-minutes 0.25 --report artifacts/repository-soak-ci.json
+      - name: Cold-path regression policy
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release/hig
+        run: |
+          node scripts/cold-path-regression-test.mjs --self-test
+          node scripts/cold-path-regression-test.mjs --mode ci --report artifacts/cold-path-regression-ci.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: repository-soak-ci-${{ github.sha }}
-          path: artifacts/repository-soak-ci.json
+          name: completion-regression-evidence-${{ github.sha }}
+          path: |
+            artifacts/repository-soak-ci.json
+            artifacts/cold-path-regression-ci.json
           if-no-files-found: error
 
   native-package:

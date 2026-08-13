@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "corpus": {
+    "seed": 1212761168,
+    "small_files": 3000,
+    "small_file_bytes": 4096,
+    "large_files": 4,
+    "large_file_bytes": 12582912
+  },
+  "samples": 3,
+  "limits": {
+    "total_median_us": 5000000,
+    "scan_median_us": 3000000,
+    "block_prepare_median_us": 3000000,
+    "output_write_median_us": 2000000,
+    "peak_pipeline_memory_bytes": 268435456,
+    "archive_to_input_ratio": 0.82
+  }
+}
