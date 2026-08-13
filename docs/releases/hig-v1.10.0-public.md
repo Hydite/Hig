@@ -49,13 +49,24 @@ boundaries for future contributors.
 ## Verification
 
 - `cargo fmt --all --check`: passed;
-- workspace CLI/core tests: passed, including 143 `hig-core` tests;
+- workspace CLI/core tests: passed, including 153 `hig-core` tests and 18 CLI tests;
 - CLI/core/FFI Clippy with warnings denied: passed;
 - macOS universal CLI/MCP smoke: passed;
 - Linux x86_64 native build and extracted package smoke: passed;
 - MCP `initialize`, `hig_version`, and constrained repository verification:
   passed;
 - package SHA-256 manifests: passed.
+
+The macOS universal package was rebuilt from the post-release compatibility
+migration commit and its current SHA-256 is recorded in the repository
+checksum file. The Linux package listed above remains the previously validated
+native Linux build; rebuilding it requires access to the Ubuntu x86_64 build
+host and must be completed before publishing a package that includes the new
+repository migration tools.
+
+The current enterprise-volume cold-path evidence is recorded in
+`artifacts/hig-v1.10.0-post-migration-cold-benchmark.md`. It reports stage
+timings and exact restore checks without making a cross-version speed claim.
 
 ## Known Scope
 

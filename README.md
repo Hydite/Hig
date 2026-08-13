@@ -49,7 +49,7 @@ Linux package SHA-256:
 macOS package SHA-256:
 
 ```text
-fc9b05bffe4faed236060f4b2792a1b98c2dda10d6f0baae828556b2094acece
+1c09f052635e37e62094b46c4aaca5ff1f072f05fea657a855c22609e147056c
 ```
 
 ## Quick Start
