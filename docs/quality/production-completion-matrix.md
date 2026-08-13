@@ -32,7 +32,7 @@ are descriptive only; the `Complete` state requires every listed gate.
 - [x] Stage-level scan/hash/compression/write telemetry and exact restore checks.
 - [ ] Same-host ABBA gate against retained v1.9.6 and v1.9.7 binaries on qualified NVMe.
 - [x] Current scan/hash hotspot receives a measured, no-regression improvement.
-- [ ] CI benchmark policy rejects quality, memory, archive-size, or protected-stage regression.
+- [x] CI benchmark policy rejects quality, memory, archive-size, or protected-stage regression.
 
 ## Native CLI and MCP Packages
 
