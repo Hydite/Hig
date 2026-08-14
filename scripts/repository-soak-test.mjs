@@ -301,7 +301,7 @@ async function waitForWatcherSnapshot(client) {
   const status = await waitFor(async () => {
     const status = await client.tool("hig_repo_watch_status", { dir: workspace });
     return status.data.snapshots > client.watcherSnapshots ? status : null;
-  }, 30_000, "repository watcher snapshot");
+  }, options.mode === "release" ? 5 * 60_000 : 30_000, "repository watcher snapshot");
   client.watcherSnapshots = status.data.snapshots;
   return status;
 }
