@@ -48,6 +48,7 @@ pub struct ScanOptions {
     pub trust_metadata: bool,
     pub chunk: ChunkOptions,
     pub hot_raw_bytes_budget: usize,
+    pub hot_raw_min_file_bytes: u64,
     pub probe_chunk_levels: bool,
     pub(crate) io_controller: Option<Arc<AdaptiveIoController>>,
 }
@@ -265,7 +266,8 @@ fn scan_file(
     let content_hash = *blake3::hash(&bytes).as_bytes();
     let content_hash_us = content_hash_started.elapsed().as_micros() as u64;
     let hash_us = read_us.saturating_add(content_hash_us);
-    let keep_whole_raw = reserve_hot_raw_bytes(&hot_raw_budget, bytes.len());
+    let keep_whole_raw = size >= options.hot_raw_min_file_bytes
+        && reserve_hot_raw_bytes(&hot_raw_budget, bytes.len());
     let hot_chunks =
         if options.chunk.enabled && size > 0 && size >= options.chunk.chunk_file_threshold {
             Some(compute_hot_chunks(
@@ -485,6 +487,7 @@ mod tests {
                 trust_metadata: true,
                 chunk: ChunkOptions::default(),
                 hot_raw_bytes_budget: 0,
+                hot_raw_min_file_bytes: 0,
                 probe_chunk_levels: false,
                 io_controller: None,
             },
@@ -514,6 +517,7 @@ mod tests {
                 trust_metadata: false,
                 chunk,
                 hot_raw_bytes_budget: 0,
+                hot_raw_min_file_bytes: 0,
                 probe_chunk_levels: true,
                 io_controller: None,
             },
@@ -556,6 +560,7 @@ mod tests {
                 trust_metadata: true,
                 chunk,
                 hot_raw_bytes_budget: 0,
+                hot_raw_min_file_bytes: 0,
                 probe_chunk_levels: false,
                 io_controller: None,
             },
@@ -581,6 +586,7 @@ mod tests {
                 trust_metadata: false,
                 chunk: ChunkOptions::default(),
                 hot_raw_bytes_budget: 4,
+                hot_raw_min_file_bytes: 0,
                 probe_chunk_levels: false,
                 io_controller: None,
             },
@@ -596,6 +602,45 @@ mod tests {
                 .filter(|file| file.raw_bytes.is_some())
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn computed_scan_can_skip_hot_raw_for_small_files() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("small.txt"), b"small").unwrap();
+        fs::write(temp.path().join("large.bin"), vec![7_u8; 1024 * 1024]).unwrap();
+        let report = scan_dir(
+            temp.path(),
+            &temp.path().join(".hig-cache"),
+            &temp.path().join("out.hig"),
+            None,
+            ScanOptions {
+                hot_raw_bytes_budget: 2 * 1024 * 1024,
+                hot_raw_min_file_bytes: 1024 * 1024,
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.stats.hot_raw_bytes, 1024 * 1024);
+        assert_eq!(
+            report
+                .files
+                .iter()
+                .find(|file| file.relative_path == "small.txt")
+                .unwrap()
+                .raw_bytes,
+            None
+        );
+        assert!(
+            report
+                .files
+                .iter()
+                .find(|file| file.relative_path == "large.bin")
+                .unwrap()
+                .raw_bytes
+                .is_some()
         );
     }
 
@@ -616,6 +661,7 @@ mod tests {
                     chunk_size: 8,
                 },
                 hot_raw_bytes_budget: 8,
+                hot_raw_min_file_bytes: 0,
                 probe_chunk_levels: true,
                 io_controller: None,
             },
@@ -651,6 +697,7 @@ mod tests {
                 trust_metadata: false,
                 chunk,
                 hot_raw_bytes_budget: 0,
+                hot_raw_min_file_bytes: 0,
                 probe_chunk_levels: true,
                 io_controller: None,
             },
@@ -685,6 +732,7 @@ mod tests {
                 trust_metadata: true,
                 chunk,
                 hot_raw_bytes_budget: 0,
+                hot_raw_min_file_bytes: 0,
                 probe_chunk_levels: false,
                 io_controller: None,
             },
