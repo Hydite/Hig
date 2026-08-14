@@ -281,7 +281,6 @@ function copyBuffered(source, target) {
       if (read === 0) break;
       fs.writeSync(output, buffer, 0, read);
     }
-    fs.fsyncSync(output);
   } finally {
     fs.closeSync(input);
     fs.closeSync(output);
