@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-const SMALL_SCAN_BATCH_FILES: usize = 64;
+const SMALL_SCAN_BATCH_FILES: usize = 8;
 const SMALL_SCAN_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
