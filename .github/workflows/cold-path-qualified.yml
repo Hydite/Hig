@@ -44,7 +44,7 @@ jobs:
           --require-qualified
           --current-bin target/release/hig
           --v196-bin /tmp/hig-v196/hig-mcp-server/bin/hig
-          --v196-sha256 b9e1e90372b79a29892f60b1c1ca60faa1d783918ad6cd162b516909f3b3910e
+          --v196-sha256 2d009e300dc4c361509f267fd556dbd50991613208c8237ff34c8d0f4ed69025
           --v197-bin /tmp/hig-v197
           --v197-sha256 90f8d113de85d67bff292952b8e39838b1322a24cb7bd942214851aba86afe9a
           --work-dir /tmp/hig-qualified-abba
