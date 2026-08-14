@@ -1,4 +1,4 @@
-use crate::adaptive_io::{AdaptiveIoController, IoDirection};
+use crate::adaptive_io::{AdaptiveIoController, IoDirection, IoPermit};
 use crate::cache::{CacheStore, PathChunkRecord, reusable_path_chunks};
 use crate::{ChunkOptions, Compression, codec};
 use rayon::prelude::*;
@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
+
+const SMALL_SCAN_BATCH_FILES: usize = 64;
+const SMALL_SCAN_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScannedFile {
@@ -133,17 +136,29 @@ pub fn scan_dir(
 
     let hot_raw_budget = Arc::new(AtomicUsize::new(options.hot_raw_bytes_budget));
     let outcomes = paths
-        .into_par_iter()
-        .map(|path| {
-            scan_file(
-                &input_dir,
-                path,
-                cache,
-                options.clone(),
-                hot_raw_budget.clone(),
-            )
+        .par_chunks(SMALL_SCAN_BATCH_FILES)
+        .map(|paths| {
+            let mut io_batch = ScanIoBatch::new(options.io_controller.clone());
+            let outcomes = paths
+                .iter()
+                .map(|path| {
+                    scan_file(
+                        &input_dir,
+                        path.clone(),
+                        cache,
+                        options.clone(),
+                        hot_raw_budget.clone(),
+                        &mut io_batch,
+                    )
+                })
+                .collect::<anyhow::Result<Vec<_>>>();
+            io_batch.finish();
+            outcomes
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let mut files = outcomes
         .iter()
         .map(|outcome| outcome.file.clone())
@@ -211,6 +226,7 @@ fn scan_file(
     cache: Option<&CacheStore>,
     options: ScanOptions,
     hot_raw_budget: Arc<AtomicUsize>,
+    io_batch: &mut ScanIoBatch,
 ) -> anyhow::Result<ScanOutcome> {
     let metadata_started = std::time::Instant::now();
     let metadata = fs::metadata(&path)?;
@@ -260,7 +276,13 @@ fn scan_file(
         });
     }
     let read_started = std::time::Instant::now();
-    let bytes = read_file_adaptive(&path, size, options.io_controller.as_ref(), "scan-read")?;
+    let bytes = read_scan_file(
+        &path,
+        size,
+        options.io_controller.as_ref(),
+        "scan-read",
+        io_batch,
+    )?;
     let read_us = read_started.elapsed().as_micros() as u64;
     let content_hash_started = std::time::Instant::now();
     let content_hash = *blake3::hash(&bytes).as_bytes();
@@ -300,6 +322,73 @@ fn scan_file(
         read_us,
         content_hash_us,
     })
+}
+
+struct ScanIoBatch {
+    controller: Option<Arc<AdaptiveIoController>>,
+    permit: Option<IoPermit>,
+    bytes: u64,
+}
+
+impl ScanIoBatch {
+    fn new(controller: Option<Arc<AdaptiveIoController>>) -> Self {
+        Self {
+            controller,
+            permit: None,
+            bytes: 0,
+        }
+    }
+
+    fn read_small(
+        &mut self,
+        path: &Path,
+        expected_size: u64,
+        stage: &'static str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut input = File::open(path)?;
+        let capacity = usize::try_from(expected_size).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(capacity);
+        if self.permit.is_none() {
+            let controller = self
+                .controller
+                .as_ref()
+                .expect("small scan batch requires an I/O controller");
+            self.permit = Some(controller.acquire(stage, IoDirection::Read, 0));
+        }
+        input.read_to_end(&mut bytes)?;
+        self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+        Ok(bytes)
+    }
+
+    fn finish(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            permit.finish_with_bytes(self.bytes);
+            self.bytes = 0;
+        }
+    }
+}
+
+impl Drop for ScanIoBatch {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn read_scan_file(
+    path: &Path,
+    expected_size: u64,
+    controller: Option<&Arc<AdaptiveIoController>>,
+    stage: &'static str,
+    io_batch: &mut ScanIoBatch,
+) -> anyhow::Result<Vec<u8>> {
+    if expected_size <= SMALL_SCAN_MAX_BYTES {
+        if controller.is_some() {
+            return io_batch.read_small(path, expected_size, stage);
+        }
+    } else {
+        io_batch.finish();
+    }
+    read_file_adaptive(path, expected_size, controller, stage)
 }
 
 pub(crate) fn read_file_adaptive(
@@ -771,5 +860,35 @@ mod tests {
         let adaptive = controller.report();
         let stage = adaptive.stages.get("scan-read").unwrap();
         assert_eq!(stage.bytes, content.len() as u64);
+    }
+
+    #[test]
+    fn adaptive_scan_batches_small_reads_into_one_sample() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..8 {
+            fs::write(
+                temp.path().join(format!("{index}.txt")),
+                vec![index as u8; 4096],
+            )
+            .unwrap();
+        }
+        let controller = AdaptiveIoController::new(4);
+        let report = scan_dir(
+            temp.path(),
+            &temp.path().join(".hig-cache"),
+            &temp.path().join("out.hig"),
+            None,
+            ScanOptions {
+                io_controller: Some(controller.clone()),
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+
+        let adaptive = controller.report();
+        let stage = adaptive.stages.get("scan-read").unwrap();
+        assert_eq!(stage.bytes, 8 * 4096);
+        assert_eq!(stage.samples, 1);
+        assert_eq!(report.stats.hashed_files, 8);
     }
 }
