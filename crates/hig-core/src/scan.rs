@@ -139,23 +139,21 @@ pub fn scan_dir(
         .par_chunks(SMALL_SCAN_BATCH_FILES)
         .map(|paths| {
             let mut io_batch = ScanIoBatch::new(options.io_controller.clone());
-            let pending = paths
+            let outcomes = paths
                 .iter()
                 .map(|path| {
-                    scan_file_pending(
+                    scan_file(
                         &input_dir,
                         path.clone(),
                         cache,
                         options.clone(),
+                        hot_raw_budget.clone(),
                         &mut io_batch,
                     )
                 })
                 .collect::<anyhow::Result<Vec<_>>>();
             io_batch.finish();
-            pending?
-                .into_par_iter()
-                .map(|pending| finish_scan_file(pending, options.clone(), hot_raw_budget.clone()))
-                .collect::<anyhow::Result<Vec<_>>>()
+            outcomes
         })
         .collect::<anyhow::Result<Vec<_>>>()?
         .into_iter()
@@ -222,30 +220,14 @@ struct ScanOutcome {
     content_hash_us: u64,
 }
 
-enum PendingScanFile {
-    Cached(ScanOutcome),
-    Raw(PendingRawScanFile),
-}
-
-struct PendingRawScanFile {
-    relative_path: String,
-    absolute_path: PathBuf,
-    size: u64,
-    mtime_secs: i64,
-    mtime_ns: i128,
-    permissions: u32,
-    metadata_us: u64,
-    read_us: u64,
-    bytes: Vec<u8>,
-}
-
-fn scan_file_pending(
+fn scan_file(
     root: &Path,
     path: PathBuf,
     cache: Option<&CacheStore>,
     options: ScanOptions,
+    hot_raw_budget: Arc<AtomicUsize>,
     io_batch: &mut ScanIoBatch,
-) -> anyhow::Result<PendingScanFile> {
+) -> anyhow::Result<ScanOutcome> {
     let metadata_started = std::time::Instant::now();
     let metadata = fs::metadata(&path)?;
     let relative_path = path
@@ -273,7 +255,7 @@ fn scan_file_pending(
             } else {
                 None
             };
-        return Ok(PendingScanFile::Cached(ScanOutcome {
+        return Ok(ScanOutcome {
             file: ScannedFile {
                 relative_path,
                 absolute_path: path,
@@ -291,81 +273,54 @@ fn scan_file_pending(
             hash_us: 0,
             read_us: 0,
             content_hash_us: 0,
-        }));
+        });
     }
     let read_started = std::time::Instant::now();
-    let bytes = read_scan_file(
+    let read_result = read_scan_file(
         &path,
         size,
         options.io_controller.as_ref(),
         "scan-read",
         io_batch,
     )?;
-    let read_us = read_started.elapsed().as_micros() as u64;
-    Ok(PendingScanFile::Raw(PendingRawScanFile {
-        relative_path,
-        absolute_path: path,
-        size,
-        mtime_secs,
-        mtime_ns,
-        permissions,
-        metadata_us,
-        read_us,
-        bytes,
-    }))
-}
-
-fn finish_scan_file(
-    pending: PendingScanFile,
-    options: ScanOptions,
-    hot_raw_budget: Arc<AtomicUsize>,
-) -> anyhow::Result<ScanOutcome> {
-    let raw = match pending {
-        PendingScanFile::Cached(outcome) => return Ok(outcome),
-        PendingScanFile::Raw(raw) => raw,
-    };
-    let content_hash_started = std::time::Instant::now();
-    let content_hash = *blake3::hash(&raw.bytes).as_bytes();
-    let content_hash_us = content_hash_started.elapsed().as_micros() as u64;
-    let hash_us = raw.read_us.saturating_add(content_hash_us);
-    let keep_whole_raw = raw.size >= options.hot_raw_min_file_bytes
-        && reserve_hot_raw_bytes(&hot_raw_budget, raw.bytes.len());
-    let hot_chunks = if options.chunk.enabled
-        && raw.size > 0
-        && raw.size >= options.chunk.chunk_file_threshold
-    {
-        Some(compute_hot_chunks(
-            &raw.bytes,
-            options.chunk.chunk_size,
-            options.probe_chunk_levels,
-            &hot_raw_budget,
-            !keep_whole_raw,
-        )?)
-    } else {
-        None
-    };
-    let raw_bytes = if keep_whole_raw {
-        Some(raw.bytes)
-    } else {
-        None
-    };
+    let total_read_us = read_started.elapsed().as_micros() as u64;
+    let content_hash_us = read_result.content_hash_us;
+    let read_us = total_read_us.saturating_sub(content_hash_us);
+    let content_hash = read_result.content_hash;
+    let bytes = read_result.bytes;
+    let hash_us = read_us.saturating_add(content_hash_us);
+    let keep_whole_raw = size >= options.hot_raw_min_file_bytes
+        && reserve_hot_raw_bytes(&hot_raw_budget, bytes.len());
+    let hot_chunks =
+        if options.chunk.enabled && size > 0 && size >= options.chunk.chunk_file_threshold {
+            Some(compute_hot_chunks(
+                &bytes,
+                options.chunk.chunk_size,
+                options.probe_chunk_levels,
+                &hot_raw_budget,
+                !keep_whole_raw,
+            )?)
+        } else {
+            None
+        };
+    let raw_bytes = if keep_whole_raw { Some(bytes) } else { None };
     Ok(ScanOutcome {
         file: ScannedFile {
-            relative_path: raw.relative_path,
-            absolute_path: raw.absolute_path,
-            size: raw.size,
-            mtime_secs: raw.mtime_secs,
-            mtime_ns: raw.mtime_ns,
-            permissions: raw.permissions,
+            relative_path,
+            absolute_path: path,
+            size,
+            mtime_secs,
+            mtime_ns,
+            permissions,
             content_hash,
             hash_source: HashSource::Computed,
             cached_chunks: None,
             hot_chunks,
             raw_bytes,
         },
-        metadata_us: raw.metadata_us,
+        metadata_us,
         hash_us,
-        read_us: raw.read_us,
+        read_us,
         content_hash_us,
     })
 }
@@ -390,7 +345,7 @@ impl ScanIoBatch {
         path: &Path,
         expected_size: u64,
         stage: &'static str,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<ScanReadResult> {
         let mut input = File::open(path)?;
         let capacity = usize::try_from(expected_size).unwrap_or(0);
         let mut bytes = Vec::with_capacity(capacity);
@@ -403,7 +358,13 @@ impl ScanIoBatch {
         }
         input.read_to_end(&mut bytes)?;
         self.bytes = self.bytes.saturating_add(bytes.len() as u64);
-        Ok(bytes)
+        let content_hash_started = std::time::Instant::now();
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        Ok(ScanReadResult {
+            bytes,
+            content_hash,
+            content_hash_us: content_hash_started.elapsed().as_micros() as u64,
+        })
     }
 
     fn finish(&mut self) {
@@ -426,16 +387,71 @@ fn read_scan_file(
     controller: Option<&Arc<AdaptiveIoController>>,
     stage: &'static str,
     io_batch: &mut ScanIoBatch,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<ScanReadResult> {
     if expected_size <= SMALL_SCAN_MAX_BYTES {
         if controller.is_some() {
             return io_batch.read_small(path, expected_size, stage);
         }
     } else {
         io_batch.finish();
-        return read_file_adaptive(path, expected_size, controller, stage);
+        return read_file_adaptive_hashed(path, expected_size, controller, stage);
     }
-    Ok(fs::read(path)?)
+    let bytes = fs::read(path)?;
+    let content_hash_started = std::time::Instant::now();
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    Ok(ScanReadResult {
+        bytes,
+        content_hash,
+        content_hash_us: content_hash_started.elapsed().as_micros() as u64,
+    })
+}
+
+struct ScanReadResult {
+    bytes: Vec<u8>,
+    content_hash: [u8; 32],
+    content_hash_us: u64,
+}
+
+fn read_file_adaptive_hashed(
+    path: &Path,
+    expected_size: u64,
+    controller: Option<&Arc<AdaptiveIoController>>,
+    stage: &'static str,
+) -> anyhow::Result<ScanReadResult> {
+    let Some(controller) = controller else {
+        let bytes = fs::read(path)?;
+        let content_hash_started = std::time::Instant::now();
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        return Ok(ScanReadResult {
+            bytes,
+            content_hash,
+            content_hash_us: content_hash_started.elapsed().as_micros() as u64,
+        });
+    };
+    let mut input = File::open(path)?;
+    let capacity = usize::try_from(expected_size).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut hasher = blake3::Hasher::new();
+    let mut content_hash_us = 0_u64;
+    loop {
+        let permit = controller.acquire(stage, IoDirection::Read, buffer.len() as u64);
+        let read = input.read(&mut buffer)?;
+        permit.finish_with_bytes(read as u64);
+        if read == 0 {
+            break;
+        }
+        let content_hash_started = std::time::Instant::now();
+        hasher.update(&buffer[..read]);
+        content_hash_us =
+            content_hash_us.saturating_add(content_hash_started.elapsed().as_micros() as u64);
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(ScanReadResult {
+        bytes,
+        content_hash: *hasher.finalize().as_bytes(),
+        content_hash_us,
+    })
 }
 
 pub(crate) fn read_file_adaptive(
