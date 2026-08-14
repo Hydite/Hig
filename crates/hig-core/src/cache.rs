@@ -3,7 +3,7 @@ use crate::crypto::{KdfParams, NONCE_LEN, SALT_LEN};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
@@ -191,7 +191,8 @@ pub struct CacheStore {
 
 struct ObjectPackWriter {
     file_name: String,
-    file: fs::File,
+    file: BufWriter<fs::File>,
+    next_offset: u64,
 }
 
 impl std::fmt::Debug for ObjectPackWriter {
@@ -1303,37 +1304,60 @@ impl CacheStore {
                 .read(true)
                 .append(true)
                 .open(&pack_path)?;
+            let next_offset = file.metadata()?.len();
             self.object_pack_writer = Some(ObjectPackWriter {
                 file_name: pack_file,
-                file,
+                file: BufWriter::with_capacity(8 * 1024 * 1024, file),
+                next_offset,
             });
         }
+        let controller = self.io_controller.clone();
         let writer = self
             .object_pack_writer
             .as_mut()
             .expect("object pack writer initialized");
-        let offset = writer.file.seek(SeekFrom::End(0))?;
+        let offset = writer.next_offset;
         for chunk in payload.chunks(1024 * 1024) {
-            let permit = self.io_controller.as_ref().map(|controller| {
-                controller.acquire("cache-pack-write", IoDirection::Write, chunk.len() as u64)
-            });
+            let buffered_before = writer.file.buffer().len();
+            let will_flush = buffered_before.saturating_add(chunk.len()) >= writer.file.capacity();
+            let permit = if will_flush {
+                controller.as_ref().map(|controller| {
+                    controller.acquire(
+                        "cache-pack-write",
+                        IoDirection::Write,
+                        buffered_before.saturating_add(chunk.len()) as u64,
+                    )
+                })
+            } else {
+                None
+            };
             writer.file.write_all(chunk)?;
+            let buffered_after = writer.file.buffer().len();
             if let Some(permit) = permit {
-                permit.finish_with_bytes(chunk.len() as u64);
+                permit.finish_with_bytes(
+                    buffered_before
+                        .saturating_add(chunk.len())
+                        .saturating_sub(buffered_after) as u64,
+                );
             }
         }
+        writer.next_offset = writer
+            .next_offset
+            .checked_add(payload.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("cache object pack length overflow"))?;
         Ok((writer.file_name.clone(), offset))
     }
 
     fn flush_object_pack(&mut self) -> anyhow::Result<()> {
+        let controller = self.io_controller.clone();
         if let Some(writer) = self.object_pack_writer.as_mut() {
-            let permit = self
-                .io_controller
-                .as_ref()
-                .map(|controller| controller.acquire("cache-pack-flush", IoDirection::Write, 0));
+            let pending = writer.file.buffer().len() as u64;
+            let permit = controller.as_ref().map(|controller| {
+                controller.acquire("cache-pack-flush", IoDirection::Write, pending)
+            });
             writer.file.flush()?;
             if let Some(permit) = permit {
-                permit.finish_with_bytes(0);
+                permit.finish_with_bytes(pending);
             }
         }
         Ok(())
@@ -1932,6 +1956,24 @@ mod tests {
             "chunk",
             b"chunk-compressed".len() as u64,
             Some(chunk_location),
+        );
+        assert_eq!(
+            cache
+                .index
+                .objects
+                .get(&hex::encode(batch_key))
+                .unwrap()
+                .pack_offset,
+            Some(0)
+        );
+        assert_eq!(
+            cache
+                .index
+                .objects
+                .get(&hex::encode(chunk_key))
+                .unwrap()
+                .pack_offset,
+            Some(b"batch-compressed".len() as u64)
         );
         cache.save().unwrap();
 

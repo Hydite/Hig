@@ -457,14 +457,17 @@ pub(crate) fn read_file_adaptive(
         return Ok(bytes);
     }
     let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let permit = controller.acquire(stage, IoDirection::Read, buffer.len() as u64);
-        let read = input.read(&mut buffer)?;
+    let mut remaining = expected_size;
+    while remaining > 0 {
+        let requested = remaining.min(buffer.len() as u64) as usize;
+        let permit = controller.acquire(stage, IoDirection::Read, requested as u64);
+        let read = input.read(&mut buffer[..requested])?;
         permit.finish_with_bytes(read as u64);
         if read == 0 {
             break;
         }
         bytes.extend_from_slice(&buffer[..read]);
+        remaining = remaining.saturating_sub(read as u64);
     }
     Ok(bytes)
 }
