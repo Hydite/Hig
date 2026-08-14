@@ -387,8 +387,27 @@ fn read_scan_file(
         }
     } else {
         io_batch.finish();
+        return read_file_adaptive_whole(path, expected_size, controller, stage);
     }
     read_file_adaptive(path, expected_size, controller, stage)
+}
+
+fn read_file_adaptive_whole(
+    path: &Path,
+    expected_size: u64,
+    controller: Option<&Arc<AdaptiveIoController>>,
+    stage: &'static str,
+) -> anyhow::Result<Vec<u8>> {
+    let Some(controller) = controller else {
+        return Ok(fs::read(path)?);
+    };
+    let mut input = File::open(path)?;
+    let capacity = usize::try_from(expected_size).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    let permit = controller.acquire(stage, IoDirection::Read, expected_size);
+    input.read_to_end(&mut bytes)?;
+    permit.finish_with_bytes(bytes.len() as u64);
+    Ok(bytes)
 }
 
 pub(crate) fn read_file_adaptive(
