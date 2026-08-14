@@ -44,7 +44,7 @@ const report = {
 
 try {
   fs.mkdirSync(workRoot, { recursive: true });
-  if (options.mode === "ci") createSyntheticCorpus(corpus, policy.corpus);
+  if (options.mode === "ci" || options.generateCorpus) createSyntheticCorpus(corpus, policy.corpus);
   assert(fs.statSync(corpus).isDirectory(), `corpus is not a directory: ${corpus}`);
 
   const corpusDigest = digestTree(corpus);
@@ -428,7 +428,7 @@ function parseArguments(args) {
   const parsed = {
     mode: "ci", currentBin: null, v196Bin: null, v197Bin: null,
     v196Sha256: null, v197Sha256: null, corpus: null, workDir: null,
-    report: null, policy: null, requireQualified: false, selfTest: false
+    report: null, policy: null, requireQualified: false, selfTest: false, generateCorpus: false
   };
   const valueOptions = new Map([
     ["--mode", "mode"], ["--current-bin", "currentBin"], ["--v196-bin", "v196Bin"],
@@ -440,6 +440,7 @@ function parseArguments(args) {
     if (valueOptions.has(argument)) parsed[valueOptions.get(argument)] = args[++index];
     else if (argument === "--require-qualified") parsed.requireQualified = true;
     else if (argument === "--self-test") parsed.selfTest = true;
+    else if (argument === "--generate-corpus") parsed.generateCorpus = true;
     else throw new Error(`unknown argument: ${argument}`);
   }
   assert(["ci", "release"].includes(parsed.mode), "mode must be ci or release");

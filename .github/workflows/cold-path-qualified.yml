@@ -1,0 +1,57 @@
+name: HIG Qualified Cold-Path ABBA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cold-path-qualified-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-qualified-abba:
+    name: Qualified macOS ABBA
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Build current native CLI
+        run: cargo build --release -p hig-cli
+      - name: Extract retained v1.9.6 baseline
+        run: |
+          mkdir -p /tmp/hig-v196
+          tar -xzf artifacts/hig-v1.9.6-ide-mcp-macos-universal.tar.gz -C /tmp/hig-v196
+          chmod +x /tmp/hig-v196/hig-mcp-server/bin/hig
+      - name: Download retained v1.9.7 baseline
+        run: |
+          curl --fail --location \
+            --output /tmp/hig-v197 \
+            https://github.com/Hydite/Hig/releases/download/v1.10.0/hig-v1.9.7-baseline-macos-arm64
+          chmod +x /tmp/hig-v197
+      - name: Run qualified ABBA gate
+        run: >-
+          node scripts/cold-path-regression-test.mjs
+          --mode release
+          --generate-corpus
+          --require-qualified
+          --current-bin target/release/hig
+          --v196-bin /tmp/hig-v196/hig-mcp-server/bin/hig
+          --v196-sha256 b9e1e90372b79a29892f60b1c1ca60faa1d783918ad6cd162b516909f3b3910e
+          --v197-bin /tmp/hig-v197
+          --v197-sha256 90f8d113de85d67bff292952b8e39838b1322a24cb7bd942214851aba86afe9a
+          --work-dir /tmp/hig-qualified-abba
+          --report artifacts/cold-path-qualified-abba.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cold-path-qualified-abba-${{ github.sha }}
+          path: artifacts/cold-path-qualified-abba.json
+          if-no-files-found: error
