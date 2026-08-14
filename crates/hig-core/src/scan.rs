@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-const SMALL_SCAN_BATCH_FILES: usize = 8;
+const SMALL_SCAN_BATCH_FILES: usize = 4;
 const SMALL_SCAN_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -910,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_scan_batches_small_reads_into_one_sample() {
+    fn adaptive_scan_batches_small_reads_into_bounded_samples() {
         let temp = tempfile::tempdir().unwrap();
         for index in 0..8 {
             fs::write(
@@ -935,7 +935,10 @@ mod tests {
         let adaptive = controller.report();
         let stage = adaptive.stages.get("scan-read").unwrap();
         assert_eq!(stage.bytes, 8 * 4096);
-        assert_eq!(stage.samples, 1);
+        assert_eq!(
+            stage.samples as usize,
+            8_usize.div_ceil(SMALL_SCAN_BATCH_FILES)
+        );
         assert_eq!(report.stats.hashed_files, 8);
     }
 }
