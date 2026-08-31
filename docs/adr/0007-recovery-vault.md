@@ -73,11 +73,12 @@ It is report-only by default.
   that share one failure domain cannot be recovered by hashes or indexes.
 
 Filesystem fidelity is part of the immutable repository object contract rather
-than a best-effort restore option. Current snapshots use file schema 6 and tree
-schema 5. They retain regular-file and symlink type, exact file bytes, directory
-structure, modification time, permission mode, hardlink identity, allocated
-sparse extents, Unix owner/group identity, managed extended attributes, and
-platform access-control metadata. Readers keep explicit decoders for every
+than a best-effort restore option. Current snapshots use file schema 7 and tree
+schema 6. They retain regular-file and file/directory-symlink type, exact file
+bytes, directory structure, modification time, permission mode, hardlink
+identity, allocated sparse extents, Unix owner/group identity, managed extended
+attributes, and platform access-control metadata. Readers keep explicit
+decoders for every
 earlier file and tree schema;
 missing fields in an older object mean that the older snapshot did not capture
 that property, not that the reader may synthesize it.
@@ -90,10 +91,13 @@ extended ACL text and user-managed xattrs, including resource forks. Linux
 stores raw POSIX access/default ACL xattrs and user-managed xattrs. Windows
 stores owner, primary group, DACL, and DACL inheritance protection. Windows SACL
 data is excluded because reading and applying audit policy requires privileges
-that ordinary IDE processes do not possess. Windows alternate data streams are
-not covered by this schema and therefore remain an open production-fidelity
-gate; the product must not claim complete NTFS stream recovery until that gate
-is implemented and proven natively.
+that ordinary IDE processes do not possess. Windows named `$DATA` streams are
+stored as canonical UTF-16 names, lengths, BLAKE3 digests, and ordinary
+content-addressed chunk references. They are restored for files and directories
+and require native Windows evidence before the production-fidelity gate closes.
+Streams attached to a reparse point itself are excluded because enumeration may
+follow the link target; silently assigning target streams to the link is
+prohibited.
 
 ## Alternatives Considered
 

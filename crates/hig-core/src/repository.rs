@@ -33,6 +33,8 @@ const MAX_EXTENDED_ATTRIBUTE_NAME_BYTES: usize = 1024;
 const MAX_EXTENDED_ATTRIBUTE_VALUE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXTENDED_ATTRIBUTES_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ACCESS_CONTROL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ALTERNATE_DATA_STREAMS: usize = 1024;
+const MAX_ALTERNATE_DATA_STREAM_NAME_UNITS: usize = 296;
 const REPOSITORY_WATCH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
 
 pub const DEFAULT_REPOSITORY_EXCLUDES: &[&str] = &[
@@ -552,6 +554,24 @@ struct FileObjectV6 {
     chunks: Vec<ChunkReference>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileObjectV7 {
+    schema: u16,
+    file_type: RepositoryFileType,
+    size: u64,
+    permissions: u32,
+    mtime_ns: i128,
+    content_hash: [u8; 32],
+    chunking_schema: u16,
+    hardlink_id: Option<[u8; 32]>,
+    allocated_extents: Option<Vec<FileExtent>>,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
+    ownership: Option<OwnershipMetadata>,
+    alternate_data_streams: Vec<AlternateDataStream>,
+    chunks: Vec<ChunkReference>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileObject {
     schema: u16,
@@ -566,6 +586,7 @@ struct FileObject {
     extended_attributes: Vec<ExtendedAttribute>,
     access_control: Option<AccessControlMetadata>,
     ownership: Option<OwnershipMetadata>,
+    alternate_data_streams: Vec<AlternateDataStream>,
     chunks: Vec<ChunkReference>,
 }
 
@@ -601,10 +622,26 @@ struct OwnershipMetadata {
     group_id: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AlternateDataStream {
+    name: Vec<u16>,
+    size: u64,
+    content_hash: [u8; 32],
+    chunks: Vec<ChunkReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedAlternateDataStream {
+    name: Vec<u16>,
+    content_hash: [u8; 32],
+    content: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 enum RepositoryFileType {
     Regular,
     Symlink,
+    SymlinkDirectory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,6 +708,18 @@ struct TreeObjectV5 {
     entries: Vec<TreeEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TreeObjectV6 {
+    schema: u16,
+    permissions: u32,
+    mtime_ns: i128,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
+    ownership: Option<OwnershipMetadata>,
+    alternate_data_streams: Vec<AlternateDataStream>,
+    entries: Vec<TreeEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TreeObject {
     metadata: Option<DirectoryMetadata>,
@@ -684,6 +733,7 @@ struct DirectoryMetadata {
     extended_attributes: Vec<ExtendedAttribute>,
     access_control: Option<AccessControlMetadata>,
     ownership: Option<OwnershipMetadata>,
+    alternate_data_streams: Vec<AlternateDataStream>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -784,7 +834,17 @@ struct SourceTreePaths {
 struct SourceDirectoryPath {
     path: PathBuf,
     relative: String,
-    metadata: DirectoryMetadata,
+    metadata: CapturedDirectoryMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedDirectoryMetadata {
+    permissions: u32,
+    mtime_ns: i128,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
+    ownership: Option<OwnershipMetadata>,
+    alternate_data_streams: Vec<CapturedAlternateDataStream>,
 }
 
 #[derive(Debug)]
@@ -835,6 +895,7 @@ struct StableSourceRead {
     allocated_extents: Option<Vec<FileExtent>>,
     extended_attributes: Vec<ExtendedAttribute>,
     access_control: Option<AccessControlMetadata>,
+    alternate_data_streams: Vec<CapturedAlternateDataStream>,
     fingerprint: FileFingerprint,
     hardlink_id: Option<[u8; 32]>,
 }
@@ -1229,27 +1290,23 @@ pub fn snapshot_repository(
         })?;
         let mut chunks = Vec::new();
         for extent in &stable.data_extents {
-            for bytes in repository_chunks(&extent.content, repository.config.chunking.schema) {
-                let (object_id, written, stored_bytes) =
-                    repository.put_raw(ObjectKind::Chunk, bytes)?;
-                if written {
-                    stats.objects_written += 1;
-                    stats.object_bytes_written += stored_bytes;
-                    stats.chunks_written += 1;
-                    stats.new_objects.push(object_id);
-                } else {
-                    stats.chunks_reused += 1;
-                }
-                chunks.push(ChunkReference {
-                    object_id,
-                    len: bytes.len() as u64,
-                });
-            }
+            chunks.extend(store_content_chunks(
+                &repository,
+                &extent.content,
+                &mut stats,
+            )?);
         }
+        let stream_bytes = stable
+            .alternate_data_streams
+            .iter()
+            .map(|stream| stream.content.len() as u64)
+            .sum::<u64>();
+        let alternate_data_streams =
+            store_alternate_data_streams(&repository, stable.alternate_data_streams, &mut stats)?;
         let (file_id, written, stored_bytes) = repository.put(
             ObjectKind::File,
-            &FileObjectV6 {
-                schema: 6,
+            &FileObjectV7 {
+                schema: 7,
                 file_type: source.file_type,
                 size: stable.logical_size,
                 permissions: stable.fingerprint.permissions,
@@ -1261,6 +1318,7 @@ pub fn snapshot_repository(
                 extended_attributes: stable.extended_attributes,
                 access_control: stable.access_control,
                 ownership: stable.fingerprint.ownership,
+                alternate_data_streams,
                 chunks,
             },
         )?;
@@ -1271,23 +1329,36 @@ pub fn snapshot_repository(
         }
         insert_file(&mut root_node, &relative, file_id)?;
         files += 1;
-        input_bytes += stable.logical_size;
+        input_bytes = input_bytes
+            .checked_add(stable.logical_size)
+            .and_then(|total| total.checked_add(stream_bytes))
+            .ok_or_else(|| anyhow::anyhow!("repository input byte count overflows"))?;
     }
 
     for directory in source_paths.directories {
-        let current = directory_metadata(&directory.path, &fs::symlink_metadata(&directory.path)?)
-            .with_context(|| {
-                format!(
-                    "failed to capture directory metadata: {}",
-                    directory.path.display()
-                )
-            })?;
+        let current =
+            capture_directory_metadata(&directory.path, &fs::symlink_metadata(&directory.path)?)
+                .with_context(|| {
+                    format!(
+                        "failed to capture directory metadata: {}",
+                        directory.path.display()
+                    )
+                })?;
         anyhow::ensure!(
             current == directory.metadata,
             "directory changed while creating repository snapshot: {}",
             directory.path.display()
         );
-        insert_directory(&mut root_node, &directory.relative, current)?;
+        let stream_bytes = current
+            .alternate_data_streams
+            .iter()
+            .map(|stream| stream.content.len() as u64)
+            .sum::<u64>();
+        let metadata = persist_directory_metadata(&repository, current, &mut stats)?;
+        input_bytes = input_bytes
+            .checked_add(stream_bytes)
+            .ok_or_else(|| anyhow::anyhow!("repository input byte count overflows"))?;
+        insert_directory(&mut root_node, &directory.relative, metadata)?;
     }
 
     let tree_id = write_tree(&repository, &root_node, &mut stats)?;
@@ -1563,7 +1634,7 @@ pub fn restore_repository(
                 } else {
                     safe_join(&stage, &directory.path)?
                 };
-                set_directory_metadata(&destination, metadata)?;
+                set_directory_metadata(&repository, &destination, metadata)?;
             }
         }
         anyhow::ensure!(
@@ -2196,7 +2267,7 @@ impl Repository {
                 paths.directories.push(SourceDirectoryPath {
                     path: entry.path().to_path_buf(),
                     relative,
-                    metadata: directory_metadata(
+                    metadata: capture_directory_metadata(
                         entry.path(),
                         &entry.metadata().with_context(|| {
                             format!(
@@ -2219,8 +2290,8 @@ impl Repository {
                 });
             } else if entry.file_type().is_symlink() {
                 paths.files.push(SourceFilePath {
+                    file_type: repository_symlink_type(entry.path())?,
                     path: entry.into_path(),
-                    file_type: RepositoryFileType::Symlink,
                 });
             }
         }
@@ -2705,13 +2776,14 @@ fn write_tree(
         .metadata
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("directory metadata is missing while writing tree"))?;
-    let tree = TreeObjectV5 {
-        schema: 5,
+    let tree = TreeObjectV6 {
+        schema: 6,
         permissions: metadata.permissions,
         mtime_ns: metadata.mtime_ns,
         extended_attributes: metadata.extended_attributes.clone(),
         access_control: metadata.access_control.clone(),
         ownership: metadata.ownership,
+        alternate_data_streams: metadata.alternate_data_streams.clone(),
         entries,
     };
     let (object_id, written, stored_bytes) = repository.put(ObjectKind::Tree, &tree)?;
@@ -2721,6 +2793,70 @@ fn write_tree(
         stats.new_objects.push(object_id);
     }
     Ok(object_id)
+}
+
+fn persist_directory_metadata(
+    repository: &Repository,
+    captured: CapturedDirectoryMetadata,
+    stats: &mut StoreStats,
+) -> anyhow::Result<DirectoryMetadata> {
+    Ok(DirectoryMetadata {
+        permissions: captured.permissions,
+        mtime_ns: captured.mtime_ns,
+        extended_attributes: captured.extended_attributes,
+        access_control: captured.access_control,
+        ownership: captured.ownership,
+        alternate_data_streams: store_alternate_data_streams(
+            repository,
+            captured.alternate_data_streams,
+            stats,
+        )?,
+    })
+}
+
+fn store_alternate_data_streams(
+    repository: &Repository,
+    captured: Vec<CapturedAlternateDataStream>,
+    stats: &mut StoreStats,
+) -> anyhow::Result<Vec<AlternateDataStream>> {
+    validate_captured_alternate_data_streams(&captured)?;
+    captured
+        .into_iter()
+        .map(|stream| {
+            let size = stream.content.len() as u64;
+            let chunks = store_content_chunks(repository, &stream.content, stats)?;
+            Ok(AlternateDataStream {
+                name: stream.name,
+                size,
+                content_hash: stream.content_hash,
+                chunks,
+            })
+        })
+        .collect()
+}
+
+fn store_content_chunks(
+    repository: &Repository,
+    content: &[u8],
+    stats: &mut StoreStats,
+) -> anyhow::Result<Vec<ChunkReference>> {
+    let mut chunks = Vec::new();
+    for bytes in repository_chunks(content, repository.config.chunking.schema) {
+        let (object_id, written, stored_bytes) = repository.put_raw(ObjectKind::Chunk, bytes)?;
+        if written {
+            stats.objects_written += 1;
+            stats.object_bytes_written += stored_bytes;
+            stats.chunks_written += 1;
+            stats.new_objects.push(object_id);
+        } else {
+            stats.chunks_reused += 1;
+        }
+        chunks.push(ChunkReference {
+            object_id,
+            len: bytes.len() as u64,
+        });
+    }
+    Ok(chunks)
 }
 
 fn insert_file(
@@ -2785,6 +2921,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 extended_attributes: Vec::new(),
                 access_control: None,
                 ownership: None,
+                alternate_data_streams: Vec::new(),
                 chunks: file.chunks,
             }
         }
@@ -2804,6 +2941,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 extended_attributes: Vec::new(),
                 access_control: None,
                 ownership: None,
+                alternate_data_streams: Vec::new(),
                 chunks: file.chunks,
             }
         }
@@ -2823,6 +2961,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 extended_attributes: Vec::new(),
                 access_control: None,
                 ownership: None,
+                alternate_data_streams: Vec::new(),
                 chunks: file.chunks,
             }
         }
@@ -2842,6 +2981,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 extended_attributes: file.extended_attributes,
                 access_control: None,
                 ownership: None,
+                alternate_data_streams: Vec::new(),
                 chunks: file.chunks,
             }
         }
@@ -2861,6 +3001,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 extended_attributes: file.extended_attributes,
                 access_control: file.access_control,
                 ownership: None,
+                alternate_data_streams: Vec::new(),
                 chunks: file.chunks,
             }
         }
@@ -2880,6 +3021,27 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 extended_attributes: file.extended_attributes,
                 access_control: file.access_control,
                 ownership: file.ownership,
+                alternate_data_streams: Vec::new(),
+                chunks: file.chunks,
+            }
+        }
+        7 => {
+            let file: FileObjectV7 = deserialize_canonical(raw)?;
+            anyhow::ensure!(file.schema == 7, "unsupported file object schema");
+            FileObject {
+                schema: file.schema,
+                file_type: file.file_type,
+                size: file.size,
+                permissions: file.permissions,
+                mtime_ns: file.mtime_ns,
+                content_hash: file.content_hash,
+                chunking_schema: file.chunking_schema,
+                hardlink_id: file.hardlink_id,
+                allocated_extents: file.allocated_extents,
+                extended_attributes: file.extended_attributes,
+                access_control: file.access_control,
+                ownership: file.ownership,
+                alternate_data_streams: file.alternate_data_streams,
                 chunks: file.chunks,
             }
         }
@@ -2893,8 +3055,17 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
         object.file_type == RepositoryFileType::Regular || object.allocated_extents.is_none(),
         "symbolic-link object cannot declare sparse extents"
     );
+    anyhow::ensure!(
+        object.schema >= 7 || object.file_type != RepositoryFileType::SymlinkDirectory,
+        "directory symbolic-link type requires file schema 7"
+    );
+    anyhow::ensure!(
+        object.file_type == RepositoryFileType::Regular || object.alternate_data_streams.is_empty(),
+        "symbolic-link object cannot declare alternate data streams"
+    );
     validate_extended_attributes(&object.extended_attributes)?;
     validate_access_control(object.access_control.as_ref())?;
+    validate_alternate_data_streams(&object.alternate_data_streams)?;
     let chunk_bytes = object.chunks.iter().try_fold(0_u64, |total, chunk| {
         total
             .checked_add(chunk.len)
@@ -2975,6 +3146,89 @@ fn validate_extended_attributes(attributes: &[ExtendedAttribute]) -> anyhow::Res
             "extended attributes exceed total size limit"
         );
     }
+    Ok(())
+}
+
+fn validate_captured_alternate_data_streams(
+    streams: &[CapturedAlternateDataStream],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        streams.len() <= MAX_ALTERNATE_DATA_STREAMS,
+        "too many alternate data streams"
+    );
+    let mut previous: Option<&[u16]> = None;
+    for stream in streams {
+        validate_alternate_data_stream_name(&stream.name)?;
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                previous < stream.name.as_slice(),
+                "alternate data streams are not canonical"
+            );
+        }
+        previous = Some(&stream.name);
+        anyhow::ensure!(
+            blake3::hash(&stream.content).as_bytes() == &stream.content_hash,
+            "captured alternate data stream checksum mismatch"
+        );
+    }
+    Ok(())
+}
+
+fn validate_alternate_data_streams(streams: &[AlternateDataStream]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        streams.len() <= MAX_ALTERNATE_DATA_STREAMS,
+        "too many alternate data streams"
+    );
+    let mut previous: Option<&[u16]> = None;
+    for stream in streams {
+        validate_alternate_data_stream_name(&stream.name)?;
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                previous < stream.name.as_slice(),
+                "alternate data streams are not canonical"
+            );
+        }
+        previous = Some(&stream.name);
+        let chunk_bytes = stream.chunks.iter().try_fold(0_u64, |total, chunk| {
+            total
+                .checked_add(chunk.len)
+                .ok_or_else(|| anyhow::anyhow!("alternate data stream length overflows"))
+        })?;
+        anyhow::ensure!(
+            chunk_bytes == stream.size,
+            "alternate data stream chunk lengths do not match its size"
+        );
+    }
+    Ok(())
+}
+
+fn validate_alternate_data_stream_name(name: &[u16]) -> anyhow::Result<()> {
+    const DATA_SUFFIX: &[u16] = &[
+        b':' as u16,
+        b'$' as u16,
+        b'D' as u16,
+        b'A' as u16,
+        b'T' as u16,
+        b'A' as u16,
+    ];
+    anyhow::ensure!(!name.is_empty(), "alternate data stream name is empty");
+    anyhow::ensure!(
+        name.len() <= MAX_ALTERNATE_DATA_STREAM_NAME_UNITS,
+        "alternate data stream name is too long"
+    );
+    anyhow::ensure!(
+        name[0] == b':' as u16,
+        "alternate data stream name is invalid"
+    );
+    anyhow::ensure!(
+        name.len() > DATA_SUFFIX.len() + 1 && name.ends_with(DATA_SUFFIX),
+        "alternate data stream type is not $DATA"
+    );
+    let body = &name[1..name.len() - DATA_SUFFIX.len()];
+    anyhow::ensure!(
+        !body.iter().any(|unit| matches!(*unit, 0 | 47 | 58 | 92)),
+        "alternate data stream name contains an unsafe character"
+    );
     Ok(())
 }
 
@@ -3080,6 +3334,7 @@ fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
                     extended_attributes: Vec::new(),
                     access_control: None,
                     ownership: None,
+                    alternate_data_streams: Vec::new(),
                 }),
                 entries: tree.entries,
             })
@@ -3095,6 +3350,7 @@ fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
                     extended_attributes: tree.extended_attributes,
                     access_control: None,
                     ownership: None,
+                    alternate_data_streams: Vec::new(),
                 }),
                 entries: tree.entries,
             })
@@ -3111,6 +3367,7 @@ fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
                     extended_attributes: tree.extended_attributes,
                     access_control: tree.access_control,
                     ownership: None,
+                    alternate_data_streams: Vec::new(),
                 }),
                 entries: tree.entries,
             })
@@ -3127,6 +3384,25 @@ fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
                     extended_attributes: tree.extended_attributes,
                     access_control: tree.access_control,
                     ownership: tree.ownership,
+                    alternate_data_streams: Vec::new(),
+                }),
+                entries: tree.entries,
+            })
+        }
+        6 => {
+            let tree: TreeObjectV6 = deserialize_canonical(raw)?;
+            anyhow::ensure!(tree.schema == 6, "unsupported tree schema");
+            validate_extended_attributes(&tree.extended_attributes)?;
+            validate_access_control(tree.access_control.as_ref())?;
+            validate_alternate_data_streams(&tree.alternate_data_streams)?;
+            Ok(TreeObject {
+                metadata: Some(DirectoryMetadata {
+                    permissions: tree.permissions,
+                    mtime_ns: tree.mtime_ns,
+                    extended_attributes: tree.extended_attributes,
+                    access_control: tree.access_control,
+                    ownership: tree.ownership,
+                    alternate_data_streams: tree.alternate_data_streams,
                 }),
                 entries: tree.entries,
             })
@@ -3264,9 +3540,9 @@ fn tree_directories_entries_at(
 }
 
 fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyhow::Result<()> {
-    if state.object.file_type == RepositoryFileType::Symlink {
+    if state.object.file_type != RepositoryFileType::Regular {
         let target = reconstruct_file_bytes(repository, state)?;
-        create_symlink(&target, path)?;
+        create_symlink(&target, path, state.object.file_type)?;
         restore_ownership(path, state.object.ownership)?;
         restore_extended_attributes(path, &state.object.extended_attributes)?;
         restore_access_control(
@@ -3316,6 +3592,7 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
         verify_restored_sparse_layout(&file, state.object.size, extents)?;
     }
     restore_ownership(path, state.object.ownership)?;
+    restore_alternate_data_streams(repository, path, &state.object.alternate_data_streams)?;
     restore_extended_attributes(path, &state.object.extended_attributes)?;
     set_permissions(path, state.object.permissions)?;
     restore_access_control(
@@ -3609,7 +3886,9 @@ fn build_indexed_changes(
                     || left.object.allocated_extents != right.object.allocated_extents
                     || left.object.extended_attributes != right.object.extended_attributes
                     || left.object.access_control != right.object.access_control
-                    || left.object.ownership != right.object.ownership =>
+                    || left.object.ownership != right.object.ownership
+                    || left.object.alternate_data_streams
+                        != right.object.alternate_data_streams =>
             {
                 (RepositoryChangeKind::Metadata, None, Vec::new())
             }
@@ -3695,6 +3974,13 @@ fn build_compression_tree_index(
             .object
             .chunks
             .iter()
+            .chain(
+                state
+                    .object
+                    .alternate_data_streams
+                    .iter()
+                    .flat_map(|stream| stream.chunks.iter()),
+            )
             .map(|chunk| chunk.object_id)
             .collect::<BTreeSet<_>>();
         let mut stored_object_bytes = repository.stored_object_size(state.object_id)?;
@@ -3704,13 +3990,45 @@ fn build_compression_tree_index(
             stored_objects.insert(*chunk);
             global_chunks.insert(*chunk);
         }
-        raw_bytes += state.object.size;
-        chunks += state.object.chunks.len() as u64;
+        let path_stream_bytes =
+            state
+                .object
+                .alternate_data_streams
+                .iter()
+                .try_fold(0_u64, |total, stream| {
+                    total
+                        .checked_add(stream.size)
+                        .ok_or_else(|| anyhow::anyhow!("repository storage byte count overflows"))
+                })?;
+        let path_raw_bytes = state
+            .object
+            .size
+            .checked_add(path_stream_bytes)
+            .ok_or_else(|| anyhow::anyhow!("repository path byte count overflows"))?;
+        let stream_chunks =
+            state
+                .object
+                .alternate_data_streams
+                .iter()
+                .try_fold(0_u64, |total, stream| {
+                    total
+                        .checked_add(stream.chunks.len() as u64)
+                        .ok_or_else(|| anyhow::anyhow!("repository stream chunk count overflows"))
+                })?;
+        let path_chunks = (state.object.chunks.len() as u64)
+            .checked_add(stream_chunks)
+            .ok_or_else(|| anyhow::anyhow!("repository path chunk count overflows"))?;
+        raw_bytes = raw_bytes
+            .checked_add(path_raw_bytes)
+            .ok_or_else(|| anyhow::anyhow!("repository storage byte count overflows"))?;
+        chunks = chunks
+            .checked_add(path_chunks)
+            .ok_or_else(|| anyhow::anyhow!("repository storage chunk count overflows"))?;
         paths.push(RepositoryStoragePath {
             path: path.clone(),
             file_object: state.object_id,
-            raw_bytes: state.object.size,
-            chunks: state.object.chunks.len() as u64,
+            raw_bytes: path_raw_bytes,
+            chunks: path_chunks,
             unique_chunks: unique.len() as u64,
             stored_object_bytes,
         });
@@ -4308,13 +4626,31 @@ fn verify_reachable(
         ObjectKind::File => {
             report.files += 1;
             let file = deserialize_file_object(&raw)?;
-            for chunk in file.chunks {
+            verify_alternate_data_stream_contents(repository, &file.alternate_data_streams)?;
+            for chunk in file.chunks.into_iter().chain(
+                file.alternate_data_streams
+                    .into_iter()
+                    .flat_map(|stream| stream.chunks),
+            ) {
                 verify_reachable(repository, chunk.object_id, visited, report)?;
             }
         }
         ObjectKind::Tree => {
             report.trees += 1;
             let tree = deserialize_tree_object(&raw)?;
+            if let Some(metadata) = tree.metadata {
+                verify_alternate_data_stream_contents(
+                    repository,
+                    &metadata.alternate_data_streams,
+                )?;
+                for chunk in metadata
+                    .alternate_data_streams
+                    .into_iter()
+                    .flat_map(|stream| stream.chunks)
+                {
+                    verify_reachable(repository, chunk.object_id, visited, report)?;
+                }
+            }
             for entry in tree.entries {
                 verify_reachable(repository, entry.object_id, visited, report)?;
             }
@@ -4412,6 +4748,7 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
         let before_identity = source_file_identity(&file, &before_metadata)?;
         let before_attributes = read_extended_attributes(path)?;
         let before_access_control = read_access_control(path, AccessControlNodeKind::Regular)?;
+        let before_streams = read_alternate_data_streams(path)?;
         let before_ranges = allocated_file_extents(&file, before.size)?;
         let sparse_extents = before_ranges
             .as_ref()
@@ -4423,6 +4760,7 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
         let after_identity = source_file_identity(&file, &after_metadata)?;
         let after_attributes = read_extended_attributes(path)?;
         let after_access_control = read_access_control(path, AccessControlNodeKind::Regular)?;
+        let after_streams = read_alternate_data_streams(path)?;
         let after_ranges = allocated_file_extents(&file, after.size)?;
         let current_file = File::open(path)?;
         let current_metadata = current_file.metadata()?;
@@ -4430,6 +4768,7 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
         let current_identity = source_file_identity(&current_file, &current_metadata)?;
         let current_attributes = read_extended_attributes(path)?;
         let current_access_control = read_access_control(path, AccessControlNodeKind::Regular)?;
+        let current_streams = read_alternate_data_streams(path)?;
         let current_ranges = allocated_file_extents(&current_file, current.size)?;
         if before == after
             && after == current
@@ -4439,6 +4778,8 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
             && after_attributes == current_attributes
             && before_access_control == after_access_control
             && after_access_control == current_access_control
+            && before_streams == after_streams
+            && after_streams == current_streams
             && before_ranges == after_ranges
             && after_ranges == current_ranges
         {
@@ -4450,6 +4791,7 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
                 allocated_extents: sparse_extents,
                 extended_attributes: current_attributes,
                 access_control: current_access_control,
+                alternate_data_streams: current_streams,
                 fingerprint: current,
                 hardlink_id: current_identity.and_then(hardlink_id),
             });
@@ -4464,7 +4806,7 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
 fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<StableSourceRead> {
     match source.file_type {
         RepositoryFileType::Regular => stable_read(&source.path),
-        RepositoryFileType::Symlink => {
+        RepositoryFileType::Symlink | RepositoryFileType::SymlinkDirectory => {
             for _ in 0..3 {
                 let before = file_fingerprint(&fs::symlink_metadata(&source.path)?)?;
                 let before_attributes = read_extended_attributes(&source.path)?;
@@ -4491,6 +4833,7 @@ fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<StableSourceRea
                         allocated_extents: None,
                         extended_attributes: after_attributes,
                         access_control: after_access_control,
+                        alternate_data_streams: Vec::new(),
                         fingerprint: after,
                         hardlink_id: None,
                     });
@@ -4814,23 +5157,49 @@ fn symlink_target_bytes(target: &Path) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-fn create_symlink(target: &[u8], path: &Path) -> anyhow::Result<()> {
+#[cfg(windows)]
+fn repository_symlink_type(path: &Path) -> anyhow::Result<RepositoryFileType> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
+    let attributes = fs::symlink_metadata(path)?.file_attributes();
+    Ok(if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        RepositoryFileType::SymlinkDirectory
+    } else {
+        RepositoryFileType::Symlink
+    })
+}
+
+#[cfg(not(windows))]
+fn repository_symlink_type(_path: &Path) -> anyhow::Result<RepositoryFileType> {
+    Ok(RepositoryFileType::Symlink)
+}
+
+fn create_symlink(target: &[u8], path: &Path, file_type: RepositoryFileType) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::symlink;
 
+        let _ = file_type;
         symlink(PathBuf::from(OsString::from_vec(target.to_vec())), path)?;
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::symlink_file;
+        use std::os::windows::fs::{symlink_dir, symlink_file};
         let target = std::str::from_utf8(target)?;
-        symlink_file(target, path)?;
+        match file_type {
+            RepositoryFileType::Symlink => symlink_file(target, path)?,
+            RepositoryFileType::SymlinkDirectory => symlink_dir(target, path)?,
+            RepositoryFileType::Regular => anyhow::bail!("regular file cannot use symlink restore"),
+        }
     }
     #[cfg(not(any(unix, windows)))]
-    anyhow::bail!("symlink restore is not supported on this platform");
+    {
+        let _ = (target, path, file_type);
+        anyhow::bail!("symlink restore is not supported on this platform");
+    }
     Ok(())
 }
 
@@ -4843,9 +5212,12 @@ fn file_fingerprint(metadata: &fs::Metadata) -> anyhow::Result<FileFingerprint> 
     })
 }
 
-fn directory_metadata(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<DirectoryMetadata> {
+fn capture_directory_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> anyhow::Result<CapturedDirectoryMetadata> {
     anyhow::ensure!(metadata.is_dir(), "repository directory changed type");
-    Ok(DirectoryMetadata {
+    Ok(CapturedDirectoryMetadata {
         permissions: metadata_permissions(metadata),
         mtime_ns: metadata_modified_ns(metadata)?,
         extended_attributes: read_extended_attributes(path)
@@ -4853,6 +5225,8 @@ fn directory_metadata(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<Di
         access_control: read_access_control(path, AccessControlNodeKind::Directory)
             .context("failed to read directory ACL")?,
         ownership: metadata_ownership(metadata),
+        alternate_data_streams: read_alternate_data_streams(path)
+            .context("failed to read directory alternate data streams")?,
     })
 }
 
@@ -4889,6 +5263,268 @@ fn metadata_ownership(metadata: &fs::Metadata) -> Option<OwnershipMetadata> {
 #[cfg(not(unix))]
 fn metadata_ownership(_metadata: &fs::Metadata) -> Option<OwnershipMetadata> {
     None
+}
+
+#[cfg(not(windows))]
+fn read_alternate_data_streams(_path: &Path) -> anyhow::Result<Vec<CapturedAlternateDataStream>> {
+    Ok(Vec::new())
+}
+
+#[cfg(windows)]
+fn read_alternate_data_streams(path: &Path) -> anyhow::Result<Vec<CapturedAlternateDataStream>> {
+    windows_alternate_data_streams::read(path)
+}
+
+#[cfg(not(windows))]
+fn restore_alternate_data_streams(
+    _repository: &Repository,
+    _path: &Path,
+    expected: &[AlternateDataStream],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        expected.is_empty(),
+        "alternate data streams are not supported on this destination"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restore_alternate_data_streams(
+    repository: &Repository,
+    path: &Path,
+    expected: &[AlternateDataStream],
+) -> anyhow::Result<()> {
+    validate_alternate_data_streams(expected)?;
+    let expected = expected
+        .iter()
+        .map(|stream| {
+            Ok(CapturedAlternateDataStream {
+                name: stream.name.clone(),
+                content_hash: stream.content_hash,
+                content: reconstruct_alternate_data_stream(repository, stream)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    windows_alternate_data_streams::restore(path, &expected)
+}
+
+fn reconstruct_alternate_data_stream(
+    repository: &Repository,
+    stream: &AlternateDataStream,
+) -> anyhow::Result<Vec<u8>> {
+    let capacity: usize = stream
+        .size
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("alternate data stream is too large for this platform"))?;
+    let mut content = Vec::with_capacity(capacity);
+    for chunk in &stream.chunks {
+        let (kind, bytes) = repository.read_raw(chunk.object_id)?;
+        anyhow::ensure!(kind == ObjectKind::Chunk, "expected stream Chunk object");
+        anyhow::ensure!(
+            bytes.len() as u64 == chunk.len,
+            "alternate data stream chunk length mismatch"
+        );
+        content.extend_from_slice(&bytes);
+    }
+    anyhow::ensure!(
+        content.len() as u64 == stream.size,
+        "reconstructed alternate data stream length mismatch"
+    );
+    anyhow::ensure!(
+        blake3::hash(&content).as_bytes() == &stream.content_hash,
+        "reconstructed alternate data stream checksum mismatch"
+    );
+    Ok(content)
+}
+
+fn verify_alternate_data_stream_contents(
+    repository: &Repository,
+    streams: &[AlternateDataStream],
+) -> anyhow::Result<()> {
+    for stream in streams {
+        reconstruct_alternate_data_stream(repository, stream)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+mod windows_alternate_data_streams {
+    use super::{
+        CapturedAlternateDataStream, validate_alternate_data_stream_name,
+        validate_captured_alternate_data_streams,
+    };
+    use std::collections::BTreeSet;
+    use std::ffi::{OsStr, OsString};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
+        HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FindClose, FindFirstStreamW,
+        FindNextStreamW, FindStreamInfoStandard, WIN32_FIND_STREAM_DATA,
+    };
+
+    const DEFAULT_DATA_STREAM: &[u16] = &[
+        b':' as u16,
+        b':' as u16,
+        b'$' as u16,
+        b'D' as u16,
+        b'A' as u16,
+        b'T' as u16,
+        b'A' as u16,
+    ];
+
+    pub(super) fn read(path: &Path) -> anyhow::Result<Vec<CapturedAlternateDataStream>> {
+        let mut streams = Vec::new();
+        for (name, declared_size) in enumerate(path)? {
+            if name == DEFAULT_DATA_STREAM {
+                continue;
+            }
+            validate_alternate_data_stream_name(&name)?;
+            anyhow::ensure!(declared_size >= 0, "alternate data stream size is negative");
+            let mut file = open_stream(path, &name, false)?;
+            let mut content = Vec::new();
+            file.read_to_end(&mut content)?;
+            anyhow::ensure!(
+                content.len() as i64 == declared_size,
+                "alternate data stream changed while being read"
+            );
+            streams.push(CapturedAlternateDataStream {
+                name,
+                content_hash: *blake3::hash(&content).as_bytes(),
+                content,
+            });
+        }
+        streams.sort_by(|left, right| left.name.cmp(&right.name));
+        validate_captured_alternate_data_streams(&streams)?;
+        Ok(streams)
+    }
+
+    pub(super) fn restore(
+        path: &Path,
+        expected: &[CapturedAlternateDataStream],
+    ) -> anyhow::Result<()> {
+        validate_captured_alternate_data_streams(expected)?;
+        let expected_names = expected
+            .iter()
+            .map(|stream| stream.name.as_slice())
+            .collect::<BTreeSet<_>>();
+        for (name, _) in enumerate(path)? {
+            if name != DEFAULT_DATA_STREAM && !expected_names.contains(name.as_slice()) {
+                fs::remove_file(stream_path(path, &name))?;
+            }
+        }
+        for stream in expected {
+            let mut file = open_stream(path, &stream.name, true)?;
+            file.write_all(&stream.content)?;
+            file.sync_all()?;
+        }
+        anyhow::ensure!(
+            read(path)? == expected,
+            "restored alternate data streams failed exact verification"
+        );
+        Ok(())
+    }
+
+    fn enumerate(path: &Path) -> anyhow::Result<Vec<(Vec<u16>, i64)>> {
+        let path = wide_null(path.as_os_str());
+        let mut data = WIN32_FIND_STREAM_DATA::default();
+        let handle = unsafe {
+            FindFirstStreamW(
+                path.as_ptr(),
+                FindStreamInfoStandard,
+                (&mut data as *mut WIN32_FIND_STREAM_DATA).cast(),
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let error = std::io::Error::last_os_error();
+            if error
+                .raw_os_error()
+                .is_some_and(|code| no_stream_error(code as u32))
+            {
+                return Ok(Vec::new());
+            }
+            return Err(error.into());
+        }
+        let handle = FindStreamHandle(handle);
+        let mut streams = Vec::new();
+        loop {
+            streams.push((stream_name(&data)?, data.StreamSize));
+            data = WIN32_FIND_STREAM_DATA::default();
+            let next = unsafe {
+                FindNextStreamW(handle.0, (&mut data as *mut WIN32_FIND_STREAM_DATA).cast())
+            };
+            if next == 0 {
+                let error = std::io::Error::last_os_error();
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| end_of_stream_enumeration(code as u32))
+                {
+                    break;
+                }
+                return Err(error.into());
+            }
+        }
+        Ok(streams)
+    }
+
+    fn no_stream_error(code: u32) -> bool {
+        matches!(
+            code,
+            ERROR_HANDLE_EOF | ERROR_FILE_NOT_FOUND | ERROR_INVALID_PARAMETER
+        )
+    }
+
+    fn end_of_stream_enumeration(code: u32) -> bool {
+        matches!(code, ERROR_HANDLE_EOF | ERROR_NO_MORE_FILES)
+    }
+
+    fn stream_name(data: &WIN32_FIND_STREAM_DATA) -> anyhow::Result<Vec<u16>> {
+        let len = data
+            .cStreamName
+            .iter()
+            .position(|unit| *unit == 0)
+            .ok_or_else(|| anyhow::anyhow!("alternate data stream name is not terminated"))?;
+        anyhow::ensure!(len > 0, "alternate data stream name is empty");
+        Ok(data.cStreamName[..len].to_vec())
+    }
+
+    fn open_stream(path: &Path, name: &[u16], write: bool) -> anyhow::Result<File> {
+        let mut options = OpenOptions::new();
+        options
+            .read(!write)
+            .write(write)
+            .create(write)
+            .truncate(write)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        Ok(options.open(stream_path(path, name))?)
+    }
+
+    pub(super) fn stream_path(path: &Path, name: &[u16]) -> PathBuf {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.extend_from_slice(name);
+        PathBuf::from(OsString::from_wide(&wide))
+    }
+
+    fn wide_null(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(Some(0)).collect()
+    }
+
+    struct FindStreamHandle(HANDLE);
+
+    impl Drop for FindStreamHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = FindClose(self.0);
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -5498,8 +6134,13 @@ fn set_file_modified_time(file: &File, unix_ns: i128) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn set_directory_metadata(path: &Path, metadata: &DirectoryMetadata) -> anyhow::Result<()> {
+fn set_directory_metadata(
+    repository: &Repository,
+    path: &Path,
+    metadata: &DirectoryMetadata,
+) -> anyhow::Result<()> {
     restore_ownership(path, metadata.ownership)?;
+    restore_alternate_data_streams(repository, path, &metadata.alternate_data_streams)?;
     restore_extended_attributes(path, &metadata.extended_attributes)?;
     set_permissions(path, metadata.permissions)?;
     restore_access_control(
@@ -6075,8 +6716,9 @@ mod tests {
         set_directory_modified_time(&nested, nested_time).unwrap();
         set_directory_modified_time(temp.path(), root_time).unwrap();
         let expected_root =
-            directory_metadata(temp.path(), &fs::metadata(temp.path()).unwrap()).unwrap();
-        let expected_nested = directory_metadata(&nested, &fs::metadata(&nested).unwrap()).unwrap();
+            capture_directory_metadata(temp.path(), &fs::metadata(temp.path()).unwrap()).unwrap();
+        let expected_nested =
+            capture_directory_metadata(&nested, &fs::metadata(&nested).unwrap()).unwrap();
 
         snapshot_repository(temp.path(), "directory metadata".to_string(), None).unwrap();
         fs::remove_dir_all(temp.path().join("src")).unwrap();
@@ -6086,10 +6728,12 @@ mod tests {
         ));
         restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
 
-        let restored_root = directory_metadata(&output, &fs::metadata(&output).unwrap()).unwrap();
+        let restored_root =
+            capture_directory_metadata(&output, &fs::metadata(&output).unwrap()).unwrap();
         let restored_path = output.join("src/generated");
         let restored_nested =
-            directory_metadata(&restored_path, &fs::metadata(&restored_path).unwrap()).unwrap();
+            capture_directory_metadata(&restored_path, &fs::metadata(&restored_path).unwrap())
+                .unwrap();
         assert_eq!(restored_root.mtime_ns, expected_root.mtime_ns);
         assert_eq!(restored_nested.mtime_ns, expected_nested.mtime_ns);
         fs::remove_dir_all(output).unwrap();
@@ -6228,7 +6872,7 @@ mod tests {
             .read(snapshot.commit_id, ObjectKind::Commit)
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
-        assert_eq!(files["owned/payload.bin"].object.schema, 6);
+        assert_eq!(files["owned/payload.bin"].object.schema, 7);
         assert_eq!(files["owned/payload.bin"].object.ownership, expected_file);
         assert_eq!(files["owned/payload.link"].object.ownership, expected_link);
 
@@ -6274,7 +6918,7 @@ mod tests {
             .read(repository.read_head().unwrap().unwrap(), ObjectKind::Commit)
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
-        assert_eq!(files["original.bin"].object.schema, 6);
+        assert_eq!(files["original.bin"].object.schema, 7);
         assert!(files["original.bin"].object.hardlink_id.is_some());
         assert_eq!(
             files["original.bin"].object.hardlink_id,
@@ -6376,7 +7020,7 @@ mod tests {
             });
         }
         let root_metadata =
-            directory_metadata(temp.path(), &fs::metadata(temp.path()).unwrap()).unwrap();
+            capture_directory_metadata(temp.path(), &fs::metadata(temp.path()).unwrap()).unwrap();
         let tree = TreeObjectV2 {
             schema: 2,
             permissions: root_metadata.permissions,
@@ -6450,7 +7094,7 @@ mod tests {
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
         let state = &files["disk-image.bin"];
-        assert_eq!(state.object.schema, 6);
+        assert_eq!(state.object.schema, 7);
         assert_eq!(
             state.object.allocated_extents.as_deref(),
             Some(source_extents.as_slice())
@@ -6520,7 +7164,7 @@ mod tests {
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
         let state = &files["empty-volume.bin"];
-        assert_eq!(state.object.schema, 6);
+        assert_eq!(state.object.schema, 7);
         assert_eq!(state.object.allocated_extents, Some(Vec::new()));
         assert!(state.object.chunks.is_empty());
 
@@ -6592,7 +7236,7 @@ mod tests {
             .read(snapshot.commit_id, ObjectKind::Commit)
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
-        assert_eq!(files["metadata/payload.bin"].object.schema, 6);
+        assert_eq!(files["metadata/payload.bin"].object.schema, 7);
         assert_eq!(
             files["metadata/payload.bin"].object.extended_attributes,
             vec![ExtendedAttribute {
@@ -6704,7 +7348,7 @@ mod tests {
     }
 
     #[test]
-    fn previous_filesystem_metadata_schemas_decode_without_ownership() {
+    fn previous_filesystem_metadata_schemas_decode_missing_fields_explicitly() {
         let file = FileObjectV5 {
             schema: 5,
             file_type: RepositoryFileType::Regular,
@@ -6733,6 +7377,144 @@ mod tests {
         };
         let decoded_tree = deserialize_tree_object(&serialize_canonical(&tree).unwrap()).unwrap();
         assert_eq!(decoded_tree.metadata.unwrap().ownership, None);
+
+        let file = FileObjectV6 {
+            schema: 6,
+            file_type: RepositoryFileType::Regular,
+            size: 0,
+            permissions: 0o640,
+            mtime_ns: 789,
+            content_hash: *blake3::hash(&[]).as_bytes(),
+            chunking_schema: 2,
+            hardlink_id: None,
+            allocated_extents: None,
+            extended_attributes: Vec::new(),
+            access_control: None,
+            ownership: None,
+            chunks: Vec::new(),
+        };
+        let decoded_file = deserialize_file_object(&serialize_canonical(&file).unwrap()).unwrap();
+        assert_eq!(decoded_file.schema, 6);
+        assert!(decoded_file.alternate_data_streams.is_empty());
+
+        let tree = TreeObjectV5 {
+            schema: 5,
+            permissions: 0o750,
+            mtime_ns: 987,
+            extended_attributes: Vec::new(),
+            access_control: None,
+            ownership: None,
+            entries: Vec::new(),
+        };
+        let decoded_tree = deserialize_tree_object(&serialize_canonical(&tree).unwrap()).unwrap();
+        assert!(
+            decoded_tree
+                .metadata
+                .unwrap()
+                .alternate_data_streams
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unsafe_or_noncanonical_alternate_data_streams_are_rejected() {
+        let valid_name = ":valid:$DATA".encode_utf16().collect::<Vec<_>>();
+        let unsafe_name = ":../escape:$DATA".encode_utf16().collect::<Vec<_>>();
+        let empty_hash = *blake3::hash(&[]).as_bytes();
+        let unsafe_stream = AlternateDataStream {
+            name: unsafe_name,
+            size: 0,
+            content_hash: empty_hash,
+            chunks: Vec::new(),
+        };
+        assert!(
+            validate_alternate_data_streams(&[unsafe_stream])
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe character")
+        );
+        let duplicate = AlternateDataStream {
+            name: valid_name,
+            size: 0,
+            content_hash: empty_hash,
+            chunks: Vec::new(),
+        };
+        assert!(
+            validate_alternate_data_streams(&[duplicate.clone(), duplicate])
+                .unwrap_err()
+                .to_string()
+                .contains("not canonical")
+        );
+    }
+
+    #[test]
+    fn alternate_data_stream_checksum_mismatch_fails_verify_and_atomic_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        let stream_bytes = b"named stream";
+        let (chunk_id, _, _) = repository.put_raw(ObjectKind::Chunk, stream_bytes).unwrap();
+        let file = FileObjectV7 {
+            schema: 7,
+            file_type: RepositoryFileType::Regular,
+            size: 0,
+            permissions: 0o100644,
+            mtime_ns: 0,
+            content_hash: *blake3::hash(&[]).as_bytes(),
+            chunking_schema: 2,
+            hardlink_id: None,
+            allocated_extents: None,
+            extended_attributes: Vec::new(),
+            access_control: None,
+            ownership: None,
+            alternate_data_streams: vec![AlternateDataStream {
+                name: ":metadata:$DATA".encode_utf16().collect(),
+                size: stream_bytes.len() as u64,
+                content_hash: [0x5a; 32],
+                chunks: vec![ChunkReference {
+                    object_id: chunk_id,
+                    len: stream_bytes.len() as u64,
+                }],
+            }],
+            chunks: Vec::new(),
+        };
+        let (file_id, _, _) = repository.put(ObjectKind::File, &file).unwrap();
+        let tree = TreeObjectV1 {
+            schema: 1,
+            entries: vec![TreeEntry {
+                name: "payload.bin".to_string(),
+                kind: TreeEntryKind::File,
+                object_id: file_id,
+            }],
+        };
+        let (tree_id, _, _) = repository.put(ObjectKind::Tree, &tree).unwrap();
+        let commit = CommitObject {
+            schema: 1,
+            root_tree: tree_id,
+            parent: None,
+            created_unix_ns: now_unix_ns(),
+            message: "invalid ADS checksum".to_string(),
+            author: None,
+            files: 1,
+            input_bytes: stream_bytes.len() as u64,
+            change_index: None,
+            semantic_index: None,
+            compression_tree_index: None,
+        };
+        let (commit_id, _, _) = repository.put(ObjectKind::Commit, &commit).unwrap();
+        repository.publish_head(commit_id).unwrap();
+
+        let verify_error = verify_repository(temp.path()).unwrap_err().to_string();
+        assert!(verify_error.contains("stream checksum mismatch"));
+        let output = temp.path().parent().unwrap().join(format!(
+            "rejected-stream-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        let restore_error = restore_repository(temp.path(), "HEAD", &output, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(restore_error.contains("stream"));
+        assert!(!output.exists());
     }
 
     #[cfg(target_vendor = "apple")]
@@ -6939,6 +7721,165 @@ mod tests {
             read_access_control(&output.join("controlled"), AccessControlNodeKind::Directory,)
                 .unwrap(),
             Some(expected_directory)
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_alternate_data_streams_survive_source_deletion_for_file_and_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("streams");
+        let file = directory.join("payload.bin");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, b"default stream").unwrap();
+        let file_stream_name = ":hig-large:$DATA".encode_utf16().collect::<Vec<_>>();
+        let directory_stream_name = ":hig-directory:$DATA".encode_utf16().collect::<Vec<_>>();
+        let mut file_stream = (0..(2 * 1024 * 1024 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let directory_stream = b"directory stream metadata".to_vec();
+        fs::write(
+            windows_alternate_data_streams::stream_path(&file, &file_stream_name),
+            &file_stream,
+        )
+        .unwrap();
+        fs::write(
+            windows_alternate_data_streams::stream_path(&directory, &directory_stream_name),
+            &directory_stream,
+        )
+        .unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "Windows ADS".to_string(), None).unwrap();
+        file_stream[1024 * 1024 + 9] ^= 0xff;
+        fs::write(
+            windows_alternate_data_streams::stream_path(&file, &file_stream_name),
+            &file_stream,
+        )
+        .unwrap();
+        let snapshot =
+            snapshot_repository(temp.path(), "Windows ADS update".to_string(), None).unwrap();
+        let diff = repository_diff(
+            temp.path(),
+            Some(&first.commit_id.to_hex()),
+            Some(&snapshot.commit_id.to_hex()),
+        )
+        .unwrap();
+        assert_eq!(diff.metadata, 1);
+        assert_eq!(diff.modified, 0);
+        assert_eq!(diff.changes[0].path, "streams/payload.bin");
+        let expected_file_streams = read_alternate_data_streams(&file).unwrap();
+        let expected_directory_streams = read_alternate_data_streams(&directory).unwrap();
+
+        let repository = Repository::discover(temp.path()).unwrap();
+        let commit: CommitObject = repository
+            .read(snapshot.commit_id, ObjectKind::Commit)
+            .unwrap();
+        let files = flatten_tree(&repository, commit.root_tree).unwrap();
+        assert_eq!(files["streams/payload.bin"].object.schema, 7);
+        assert_eq!(
+            files["streams/payload.bin"].object.alternate_data_streams[0].size,
+            file_stream.len() as u64
+        );
+        let directories = tree_directories(&repository, commit.root_tree).unwrap();
+        let stored_directory = directories
+            .iter()
+            .find(|entry| entry.path == "streams")
+            .unwrap();
+        assert_eq!(
+            stored_directory
+                .metadata
+                .as_ref()
+                .unwrap()
+                .alternate_data_streams[0]
+                .size,
+            directory_stream.len() as u64
+        );
+        verify_repository(temp.path()).unwrap();
+
+        fs::remove_dir_all(&directory).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-windows-streams-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        assert_eq!(
+            read_alternate_data_streams(&output.join("streams/payload.bin")).unwrap(),
+            expected_file_streams
+        );
+        assert_eq!(
+            read_alternate_data_streams(&output.join("streams")).unwrap(),
+            expected_directory_streams
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_and_directory_symlink_types_survive_source_deletion() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target_file = temp.path().join("target.txt");
+        let target_directory = temp.path().join("target-directory");
+        let file_link = temp.path().join("file-link");
+        let directory_link = temp.path().join("directory-link");
+        fs::write(&target_file, b"target").unwrap();
+        fs::create_dir_all(&target_directory).unwrap();
+        symlink_file("target.txt", &file_link)
+            .expect("native Windows qualification requires symbolic-link support");
+        symlink_dir("target-directory", &directory_link)
+            .expect("native Windows qualification requires directory symbolic-link support");
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let snapshot =
+            snapshot_repository(temp.path(), "Windows symlink types".to_string(), None).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        let commit: CommitObject = repository
+            .read(snapshot.commit_id, ObjectKind::Commit)
+            .unwrap();
+        let files = flatten_tree(&repository, commit.root_tree).unwrap();
+        assert_eq!(
+            files["file-link"].object.file_type,
+            RepositoryFileType::Symlink
+        );
+        assert_eq!(
+            files["directory-link"].object.file_type,
+            RepositoryFileType::SymlinkDirectory
+        );
+
+        fs::remove_file(&file_link).unwrap();
+        fs::remove_dir(&directory_link).unwrap();
+        fs::remove_file(&target_file).unwrap();
+        fs::remove_dir_all(&target_directory).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-windows-links-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        assert!(
+            fs::symlink_metadata(output.join("file-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(output.join("directory-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::metadata(output.join("directory-link"))
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(
+            fs::read_link(output.join("file-link")).unwrap(),
+            Path::new("target.txt")
+        );
+        assert_eq!(
+            fs::read_link(output.join("directory-link")).unwrap(),
+            Path::new("target-directory")
         );
         fs::remove_dir_all(output).unwrap();
     }

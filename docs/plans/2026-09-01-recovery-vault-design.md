@@ -95,19 +95,19 @@ bytes are corruption and stop publication.
 
 ## Filesystem Fidelity Contract
 
-The repository wire format is append-only by schema. File schema 6 and tree
-schema 5 are the current writers; file schemas 1 through 5 and tree schemas 1
-through 4 remain explicit read paths. A newer reader never rewrites an old
+The repository wire format is append-only by schema. File schema 7 and tree
+schema 6 are the current writers; file schemas 1 through 6 and tree schemas 1
+through 5 remain explicit read paths. A newer reader never rewrites an old
 reachable object solely to upgrade its schema.
 
 | Property | macOS | Linux/Android | Windows |
 |---|---|---|---|
 | Exact regular-file bytes | Required and verified | Required and verified | Required and verified |
-| Directory and symlink identity | Required | Required | Required; native reparse tests required |
+| Directory and symlink identity | Required | Required | File/directory symlink type retained; native reparse tests required |
 | Mode/read-only and mtime | POSIX mode + mtime | POSIX mode + mtime | read-only + mtime |
 | Hardlinks | Stable file identity + restore verification | Stable file identity + restore verification | volume/file identity + restore verification |
 | Sparse allocation | `SEEK_DATA`/`SEEK_HOLE` when supported | `SEEK_DATA`/`SEEK_HOLE` when supported | allocated-range query + sparse restore |
-| Extended attributes | User-managed xattrs; resource forks included | User-managed xattrs | Not represented; NTFS ADS is an open gate |
+| Extended attributes and named streams | User-managed xattrs; resource forks included | User-managed xattrs | Named `$DATA` streams on files and directories use ordinary chunk objects |
 | ACL | Extended ACL text | Raw POSIX access/default ACL xattrs | Owner, group, DACL, inheritance protection |
 | Owner/group | Numeric UID/GID, exact or fail | Numeric UID/GID, exact or fail | Represented by security descriptor |
 | Audit ACL | Not a separate namespace | Not a separate namespace | SACL explicitly excluded from ordinary-user profile |
@@ -120,10 +120,13 @@ rejects any mismatch before atomic publication. System-managed macOS attributes
 ACL codec and cannot also appear as generic xattrs. Cross-family ACL conversion
 is prohibited because a lossy translation would violate exact recovery.
 
-The remaining platform-fidelity work is tracked rather than inferred: Windows
-alternate data streams, Windows directory-symlink typing, and native
-multi-platform fault/soak evidence must close before the
-completion matrix can be marked complete.
+Windows stream names are retained as canonical UTF-16 and confined to one base
+object: default streams, path separators, nested stream syntax, and non-`$DATA`
+stream types are rejected. Stream bytes are chunked, deduplicated, included in
+reachability/GC, and length- and BLAKE3-verified by repository verification and
+restore. Reparse-point streams are excluded rather than followed because target
+stream capture would violate object identity. Native multi-platform fault/soak
+evidence must still close before the completion matrix can be marked complete.
 
 ## Security Model
 
