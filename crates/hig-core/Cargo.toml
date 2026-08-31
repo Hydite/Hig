@@ -30,8 +30,11 @@ walkdir.workspace = true
 zstd.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+xattr.workspace = true
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Memory"] }
 
 [dev-dependencies]
 tempfile.workspace = true

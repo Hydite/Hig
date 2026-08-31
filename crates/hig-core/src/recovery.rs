@@ -290,17 +290,17 @@ pub fn default_recovery_vault_root() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let home = required_environment_path("HOME")?;
-        return Ok(home
+        Ok(home
             .join("Library")
             .join("Application Support")
             .join("HIG")
-            .join("recovery-vault"));
+            .join("recovery-vault"))
     }
     #[cfg(windows)]
     {
-        return Ok(required_environment_path("LOCALAPPDATA")?
+        Ok(required_environment_path("LOCALAPPDATA")?
             .join("HIG")
-            .join("recovery-vault"));
+            .join("recovery-vault"))
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use bincode::Options;
 use fastcdc::v2020::FastCDC;
 use fs2::FileExt;
@@ -27,6 +28,11 @@ const MICRO_CHUNK_TARGET_BYTES: usize = 64 * 1024;
 const MICRO_CHUNK_MAX_BYTES: usize = 256 * 1024;
 const MIN_REVISION_PREFIX: usize = 8;
 const SEMANTIC_PARSER_SCHEMA: u16 = 3;
+const MAX_EXTENDED_ATTRIBUTES: usize = 1024;
+const MAX_EXTENDED_ATTRIBUTE_NAME_BYTES: usize = 1024;
+const MAX_EXTENDED_ATTRIBUTE_VALUE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EXTENDED_ATTRIBUTES_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ACCESS_CONTROL_BYTES: usize = 4 * 1024 * 1024;
 const REPOSITORY_WATCH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
 
 pub const DEFAULT_REPOSITORY_EXCLUDES: &[&str] = &[
@@ -498,6 +504,37 @@ struct FileObjectV3 {
     chunks: Vec<ChunkReference>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileObjectV4 {
+    schema: u16,
+    file_type: RepositoryFileType,
+    size: u64,
+    permissions: u32,
+    mtime_ns: i128,
+    content_hash: [u8; 32],
+    chunking_schema: u16,
+    hardlink_id: Option<[u8; 32]>,
+    allocated_extents: Option<Vec<FileExtent>>,
+    extended_attributes: Vec<ExtendedAttribute>,
+    chunks: Vec<ChunkReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileObjectV5 {
+    schema: u16,
+    file_type: RepositoryFileType,
+    size: u64,
+    permissions: u32,
+    mtime_ns: i128,
+    content_hash: [u8; 32],
+    chunking_schema: u16,
+    hardlink_id: Option<[u8; 32]>,
+    allocated_extents: Option<Vec<FileExtent>>,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
+    chunks: Vec<ChunkReference>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileObject {
     schema: u16,
@@ -509,6 +546,8 @@ struct FileObject {
     chunking_schema: u16,
     hardlink_id: Option<[u8; 32]>,
     allocated_extents: Option<Vec<FileExtent>>,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
     chunks: Vec<ChunkReference>,
 }
 
@@ -518,9 +557,36 @@ struct FileExtent {
     len: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ExtendedAttribute {
+    name: Vec<u8>,
+    value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum AccessControlMetadata {
+    AppleExtended {
+        text: Vec<u8>,
+    },
+    LinuxPosix {
+        access: Option<Vec<u8>>,
+        default: Option<Vec<u8>>,
+    },
+    WindowsSecurityDescriptor {
+        sddl: Vec<u8>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 enum RepositoryFileType {
     Regular,
+    Symlink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessControlNodeKind {
+    Regular,
+    Directory,
     Symlink,
 }
 
@@ -551,16 +617,37 @@ struct TreeObjectV2 {
     entries: Vec<TreeEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TreeObjectV3 {
+    schema: u16,
+    permissions: u32,
+    mtime_ns: i128,
+    extended_attributes: Vec<ExtendedAttribute>,
+    entries: Vec<TreeEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TreeObjectV4 {
+    schema: u16,
+    permissions: u32,
+    mtime_ns: i128,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
+    entries: Vec<TreeEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TreeObject {
     metadata: Option<DirectoryMetadata>,
     entries: Vec<TreeEntry>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DirectoryMetadata {
     permissions: u32,
     mtime_ns: i128,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -709,6 +796,8 @@ struct StableSourceRead {
     content_hash: [u8; 32],
     data_extents: Vec<StableDataExtent>,
     allocated_extents: Option<Vec<FileExtent>>,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
     fingerprint: FileFingerprint,
     hardlink_id: Option<[u8; 32]>,
 }
@@ -1089,11 +1178,18 @@ pub fn snapshot_repository(
     let mut files = 0_u64;
     let mut input_bytes = 0_u64;
 
-    let source_paths = repository.source_tree_paths()?;
+    let source_paths = repository
+        .source_tree_paths()
+        .context("failed to enumerate repository source tree")?;
     for source in source_paths.files {
         let relative = source.path.strip_prefix(&repository.root)?;
         let relative = normalize_relative_path(relative)?;
-        let stable = stable_read_source(&source)?;
+        let stable = stable_read_source(&source).with_context(|| {
+            format!(
+                "failed to capture source metadata: {}",
+                source.path.display()
+            )
+        })?;
         let mut chunks = Vec::new();
         for extent in &stable.data_extents {
             for bytes in repository_chunks(&extent.content, repository.config.chunking.schema) {
@@ -1113,39 +1209,23 @@ pub fn snapshot_repository(
                 });
             }
         }
-        let (file_id, written, stored_bytes) =
-            if let Some(allocated_extents) = stable.allocated_extents {
-                repository.put(
-                    ObjectKind::File,
-                    &FileObjectV3 {
-                        schema: 3,
-                        file_type: source.file_type,
-                        size: stable.logical_size,
-                        permissions: stable.fingerprint.permissions,
-                        mtime_ns: stable.fingerprint.modified_ns,
-                        content_hash: stable.content_hash,
-                        chunking_schema: repository.config.chunking.schema,
-                        hardlink_id: stable.hardlink_id,
-                        allocated_extents,
-                        chunks,
-                    },
-                )?
-            } else {
-                repository.put(
-                    ObjectKind::File,
-                    &FileObjectV2 {
-                        schema: 2,
-                        file_type: source.file_type,
-                        size: stable.logical_size,
-                        permissions: stable.fingerprint.permissions,
-                        mtime_ns: stable.fingerprint.modified_ns,
-                        content_hash: stable.content_hash,
-                        chunking_schema: repository.config.chunking.schema,
-                        hardlink_id: stable.hardlink_id,
-                        chunks,
-                    },
-                )?
-            };
+        let (file_id, written, stored_bytes) = repository.put(
+            ObjectKind::File,
+            &FileObjectV5 {
+                schema: 5,
+                file_type: source.file_type,
+                size: stable.logical_size,
+                permissions: stable.fingerprint.permissions,
+                mtime_ns: stable.fingerprint.modified_ns,
+                content_hash: stable.content_hash,
+                chunking_schema: repository.config.chunking.schema,
+                hardlink_id: stable.hardlink_id,
+                allocated_extents: stable.allocated_extents,
+                extended_attributes: stable.extended_attributes,
+                access_control: stable.access_control,
+                chunks,
+            },
+        )?;
         if written {
             stats.objects_written += 1;
             stats.object_bytes_written += stored_bytes;
@@ -1157,7 +1237,13 @@ pub fn snapshot_repository(
     }
 
     for directory in source_paths.directories {
-        let current = directory_metadata(&fs::symlink_metadata(&directory.path)?)?;
+        let current = directory_metadata(&directory.path, &fs::symlink_metadata(&directory.path)?)
+            .with_context(|| {
+                format!(
+                    "failed to capture directory metadata: {}",
+                    directory.path.display()
+                )
+            })?;
         anyhow::ensure!(
             current == directory.metadata,
             "directory changed while creating repository snapshot: {}",
@@ -1425,7 +1511,7 @@ pub fn restore_repository(
             let should_restore = if directory.path.is_empty() {
                 selected.is_none()
             } else {
-                selected.as_ref().map_or(true, |selected| {
+                selected.as_ref().is_none_or(|selected| {
                     directory.path == *selected
                         || directory.path.starts_with(&format!("{selected}/"))
                 })
@@ -1433,7 +1519,7 @@ pub fn restore_repository(
             if !should_restore {
                 continue;
             }
-            if let Some(metadata) = directory.metadata {
+            if let Some(metadata) = &directory.metadata {
                 let destination = if directory.path.is_empty() {
                     stage.clone()
                 } else {
@@ -1935,7 +2021,7 @@ fn gc_repository_locked(
             repository.read_raw(*object_id)?.0 == ObjectKind::Commit,
             "repository ref does not point to a commit"
         );
-        verify_reachable(&repository, *object_id, &mut reachable, &mut verify)?;
+        verify_reachable(repository, *object_id, &mut reachable, &mut verify)?;
     }
     let objects = repository.list_objects()?;
     let total_bytes = objects.iter().map(|(_, _, bytes)| *bytes).sum();
@@ -2062,7 +2148,7 @@ impl Repository {
                         .unwrap_or(false)
             })
         {
-            let entry = entry?;
+            let entry = entry.context("failed to walk repository source entry")?;
             if entry.file_type().is_dir() {
                 let relative = if entry.path() == self.root {
                     String::new()
@@ -2072,7 +2158,21 @@ impl Repository {
                 paths.directories.push(SourceDirectoryPath {
                     path: entry.path().to_path_buf(),
                     relative,
-                    metadata: directory_metadata(&entry.metadata()?)?,
+                    metadata: directory_metadata(
+                        entry.path(),
+                        &entry.metadata().with_context(|| {
+                            format!(
+                                "failed to stat source directory: {}",
+                                entry.path().display()
+                            )
+                        })?,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to read source directory metadata: {}",
+                            entry.path().display()
+                        )
+                    })?,
                 });
             } else if entry.file_type().is_file() {
                 paths.files.push(SourceFilePath {
@@ -2565,11 +2665,14 @@ fn write_tree(
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     let metadata = node
         .metadata
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("directory metadata is missing while writing tree"))?;
-    let tree = TreeObjectV2 {
-        schema: 2,
+    let tree = TreeObjectV4 {
+        schema: 4,
         permissions: metadata.permissions,
         mtime_ns: metadata.mtime_ns,
+        extended_attributes: metadata.extended_attributes.clone(),
+        access_control: metadata.access_control.clone(),
         entries,
     };
     let (object_id, written, stored_bytes) = repository.put(ObjectKind::Tree, &tree)?;
@@ -2640,6 +2743,8 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 chunking_schema: file.chunking_schema,
                 hardlink_id: None,
                 allocated_extents: None,
+                extended_attributes: Vec::new(),
+                access_control: None,
                 chunks: file.chunks,
             }
         }
@@ -2656,6 +2761,8 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 chunking_schema: file.chunking_schema,
                 hardlink_id: file.hardlink_id,
                 allocated_extents: None,
+                extended_attributes: Vec::new(),
+                access_control: None,
                 chunks: file.chunks,
             }
         }
@@ -2672,6 +2779,44 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 chunking_schema: file.chunking_schema,
                 hardlink_id: file.hardlink_id,
                 allocated_extents: Some(file.allocated_extents),
+                extended_attributes: Vec::new(),
+                access_control: None,
+                chunks: file.chunks,
+            }
+        }
+        4 => {
+            let file: FileObjectV4 = deserialize_canonical(raw)?;
+            anyhow::ensure!(file.schema == 4, "unsupported file object schema");
+            FileObject {
+                schema: file.schema,
+                file_type: file.file_type,
+                size: file.size,
+                permissions: file.permissions,
+                mtime_ns: file.mtime_ns,
+                content_hash: file.content_hash,
+                chunking_schema: file.chunking_schema,
+                hardlink_id: file.hardlink_id,
+                allocated_extents: file.allocated_extents,
+                extended_attributes: file.extended_attributes,
+                access_control: None,
+                chunks: file.chunks,
+            }
+        }
+        5 => {
+            let file: FileObjectV5 = deserialize_canonical(raw)?;
+            anyhow::ensure!(file.schema == 5, "unsupported file object schema");
+            FileObject {
+                schema: file.schema,
+                file_type: file.file_type,
+                size: file.size,
+                permissions: file.permissions,
+                mtime_ns: file.mtime_ns,
+                content_hash: file.content_hash,
+                chunking_schema: file.chunking_schema,
+                hardlink_id: file.hardlink_id,
+                allocated_extents: file.allocated_extents,
+                extended_attributes: file.extended_attributes,
+                access_control: file.access_control,
                 chunks: file.chunks,
             }
         }
@@ -2685,6 +2830,8 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
         object.file_type == RepositoryFileType::Regular || object.allocated_extents.is_none(),
         "symbolic-link object cannot declare sparse extents"
     );
+    validate_extended_attributes(&object.extended_attributes)?;
+    validate_access_control(object.access_control.as_ref())?;
     let chunk_bytes = object.chunks.iter().try_fold(0_u64, |total, chunk| {
         total
             .checked_add(chunk.len)
@@ -2723,6 +2870,80 @@ fn validate_file_extents(size: u64, extents: &[FileExtent]) -> anyhow::Result<u6
         previous_end = end;
     }
     Ok(allocated)
+}
+
+fn validate_extended_attributes(attributes: &[ExtendedAttribute]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        attributes.len() <= MAX_EXTENDED_ATTRIBUTES,
+        "too many extended attributes"
+    );
+    let mut previous: Option<&[u8]> = None;
+    let mut total = 0_usize;
+    for attribute in attributes {
+        anyhow::ensure!(
+            !attribute.name.is_empty(),
+            "extended attribute name is empty"
+        );
+        anyhow::ensure!(
+            attribute.name.len() <= MAX_EXTENDED_ATTRIBUTE_NAME_BYTES,
+            "extended attribute name is too long"
+        );
+        anyhow::ensure!(
+            !attribute.name.contains(&0),
+            "extended attribute name contains NUL"
+        );
+        anyhow::ensure!(
+            attribute.value.len() <= MAX_EXTENDED_ATTRIBUTE_VALUE_BYTES,
+            "extended attribute value is too large"
+        );
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                previous < attribute.name.as_slice(),
+                "extended attributes are not canonical"
+            );
+        }
+        previous = Some(&attribute.name);
+        total = total
+            .checked_add(attribute.name.len())
+            .and_then(|value| value.checked_add(attribute.value.len()))
+            .ok_or_else(|| anyhow::anyhow!("extended attribute size overflows"))?;
+        anyhow::ensure!(
+            total <= MAX_EXTENDED_ATTRIBUTES_TOTAL_BYTES,
+            "extended attributes exceed total size limit"
+        );
+    }
+    Ok(())
+}
+
+fn validate_access_control(access_control: Option<&AccessControlMetadata>) -> anyhow::Result<()> {
+    match access_control {
+        None => Ok(()),
+        Some(AccessControlMetadata::AppleExtended { text }) => {
+            anyhow::ensure!(!text.is_empty(), "Apple ACL text is empty");
+            anyhow::ensure!(
+                text.len() <= MAX_ACCESS_CONTROL_BYTES,
+                "Apple ACL is too large"
+            );
+            anyhow::ensure!(!text.contains(&0), "Apple ACL text contains NUL");
+            Ok(())
+        }
+        Some(AccessControlMetadata::LinuxPosix { access, default }) => {
+            anyhow::ensure!(access.is_some() || default.is_some(), "Linux ACL is empty");
+            let total = access.as_ref().map_or(0, Vec::len) + default.as_ref().map_or(0, Vec::len);
+            anyhow::ensure!(total <= MAX_ACCESS_CONTROL_BYTES, "Linux ACL is too large");
+            Ok(())
+        }
+        Some(AccessControlMetadata::WindowsSecurityDescriptor { sddl }) => {
+            anyhow::ensure!(!sddl.is_empty(), "Windows security descriptor is empty");
+            anyhow::ensure!(
+                sddl.len() <= MAX_ACCESS_CONTROL_BYTES,
+                "Windows ACL is too large"
+            );
+            anyhow::ensure!(!sddl.contains(&0), "Windows SDDL contains NUL");
+            std::str::from_utf8(sddl)?;
+            Ok(())
+        }
+    }
 }
 
 fn validate_chunk_extent_mapping(
@@ -2793,6 +3014,37 @@ fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
                 metadata: Some(DirectoryMetadata {
                     permissions: tree.permissions,
                     mtime_ns: tree.mtime_ns,
+                    extended_attributes: Vec::new(),
+                    access_control: None,
+                }),
+                entries: tree.entries,
+            })
+        }
+        3 => {
+            let tree: TreeObjectV3 = deserialize_canonical(raw)?;
+            anyhow::ensure!(tree.schema == 3, "unsupported tree schema");
+            validate_extended_attributes(&tree.extended_attributes)?;
+            Ok(TreeObject {
+                metadata: Some(DirectoryMetadata {
+                    permissions: tree.permissions,
+                    mtime_ns: tree.mtime_ns,
+                    extended_attributes: tree.extended_attributes,
+                    access_control: None,
+                }),
+                entries: tree.entries,
+            })
+        }
+        4 => {
+            let tree: TreeObjectV4 = deserialize_canonical(raw)?;
+            anyhow::ensure!(tree.schema == 4, "unsupported tree schema");
+            validate_extended_attributes(&tree.extended_attributes)?;
+            validate_access_control(tree.access_control.as_ref())?;
+            Ok(TreeObject {
+                metadata: Some(DirectoryMetadata {
+                    permissions: tree.permissions,
+                    mtime_ns: tree.mtime_ns,
+                    extended_attributes: tree.extended_attributes,
+                    access_control: tree.access_control,
                 }),
                 entries: tree.entries,
             })
@@ -2933,6 +3185,12 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
     if state.object.file_type == RepositoryFileType::Symlink {
         let target = reconstruct_file_bytes(repository, state)?;
         create_symlink(&target, path)?;
+        restore_extended_attributes(path, &state.object.extended_attributes)?;
+        restore_access_control(
+            path,
+            AccessControlNodeKind::Symlink,
+            state.object.access_control.as_ref(),
+        )?;
         set_symlink_modified_time(path, state.object.mtime_ns)?;
         return Ok(());
     }
@@ -2974,8 +3232,18 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
     if let Some(extents) = &state.object.allocated_extents {
         verify_restored_sparse_layout(&file, state.object.size, extents)?;
     }
-    set_file_modified_time(&file, state.object.mtime_ns)?;
+    restore_extended_attributes(path, &state.object.extended_attributes)?;
     set_permissions(path, state.object.permissions)?;
+    restore_access_control(
+        path,
+        AccessControlNodeKind::Regular,
+        state.object.access_control.as_ref(),
+    )?;
+    anyhow::ensure!(
+        metadata_permissions(&fs::metadata(path)?) == state.object.permissions,
+        "restored file permissions changed while applying ACL"
+    );
+    set_file_modified_time(&file, state.object.mtime_ns)?;
     Ok(())
 }
 
@@ -3253,7 +3521,10 @@ fn build_indexed_changes(
             (Some(left), Some(right))
                 if left.object.permissions != right.object.permissions
                     || left.object.mtime_ns != right.object.mtime_ns
-                    || left.object.hardlink_id != right.object.hardlink_id =>
+                    || left.object.hardlink_id != right.object.hardlink_id
+                    || left.object.allocated_extents != right.object.allocated_extents
+                    || left.object.extended_attributes != right.object.extended_attributes
+                    || left.object.access_control != right.object.access_control =>
             {
                 (RepositoryChangeKind::Metadata, None, Vec::new())
             }
@@ -4054,6 +4325,8 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
         anyhow::ensure!(before_metadata.is_file(), "repository source changed type");
         let before = file_fingerprint(&before_metadata)?;
         let before_identity = source_file_identity(&file, &before_metadata)?;
+        let before_attributes = read_extended_attributes(path)?;
+        let before_access_control = read_access_control(path, AccessControlNodeKind::Regular)?;
         let before_ranges = allocated_file_extents(&file, before.size)?;
         let sparse_extents = before_ranges
             .as_ref()
@@ -4063,16 +4336,24 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
         let after_metadata = file.metadata()?;
         let after = file_fingerprint(&after_metadata)?;
         let after_identity = source_file_identity(&file, &after_metadata)?;
+        let after_attributes = read_extended_attributes(path)?;
+        let after_access_control = read_access_control(path, AccessControlNodeKind::Regular)?;
         let after_ranges = allocated_file_extents(&file, after.size)?;
         let current_file = File::open(path)?;
         let current_metadata = current_file.metadata()?;
         let current = file_fingerprint(&current_metadata)?;
         let current_identity = source_file_identity(&current_file, &current_metadata)?;
+        let current_attributes = read_extended_attributes(path)?;
+        let current_access_control = read_access_control(path, AccessControlNodeKind::Regular)?;
         let current_ranges = allocated_file_extents(&current_file, current.size)?;
         if before == after
             && after == current
             && before_identity == after_identity
             && after_identity == current_identity
+            && before_attributes == after_attributes
+            && after_attributes == current_attributes
+            && before_access_control == after_access_control
+            && after_access_control == current_access_control
             && before_ranges == after_ranges
             && after_ranges == current_ranges
         {
@@ -4082,6 +4363,8 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
                 content_hash,
                 data_extents,
                 allocated_extents: sparse_extents,
+                extended_attributes: current_attributes,
+                access_control: current_access_control,
                 fingerprint: current,
                 hardlink_id: current_identity.and_then(hardlink_id),
             });
@@ -4099,10 +4382,19 @@ fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<StableSourceRea
         RepositoryFileType::Symlink => {
             for _ in 0..3 {
                 let before = file_fingerprint(&fs::symlink_metadata(&source.path)?)?;
+                let before_attributes = read_extended_attributes(&source.path)?;
+                let before_access_control =
+                    read_access_control(&source.path, AccessControlNodeKind::Symlink)?;
                 let target = fs::read_link(&source.path)?;
                 let bytes = symlink_target_bytes(&target)?;
                 let after = file_fingerprint(&fs::symlink_metadata(&source.path)?)?;
-                if before == after {
+                let after_attributes = read_extended_attributes(&source.path)?;
+                let after_access_control =
+                    read_access_control(&source.path, AccessControlNodeKind::Symlink)?;
+                if before == after
+                    && before_attributes == after_attributes
+                    && before_access_control == after_access_control
+                {
                     let logical_size = bytes.len() as u64;
                     return Ok(StableSourceRead {
                         logical_size,
@@ -4112,6 +4404,8 @@ fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<StableSourceRea
                             content: bytes,
                         }],
                         allocated_extents: None,
+                        extended_attributes: after_attributes,
+                        access_control: after_access_control,
                         fingerprint: after,
                         hardlink_id: None,
                     });
@@ -4175,7 +4469,7 @@ fn hash_logical_data(logical_size: u64, data: &[StableDataExtent]) -> anyhow::Re
 }
 
 fn hash_zeroes(hasher: &mut blake3::Hasher, mut len: u64) {
-    const ZEROES: [u8; 64 * 1024] = [0; 64 * 1024];
+    static ZEROES: [u8; 64 * 1024] = [0; 64 * 1024];
     while len > 0 {
         let take = len.min(ZEROES.len() as u64) as usize;
         hasher.update(&ZEROES[..take]);
@@ -4463,11 +4757,15 @@ fn file_fingerprint(metadata: &fs::Metadata) -> anyhow::Result<FileFingerprint> 
     })
 }
 
-fn directory_metadata(metadata: &fs::Metadata) -> anyhow::Result<DirectoryMetadata> {
+fn directory_metadata(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<DirectoryMetadata> {
     anyhow::ensure!(metadata.is_dir(), "repository directory changed type");
     Ok(DirectoryMetadata {
         permissions: metadata_permissions(metadata),
         mtime_ns: metadata_modified_ns(metadata)?,
+        extended_attributes: read_extended_attributes(path)
+            .context("failed to read directory extended attributes")?,
+        access_control: read_access_control(path, AccessControlNodeKind::Directory)
+            .context("failed to read directory ACL")?,
     })
 }
 
@@ -4488,6 +4786,558 @@ fn metadata_permissions(metadata: &fs::Metadata) -> u32 {
     #[cfg(not(unix))]
     {
         u32::from(metadata.permissions().readonly())
+    }
+}
+
+#[cfg(unix)]
+fn read_extended_attributes(path: &Path) -> anyhow::Result<Vec<ExtendedAttribute>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut attributes = Vec::new();
+    for name in xattr::list(path)? {
+        let name = name.as_bytes().to_vec();
+        if ignored_extended_attribute(&name) || access_control_attribute(&name) {
+            continue;
+        }
+        let value = xattr::get(path, std::ffi::OsStr::from_bytes(&name))?
+            .ok_or_else(|| anyhow::anyhow!("extended attribute disappeared during capture"))?;
+        attributes.push(ExtendedAttribute { name, value });
+    }
+    attributes.sort_by(|left, right| left.name.cmp(&right.name));
+    validate_extended_attributes(&attributes)?;
+    Ok(attributes)
+}
+
+#[cfg(not(unix))]
+fn read_extended_attributes(_path: &Path) -> anyhow::Result<Vec<ExtendedAttribute>> {
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn restore_extended_attributes(path: &Path, expected: &[ExtendedAttribute]) -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+    use std::os::unix::ffi::OsStrExt;
+
+    validate_extended_attributes(expected)?;
+    let expected_names = expected
+        .iter()
+        .map(|attribute| attribute.name.as_slice())
+        .collect::<BTreeSet<_>>();
+    for name in xattr::list(path)? {
+        let bytes = name.as_bytes();
+        if ignored_extended_attribute(bytes)
+            || access_control_attribute(bytes)
+            || expected_names.contains(bytes)
+        {
+            continue;
+        }
+        xattr::remove(path, &name)?;
+    }
+    for attribute in expected {
+        xattr::set(
+            path,
+            std::ffi::OsStr::from_bytes(&attribute.name),
+            &attribute.value,
+        )?;
+    }
+    anyhow::ensure!(
+        read_extended_attributes(path)? == expected,
+        "restored extended attributes failed exact verification"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restore_extended_attributes(_path: &Path, expected: &[ExtendedAttribute]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        expected.is_empty(),
+        "extended attributes are not supported on this platform"
+    );
+    Ok(())
+}
+
+fn ignored_extended_attribute(name: &[u8]) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        matches!(
+            name,
+            b"com.apple.provenance" | b"com.apple.macl" | b"com.apple.system.Security"
+        )
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+fn access_control_attribute(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"system.posix_acl_access" | b"system.posix_acl_default"
+    )
+}
+
+#[cfg(target_vendor = "apple")]
+fn read_access_control(
+    path: &Path,
+    kind: AccessControlNodeKind,
+) -> anyhow::Result<Option<AccessControlMetadata>> {
+    apple_access_control::read(path, kind)
+}
+
+#[cfg(target_vendor = "apple")]
+fn restore_access_control(
+    path: &Path,
+    kind: AccessControlNodeKind,
+    expected: Option<&AccessControlMetadata>,
+) -> anyhow::Result<()> {
+    apple_access_control::restore(path, kind, expected)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_access_control(
+    path: &Path,
+    kind: AccessControlNodeKind,
+) -> anyhow::Result<Option<AccessControlMetadata>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if kind == AccessControlNodeKind::Symlink {
+        return Ok(None);
+    }
+    let access = xattr::get(
+        path,
+        std::ffi::OsStr::from_bytes(b"system.posix_acl_access"),
+    )?;
+    let default = if kind == AccessControlNodeKind::Directory {
+        xattr::get(
+            path,
+            std::ffi::OsStr::from_bytes(b"system.posix_acl_default"),
+        )?
+    } else {
+        None
+    };
+    if access.is_none() && default.is_none() {
+        Ok(None)
+    } else {
+        let metadata = AccessControlMetadata::LinuxPosix { access, default };
+        validate_access_control(Some(&metadata))?;
+        Ok(Some(metadata))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn restore_access_control(
+    path: &Path,
+    kind: AccessControlNodeKind,
+    expected: Option<&AccessControlMetadata>,
+) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if kind == AccessControlNodeKind::Symlink {
+        anyhow::ensure!(
+            expected.is_none(),
+            "POSIX ACL cannot be applied to a symbolic link"
+        );
+        return Ok(());
+    }
+    let (expected_access, expected_default) = match expected {
+        None => (None, None),
+        Some(AccessControlMetadata::LinuxPosix { access, default }) => {
+            (access.as_deref(), default.as_deref())
+        }
+        Some(_) => anyhow::bail!("ACL platform does not match Linux destination"),
+    };
+    let access_name = std::ffi::OsStr::from_bytes(b"system.posix_acl_access");
+    let default_name = std::ffi::OsStr::from_bytes(b"system.posix_acl_default");
+    apply_linux_acl_attribute(path, access_name, expected_access)?;
+    if kind == AccessControlNodeKind::Directory {
+        apply_linux_acl_attribute(path, default_name, expected_default)?;
+    } else {
+        anyhow::ensure!(
+            expected_default.is_none(),
+            "default ACL requires a directory"
+        );
+    }
+    anyhow::ensure!(
+        read_access_control(path, kind)?.as_ref() == expected,
+        "restored Linux ACL failed exact verification"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn apply_linux_acl_attribute(
+    path: &Path,
+    name: &std::ffi::OsStr,
+    value: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    match value {
+        Some(value) => xattr::set(path, name, value)?,
+        None if xattr::get(path, name)?.is_some() => xattr::remove(path, name)?,
+        None => {}
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_access_control(
+    path: &Path,
+    _kind: AccessControlNodeKind,
+) -> anyhow::Result<Option<AccessControlMetadata>> {
+    windows_access_control::read(path).map(Some)
+}
+
+#[cfg(windows)]
+fn restore_access_control(
+    path: &Path,
+    _kind: AccessControlNodeKind,
+    expected: Option<&AccessControlMetadata>,
+) -> anyhow::Result<()> {
+    match expected {
+        Some(expected) => windows_access_control::restore(path, expected),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
+fn read_access_control(
+    _path: &Path,
+    _kind: AccessControlNodeKind,
+) -> anyhow::Result<Option<AccessControlMetadata>> {
+    Ok(None)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
+fn restore_access_control(
+    _path: &Path,
+    _kind: AccessControlNodeKind,
+    expected: Option<&AccessControlMetadata>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        expected.is_none(),
+        "ACL platform is not supported by this destination"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+mod windows_access_control {
+    use super::{AccessControlMetadata, MAX_ACCESS_CONTROL_BYTES, validate_access_control};
+    use std::fs::{File, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_DAC,
+        WRITE_OWNER,
+    };
+
+    const SECURITY_INFORMATION: u32 =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+
+    pub(super) fn read(path: &Path) -> anyhow::Result<AccessControlMetadata> {
+        let file = open_security_handle(path, READ_CONTROL)?;
+        let mut descriptor = null_mut();
+        let result = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result as i32).into());
+        }
+        let mut text = null_mut();
+        let mut text_len = 0_u32;
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                SECURITY_INFORMATION,
+                &mut text,
+                &mut text_len,
+            )
+        };
+        let descriptor_free = unsafe { LocalFree(descriptor) };
+        if converted == 0 {
+            anyhow::ensure!(
+                descriptor_free.is_null(),
+                "failed to release security descriptor"
+            );
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let text_len: usize = text_len.try_into()?;
+        if text_len > MAX_ACCESS_CONTROL_BYTES {
+            let text_free = unsafe { LocalFree(text.cast()) };
+            anyhow::ensure!(
+                descriptor_free.is_null(),
+                "failed to release security descriptor"
+            );
+            anyhow::ensure!(text_free.is_null(), "failed to release SDDL text");
+            anyhow::bail!("Windows security descriptor is too large");
+        }
+        let wide = unsafe { std::slice::from_raw_parts(text, text_len) };
+        let decoded = String::from_utf16(wide);
+        let text_free = unsafe { LocalFree(text.cast()) };
+        anyhow::ensure!(
+            descriptor_free.is_null(),
+            "failed to release security descriptor"
+        );
+        anyhow::ensure!(text_free.is_null(), "failed to release SDDL text");
+        let metadata = AccessControlMetadata::WindowsSecurityDescriptor {
+            sddl: decoded?.into_bytes(),
+        };
+        validate_access_control(Some(&metadata))?;
+        Ok(metadata)
+    }
+
+    pub(super) fn restore(path: &Path, expected: &AccessControlMetadata) -> anyhow::Result<()> {
+        let sddl = match expected {
+            AccessControlMetadata::WindowsSecurityDescriptor { sddl } => sddl,
+            _ => anyhow::bail!("ACL platform does not match Windows destination"),
+        };
+        let mut wide = std::str::from_utf8(sddl)?
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        wide.push(0);
+        let mut descriptor = null_mut();
+        let mut descriptor_size = 0_u32;
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                &mut descriptor_size,
+            )
+        };
+        if converted == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        anyhow::ensure!(
+            descriptor_size > 0,
+            "parsed Windows security descriptor is empty"
+        );
+        let result = apply_descriptor(path, descriptor);
+        let descriptor_free = unsafe { LocalFree(descriptor) };
+        anyhow::ensure!(
+            descriptor_free.is_null(),
+            "failed to release parsed security descriptor"
+        );
+        result?;
+        anyhow::ensure!(
+            read(path)? == *expected,
+            "restored Windows ACL failed exact verification"
+        );
+        Ok(())
+    }
+
+    fn apply_descriptor(
+        path: &Path,
+        descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    ) -> anyhow::Result<()> {
+        let file = open_security_handle(path, READ_CONTROL | WRITE_DAC | WRITE_OWNER)?;
+        let mut owner = null_mut();
+        let mut group = null_mut();
+        let mut dacl = null_mut();
+        let mut defaulted = 0;
+        let mut dacl_present = 0;
+        anyhow::ensure!(
+            unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) } != 0,
+            "stored Windows owner SID is invalid"
+        );
+        anyhow::ensure!(
+            unsafe { GetSecurityDescriptorGroup(descriptor, &mut group, &mut defaulted) } != 0,
+            "stored Windows group SID is invalid"
+        );
+        anyhow::ensure!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut dacl_present, &mut dacl, &mut defaulted)
+            } != 0,
+            "stored Windows DACL is invalid"
+        );
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        anyhow::ensure!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } != 0,
+            "stored Windows security descriptor control is invalid"
+        );
+        let mut information = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
+        if dacl_present != 0 {
+            information |= DACL_SECURITY_INFORMATION;
+            information |= if control & SE_DACL_PROTECTED != 0 {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
+        }
+        let result = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                information,
+                owner,
+                group,
+                dacl,
+                null_mut(),
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result as i32).into());
+        }
+        Ok(())
+    }
+
+    fn open_security_handle(path: &Path, access: u32) -> anyhow::Result<File> {
+        Ok(OpenOptions::new()
+            .access_mode(access)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?)
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+mod apple_access_control {
+    use super::{AccessControlMetadata, AccessControlNodeKind, MAX_ACCESS_CONTROL_BYTES};
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_get_file(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn acl_get_link_np(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn acl_set_file(path: *const c_char, kind: c_int, acl: *mut c_void) -> c_int;
+        fn acl_set_link_np(path: *const c_char, kind: c_int, acl: *mut c_void) -> c_int;
+        fn acl_to_text(acl: *mut c_void, len: *mut isize) -> *mut c_char;
+        fn acl_from_text(text: *const c_char) -> *mut c_void;
+        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_free(value: *mut c_void) -> c_int;
+    }
+
+    pub(super) fn read(
+        path: &Path,
+        kind: AccessControlNodeKind,
+    ) -> anyhow::Result<Option<AccessControlMetadata>> {
+        let path = CString::new(path.as_os_str().as_bytes())?;
+        let acl = unsafe {
+            match kind {
+                AccessControlNodeKind::Symlink => acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED),
+                AccessControlNodeKind::Regular | AccessControlNodeKind::Directory => {
+                    acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED)
+                }
+            }
+        };
+        if acl.is_null() {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) | Some(libc::ENOENT)
+            ) {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        let mut len = 0_isize;
+        let text = unsafe { acl_to_text(acl, &mut len) };
+        let acl_free_result = unsafe { acl_free(acl) };
+        if text.is_null() {
+            anyhow::ensure!(acl_free_result == 0, "failed to release captured ACL");
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if len < 0 || len as usize > MAX_ACCESS_CONTROL_BYTES {
+            let text_free_result = unsafe { acl_free(text.cast()) };
+            anyhow::ensure!(acl_free_result == 0, "failed to release captured ACL");
+            anyhow::ensure!(text_free_result == 0, "failed to release ACL text");
+            anyhow::bail!("Apple ACL text length is invalid");
+        }
+        let bytes = unsafe { CStr::from_ptr(text) }.to_bytes().to_vec();
+        let text_free_result = unsafe { acl_free(text.cast()) };
+        anyhow::ensure!(acl_free_result == 0, "failed to release captured ACL");
+        anyhow::ensure!(text_free_result == 0, "failed to release ACL text");
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            Ok(None)
+        } else {
+            Ok(Some(AccessControlMetadata::AppleExtended { text: bytes }))
+        }
+    }
+
+    pub(super) fn restore(
+        path: &Path,
+        kind: AccessControlNodeKind,
+        expected: Option<&AccessControlMetadata>,
+    ) -> anyhow::Result<()> {
+        let current = read(path, kind)?;
+        if current.as_ref() == expected {
+            return Ok(());
+        }
+        let acl = match expected {
+            Some(AccessControlMetadata::AppleExtended { text }) => {
+                let text = CString::new(text.as_slice())?;
+                let acl = unsafe { acl_from_text(text.as_ptr()) };
+                anyhow::ensure!(!acl.is_null(), "stored Apple ACL text is invalid");
+                acl
+            }
+            None => {
+                let acl = unsafe { acl_init(0) };
+                anyhow::ensure!(!acl.is_null(), "failed to allocate empty Apple ACL");
+                acl
+            }
+            Some(_) => anyhow::bail!("ACL platform does not match Apple destination"),
+        };
+        let original_path = path;
+        let path = CString::new(path.as_os_str().as_bytes())?;
+        let result = unsafe {
+            match kind {
+                AccessControlNodeKind::Symlink => {
+                    acl_set_link_np(path.as_ptr(), ACL_TYPE_EXTENDED, acl)
+                }
+                AccessControlNodeKind::Regular | AccessControlNodeKind::Directory => {
+                    acl_set_file(path.as_ptr(), ACL_TYPE_EXTENDED, acl)
+                }
+            }
+        };
+        let error = (result != 0).then(std::io::Error::last_os_error);
+        let free_result = unsafe { acl_free(acl) };
+        anyhow::ensure!(free_result == 0, "failed to release restored ACL");
+        if let Some(error) = error {
+            return Err(error.into());
+        }
+        anyhow::ensure!(
+            read(original_path, kind)?.as_ref() == expected,
+            "restored Apple ACL failed exact verification"
+        );
+        Ok(())
     }
 }
 
@@ -4512,9 +5362,19 @@ fn set_file_modified_time(file: &File, unix_ns: i128) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn set_directory_metadata(path: &Path, metadata: DirectoryMetadata) -> anyhow::Result<()> {
-    set_directory_modified_time(path, metadata.mtime_ns)?;
-    set_permissions(path, metadata.permissions)
+fn set_directory_metadata(path: &Path, metadata: &DirectoryMetadata) -> anyhow::Result<()> {
+    restore_extended_attributes(path, &metadata.extended_attributes)?;
+    set_permissions(path, metadata.permissions)?;
+    restore_access_control(
+        path,
+        AccessControlNodeKind::Directory,
+        metadata.access_control.as_ref(),
+    )?;
+    anyhow::ensure!(
+        metadata_permissions(&fs::metadata(path)?) == metadata.permissions,
+        "restored directory permissions changed while applying ACL"
+    );
+    set_directory_modified_time(path, metadata.mtime_ns)
 }
 
 #[cfg(unix)]
@@ -5077,8 +5937,9 @@ mod tests {
         let nested_time = 1_700_000_100_765_432_100;
         set_directory_modified_time(&nested, nested_time).unwrap();
         set_directory_modified_time(temp.path(), root_time).unwrap();
-        let expected_root = directory_metadata(&fs::metadata(temp.path()).unwrap()).unwrap();
-        let expected_nested = directory_metadata(&fs::metadata(&nested).unwrap()).unwrap();
+        let expected_root =
+            directory_metadata(temp.path(), &fs::metadata(temp.path()).unwrap()).unwrap();
+        let expected_nested = directory_metadata(&nested, &fs::metadata(&nested).unwrap()).unwrap();
 
         snapshot_repository(temp.path(), "directory metadata".to_string(), None).unwrap();
         fs::remove_dir_all(temp.path().join("src")).unwrap();
@@ -5088,9 +5949,10 @@ mod tests {
         ));
         restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
 
-        let restored_root = directory_metadata(&fs::metadata(&output).unwrap()).unwrap();
+        let restored_root = directory_metadata(&output, &fs::metadata(&output).unwrap()).unwrap();
+        let restored_path = output.join("src/generated");
         let restored_nested =
-            directory_metadata(&fs::metadata(output.join("src/generated")).unwrap()).unwrap();
+            directory_metadata(&restored_path, &fs::metadata(&restored_path).unwrap()).unwrap();
         assert_eq!(restored_root.mtime_ns, expected_root.mtime_ns);
         assert_eq!(restored_nested.mtime_ns, expected_nested.mtime_ns);
         fs::remove_dir_all(output).unwrap();
@@ -5221,7 +6083,7 @@ mod tests {
             .read(repository.read_head().unwrap().unwrap(), ObjectKind::Commit)
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
-        assert_eq!(files["original.bin"].object.schema, 2);
+        assert_eq!(files["original.bin"].object.schema, 5);
         assert!(files["original.bin"].object.hardlink_id.is_some());
         assert_eq!(
             files["original.bin"].object.hardlink_id,
@@ -5322,7 +6184,8 @@ mod tests {
                 object_id: file_id,
             });
         }
-        let root_metadata = directory_metadata(&fs::metadata(temp.path()).unwrap()).unwrap();
+        let root_metadata =
+            directory_metadata(temp.path(), &fs::metadata(temp.path()).unwrap()).unwrap();
         let tree = TreeObjectV2 {
             schema: 2,
             permissions: root_metadata.permissions,
@@ -5396,20 +6259,20 @@ mod tests {
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
         let state = &files["disk-image.bin"];
-        assert_eq!(state.object.schema, 3);
+        assert_eq!(state.object.schema, 5);
         assert_eq!(
             state.object.allocated_extents.as_deref(),
             Some(source_extents.as_slice())
         );
-        assert!(
-            state
-                .object
-                .chunks
-                .iter()
-                .map(|chunk| chunk.len)
-                .sum::<u64>()
-                < logical_size / 8
-        );
+        let stored_data_bytes = state
+            .object
+            .chunks
+            .iter()
+            .map(|chunk| chunk.len)
+            .sum::<u64>();
+        let allocated_data_bytes = validate_file_extents(logical_size, &source_extents).unwrap();
+        assert_eq!(stored_data_bytes, allocated_data_bytes);
+        assert!(stored_data_bytes < logical_size);
         let across_hole = reconstruct_file_range(
             &repository,
             state,
@@ -5466,7 +6329,7 @@ mod tests {
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
         let state = &files["empty-volume.bin"];
-        assert_eq!(state.object.schema, 3);
+        assert_eq!(state.object.schema, 5);
         assert_eq!(state.object.allocated_extents, Some(Vec::new()));
         assert!(state.object.chunks.is_empty());
 
@@ -5512,6 +6375,349 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("sparse extents overlap"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extended_attributes_survive_source_deletion_on_files_directories_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("metadata");
+        let file = directory.join("payload.bin");
+        let link = directory.join("payload.link");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, b"xattr payload").unwrap();
+        symlink("payload.bin", &link).unwrap();
+        xattr::set(temp.path(), "user.hig.root", b"root\0value").unwrap();
+        xattr::set(&directory, "user.hig.directory", &[0, 1, 2, 0xff]).unwrap();
+        xattr::set(&file, "user.hig.file", &[0xff, 0, 0x7f, 0x80]).unwrap();
+        xattr::set(&link, "user.hig.symlink", b"link attribute").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let snapshot = snapshot_repository(temp.path(), "xattrs".to_string(), None).unwrap();
+
+        let repository = Repository::discover(temp.path()).unwrap();
+        let commit: CommitObject = repository
+            .read(snapshot.commit_id, ObjectKind::Commit)
+            .unwrap();
+        let files = flatten_tree(&repository, commit.root_tree).unwrap();
+        assert_eq!(files["metadata/payload.bin"].object.schema, 5);
+        assert_eq!(
+            files["metadata/payload.bin"].object.extended_attributes,
+            vec![ExtendedAttribute {
+                name: b"user.hig.file".to_vec(),
+                value: vec![0xff, 0, 0x7f, 0x80],
+            }]
+        );
+        assert!(
+            files["metadata/payload.link"]
+                .object
+                .extended_attributes
+                .iter()
+                .any(|attribute| attribute.name == b"user.hig.symlink")
+        );
+        assert!(files.values().all(|state| {
+            state
+                .object
+                .extended_attributes
+                .iter()
+                .all(|attribute| attribute.name != b"com.apple.provenance")
+        }));
+
+        fs::remove_dir_all(&directory).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-xattrs-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        assert_eq!(
+            xattr::get(&output, "user.hig.root").unwrap().unwrap(),
+            b"root\0value"
+        );
+        assert_eq!(
+            xattr::get(output.join("metadata"), "user.hig.directory")
+                .unwrap()
+                .unwrap(),
+            [0, 1, 2, 0xff]
+        );
+        assert_eq!(
+            xattr::get(output.join("metadata/payload.bin"), "user.hig.file")
+                .unwrap()
+                .unwrap(),
+            [0xff, 0, 0x7f, 0x80]
+        );
+        assert_eq!(
+            xattr::get(output.join("metadata/payload.link"), "user.hig.symlink")
+                .unwrap()
+                .unwrap(),
+            b"link attribute"
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extended_attribute_change_is_versioned_as_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file.bin");
+        fs::write(&file, b"unchanged bytes").unwrap();
+        xattr::set(&file, "user.hig.version", b"one").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "first xattr".to_string(), None).unwrap();
+        xattr::set(&file, "user.hig.version", b"two").unwrap();
+        let second = snapshot_repository(temp.path(), "second xattr".to_string(), None).unwrap();
+
+        let diff = repository_diff(
+            temp.path(),
+            Some(&first.commit_id.to_hex()),
+            Some(&second.commit_id.to_hex()),
+        )
+        .unwrap();
+        assert_eq!(diff.metadata, 1);
+        assert_eq!(diff.changes[0].path, "file.bin");
+        assert_eq!(diff.changes[0].kind, RepositoryChangeKind::Metadata);
+        assert_eq!(
+            diff.changes[0].old_content_hash,
+            diff.changes[0].new_content_hash
+        );
+    }
+
+    #[test]
+    fn noncanonical_extended_attributes_are_rejected() {
+        let malformed = FileObjectV4 {
+            schema: 4,
+            file_type: RepositoryFileType::Regular,
+            size: 0,
+            permissions: 0,
+            mtime_ns: 0,
+            content_hash: *blake3::hash(&[]).as_bytes(),
+            chunking_schema: 2,
+            hardlink_id: None,
+            allocated_extents: None,
+            extended_attributes: vec![
+                ExtendedAttribute {
+                    name: b"user.z".to_vec(),
+                    value: vec![1],
+                },
+                ExtendedAttribute {
+                    name: b"user.a".to_vec(),
+                    value: vec![2],
+                },
+            ],
+            chunks: Vec::new(),
+        };
+        let error = deserialize_file_object(&serialize_canonical(&malformed).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("extended attributes are not canonical"));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_acl_survives_source_deletion_for_file_and_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("controlled");
+        let file = directory.join("document.txt");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, b"access controlled").unwrap();
+        let user = std::env::var("USER").unwrap();
+        let rule = format!("user:{user} allow read,write");
+        for path in [&directory, &file] {
+            let status = std::process::Command::new("chmod")
+                .arg("+a")
+                .arg(&rule)
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let expected_file = read_access_control(&file, AccessControlNodeKind::Regular)
+            .unwrap()
+            .expect("file ACL must be captured");
+        let expected_directory = read_access_control(&directory, AccessControlNodeKind::Directory)
+            .unwrap()
+            .expect("directory ACL must be captured");
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let snapshot = snapshot_repository(temp.path(), "Apple ACL".to_string(), None)
+            .unwrap_or_else(|error| panic!("Apple ACL snapshot failed: {error:#}"));
+
+        let repository = Repository::discover(temp.path()).unwrap();
+        let commit: CommitObject = repository
+            .read(snapshot.commit_id, ObjectKind::Commit)
+            .unwrap();
+        let files = flatten_tree(&repository, commit.root_tree).unwrap();
+        assert_eq!(
+            files["controlled/document.txt"].object.access_control,
+            Some(expected_file.clone())
+        );
+
+        fs::remove_dir_all(&directory).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-apple-acl-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        assert_eq!(
+            read_access_control(
+                &output.join("controlled/document.txt"),
+                AccessControlNodeKind::Regular,
+            )
+            .unwrap(),
+            Some(expected_file)
+        );
+        assert_eq!(
+            read_access_control(&output.join("controlled"), AccessControlNodeKind::Directory,)
+                .unwrap(),
+            Some(expected_directory)
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_acl_change_is_versioned_as_metadata_without_content_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("policy.txt");
+        fs::write(&file, b"stable content").unwrap();
+        let user = std::env::var("USER").unwrap();
+        let first_rule = format!("user:{user} allow read");
+        assert!(
+            std::process::Command::new("chmod")
+                .arg("+a")
+                .arg(&first_rule)
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success()
+        );
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "read ACL".to_string(), None).unwrap();
+        assert!(
+            std::process::Command::new("chmod")
+                .args(["-a#", "0"])
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let second_rule = format!("user:{user} allow read,write");
+        assert!(
+            std::process::Command::new("chmod")
+                .arg("+a")
+                .arg(&second_rule)
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let second = snapshot_repository(temp.path(), "read-write ACL".to_string(), None).unwrap();
+        let diff = repository_diff(
+            temp.path(),
+            Some(&first.commit_id.to_hex()),
+            Some(&second.commit_id.to_hex()),
+        )
+        .unwrap();
+        assert_eq!(diff.metadata, 1);
+        assert_eq!(diff.changes[0].path, "policy.txt");
+        assert_eq!(
+            diff.changes[0].old_content_hash,
+            diff.changes[0].new_content_hash
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_posix_acl_survives_source_deletion_for_file_and_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("controlled");
+        let file = directory.join("document.txt");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, b"access controlled").unwrap();
+        let user = std::env::var("USER").unwrap();
+        let access_rule = format!("u:{user}:rw");
+        let default_rule = format!("d:u:{user}:rwx");
+        assert!(
+            std::process::Command::new("setfacl")
+                .args(["-m", access_rule.as_str()])
+                .arg(&file)
+                .status()
+                .expect("setfacl is required for native ACL qualification")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("setfacl")
+                .args(["-m", default_rule.as_str()])
+                .arg(&directory)
+                .status()
+                .expect("setfacl is required for native ACL qualification")
+                .success()
+        );
+        let expected_file = read_access_control(&file, AccessControlNodeKind::Regular)
+            .unwrap()
+            .expect("file ACL must be captured");
+        let expected_directory = read_access_control(&directory, AccessControlNodeKind::Directory)
+            .unwrap()
+            .expect("directory ACL must be captured");
+        init_repository(temp.path(), Vec::new()).unwrap();
+        snapshot_repository(temp.path(), "Linux ACL".to_string(), None).unwrap();
+        fs::remove_dir_all(&directory).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-linux-acl-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        assert_eq!(
+            read_access_control(
+                &output.join("controlled/document.txt"),
+                AccessControlNodeKind::Regular,
+            )
+            .unwrap(),
+            Some(expected_file)
+        );
+        assert_eq!(
+            read_access_control(&output.join("controlled"), AccessControlNodeKind::Directory,)
+                .unwrap(),
+            Some(expected_directory)
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_group_and_dacl_survive_source_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("controlled");
+        let file = directory.join("document.txt");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, b"access controlled").unwrap();
+        let expected_file = read_access_control(&file, AccessControlNodeKind::Regular)
+            .unwrap()
+            .expect("file security descriptor must be captured");
+        let expected_directory = read_access_control(&directory, AccessControlNodeKind::Directory)
+            .unwrap()
+            .expect("directory security descriptor must be captured");
+        init_repository(temp.path(), Vec::new()).unwrap();
+        snapshot_repository(temp.path(), "Windows DACL".to_string(), None).unwrap();
+        fs::remove_dir_all(&directory).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-windows-acl-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        assert_eq!(
+            read_access_control(
+                &output.join("controlled/document.txt"),
+                AccessControlNodeKind::Regular,
+            )
+            .unwrap(),
+            Some(expected_file)
+        );
+        assert_eq!(
+            read_access_control(&output.join("controlled"), AccessControlNodeKind::Directory,)
+                .unwrap(),
+            Some(expected_directory)
+        );
+        fs::remove_dir_all(output).unwrap();
     }
 
     #[test]

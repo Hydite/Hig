@@ -93,6 +93,37 @@ bytes are corruption and stop publication.
 | Ransomware with user rights | Detection/audit helps; local writable copies are not sufficient |
 | Malicious object/path | Typed decoding, size limits, checksum, and path confinement fail closed |
 
+## Filesystem Fidelity Contract
+
+The repository wire format is append-only by schema. File schema 5 and tree
+schema 4 are the current writers; file schemas 1 through 4 and tree schemas 1
+through 3 remain explicit read paths. A newer reader never rewrites an old
+reachable object solely to upgrade its schema.
+
+| Property | macOS | Linux/Android | Windows |
+|---|---|---|---|
+| Exact regular-file bytes | Required and verified | Required and verified | Required and verified |
+| Directory and symlink identity | Required | Required | Required; native reparse tests required |
+| Mode/read-only and mtime | POSIX mode + mtime | POSIX mode + mtime | read-only + mtime |
+| Hardlinks | Stable file identity + restore verification | Stable file identity + restore verification | volume/file identity + restore verification |
+| Sparse allocation | `SEEK_DATA`/`SEEK_HOLE` when supported | `SEEK_DATA`/`SEEK_HOLE` when supported | allocated-range query + sparse restore |
+| Extended attributes | User-managed xattrs; resource forks included | User-managed xattrs | Not represented; NTFS ADS is an open gate |
+| ACL | Extended ACL text | Raw POSIX access/default ACL xattrs | Owner, group, DACL, inheritance protection |
+| Audit ACL | Not a separate namespace | Not a separate namespace | SACL explicitly excluded from ordinary-user profile |
+
+Capture sorts and bounds variable metadata before canonical serialization.
+Restore applies metadata only inside the staged destination, reads it back, and
+rejects any mismatch before atomic publication. System-managed macOS attributes
+(`com.apple.provenance`, `com.apple.macl`, and
+`com.apple.system.Security`) are not replayed. Linux ACL xattrs are owned by the
+ACL codec and cannot also appear as generic xattrs. Cross-family ACL conversion
+is prohibited because a lossy translation would violate exact recovery.
+
+The remaining platform-fidelity work is tracked rather than inferred: Unix
+owner/group policy, Windows alternate data streams, Windows directory-symlink
+typing, and native multi-platform fault/soak evidence must close before the
+completion matrix can be marked complete.
+
 ## Security Model
 
 The trust boundary includes the HIG process, vault configuration, and key
@@ -121,4 +152,3 @@ from routine logs.
 - multi-hour soak with repeated captures, deletions, restores, GC, restart, and
   digest comparison;
 - qualified performance comparison against v1.10 repository snapshot/restore.
-
