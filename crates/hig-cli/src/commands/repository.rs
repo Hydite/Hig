@@ -1,11 +1,12 @@
 use crate::cli::{RepositoryBranchCommand, RepositoryCommand, RepositoryTagCommand};
 use hig_core::{
-    RepositoryObjectId, RepositoryWatcher, create_repository_branch, create_repository_tag,
-    delete_repository_branch, delete_repository_tag, gc_repository, init_repository,
-    migrate_repository, repository_branch_names, repository_diff, repository_log,
-    repository_path_history, repository_refs, repository_storage_tree, repository_symbol_history,
-    repository_symbols, restore_repository, restore_repository_range, restore_repository_symbol,
-    snapshot_repository, switch_repository_branch, verify_repository,
+    RecoveryCaptureReport, RepositoryObjectId, RepositoryWatcher, capture_recovery_point,
+    create_repository_branch, create_repository_tag, delete_repository_branch,
+    delete_repository_tag, gc_repository, init_repository, migrate_repository,
+    repository_branch_names, repository_diff, repository_log, repository_path_history,
+    repository_refs, repository_storage_tree, repository_symbol_history, repository_symbols,
+    restore_repository, restore_repository_range, restore_repository_symbol, snapshot_repository,
+    switch_repository_branch, verify_repository,
 };
 use std::io::Read;
 use std::sync::{
@@ -357,6 +358,7 @@ pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
             author,
             catch_up,
             lifecycle_stdin,
+            recovery_vault,
             json,
         } => {
             anyhow::ensure!(debounce_ms > 0, "--debounce-ms must be greater than zero");
@@ -383,8 +385,9 @@ pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
             if catch_up {
                 let report =
                     snapshot_repository(&dir, format!("{message} (catch-up)"), author.clone())?;
-                if report.created {
-                    print_watcher_snapshot(&report, json)?;
+                let recovery = capture_watch_recovery(&dir, recovery_vault.as_deref())?;
+                if report.created || recovery.as_ref().is_some_and(|capture| capture.created) {
+                    print_watcher_snapshot(&report, recovery.as_ref(), json)?;
                 }
             }
             loop {
@@ -394,10 +397,11 @@ pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
                 {
                     break;
                 }
-                if let Some(report) = watcher.poll(&message, author.as_deref())?
-                    && report.created
-                {
-                    print_watcher_snapshot(&report, json)?;
+                if let Some(report) = watcher.poll(&message, author.as_deref())? {
+                    let recovery = capture_watch_recovery(&dir, recovery_vault.as_deref())?;
+                    if report.created || recovery.as_ref().is_some_and(|capture| capture.created) {
+                        print_watcher_snapshot(&report, recovery.as_ref(), json)?;
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -449,21 +453,42 @@ pub(crate) fn handle(command: RepositoryCommand) -> anyhow::Result<()> {
 
 fn print_watcher_snapshot(
     report: &hig_core::RepositorySnapshotReport,
+    recovery: Option<&RecoveryCaptureReport>,
     json: bool,
 ) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string(report)?);
+        let mut value = serde_json::to_value(report)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("repository watcher report must be a JSON object"))?;
+        object.insert("recovery".to_string(), serde_json::to_value(recovery)?);
+        println!("{}", serde_json::to_string(&value)?);
     } else {
         println!(
-            "repo: automatic-snapshot commit={} files={} bytes={} chunks_written={} chunks_reused={}",
+            "repo: automatic-snapshot commit={} files={} bytes={} chunks_written={} chunks_reused={} recovery_point={} durability={}",
             short_id(report.commit_id),
             report.files,
             report.input_bytes,
             report.chunks_written,
-            report.chunks_reused
+            report.chunks_reused,
+            recovery
+                .map(|capture| capture.recovery_point.recovery_point_id.as_str())
+                .unwrap_or("none"),
+            recovery
+                .map(|capture| format!("{:?}", capture.recovery_point.durability))
+                .unwrap_or_else(|| "none".to_string())
         );
     }
     Ok(())
+}
+
+fn capture_watch_recovery(
+    repository_root: &std::path::Path,
+    vault_root: Option<&std::path::Path>,
+) -> anyhow::Result<Option<RecoveryCaptureReport>> {
+    vault_root
+        .map(|vault| capture_recovery_point(repository_root, "HEAD", Some(vault)))
+        .transpose()
 }
 
 fn short_id(id: RepositoryObjectId) -> String {

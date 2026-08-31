@@ -188,7 +188,7 @@ try {
   await tool("hig_unpack", { archiveFile: archive, outputDir: unpacked });
   assert.equal(fs.readFileSync(path.join(unpacked, "src", "lib.rs"), "utf8"), fs.readFileSync(path.join(workspace, "src", "lib.rs"), "utf8"));
 
-  await tool("hig_repo_init", { dir: workspace });
+  const repositoryInitialized = await tool("hig_repo_init", { dir: workspace });
   const first = await tool("hig_repo_snapshot", { dir: workspace, message: "baseline", author: "mcp-ci" });
   assert.equal(first.data.created, true);
   await tool("hig_repo_branch_create", { dir: workspace, name: "feature/mcp" });
@@ -199,11 +199,15 @@ try {
   assert(refs.data.refs.some((entry) => entry.name === "mcp-baseline"));
   await tool("hig_repo_verify", { dir: workspace });
 
+  const recoveryVault = path.join(work, "recovery-vault");
+  await tool("hig_recovery_init", { vaultRoot: recoveryVault });
+
   const watchStarted = await tool("hig_repo_watch_start", {
     dir: workspace,
     debounceMs: 100,
     message: "MCP automatic snapshot",
-    author: "mcp-ci"
+    author: "mcp-ci",
+    recoveryVault
   });
   assert.equal(watchStarted.data.active, true);
   await new Promise((resolve) => setTimeout(resolve, 500));
@@ -211,9 +215,10 @@ try {
   fs.writeFileSync(path.join(workspace, "src", "lib.rs"), automaticContent);
   const watchStatus = await waitFor(async () => {
     const status = await tool("hig_repo_watch_status", { dir: workspace });
-    return status.data.snapshots >= 1 ? status : null;
+    return status.data.last_snapshot?.created === true ? status : null;
   }, 15000, "automatic repository snapshot");
   assert.equal(watchStatus.data.last_snapshot.created, true);
+  assert.equal(watchStatus.data.last_snapshot.recovery.recovery_point.durability, "captured");
   const watchStopped = await tool("hig_repo_watch_stop", { dir: workspace });
   assert.equal(watchStopped.data.active, false);
   await tool("hig_repo_verify", { dir: workspace });
@@ -224,7 +229,8 @@ try {
     dir: workspace,
     debounceMs: 100,
     message: "MCP restarted snapshot",
-    author: "mcp-ci"
+    author: "mcp-ci",
+    recoveryVault
   });
   assert.equal(restarted.data.active, true);
   const catchUp = await waitFor(async () => {
@@ -232,6 +238,7 @@ try {
     return status.data.snapshots >= 1 ? status : null;
   }, 15000, "repository catch-up snapshot");
   assert.equal(catchUp.data.last_snapshot.created, true);
+  assert(catchUp.data.last_snapshot.recovery.recovery_point.recovery_point_id);
   await tool("hig_repo_watch_stop", { dir: workspace });
   await tool("hig_repo_verify", { dir: workspace });
 
@@ -254,8 +261,6 @@ try {
   });
   assert.equal(fs.readFileSync(range, "utf8"), "fn");
 
-  const recoveryVault = path.join(work, "recovery-vault");
-  await tool("hig_recovery_init", { vaultRoot: recoveryVault });
   const registered = await tool("hig_recovery_register", {
     dir: workspace,
     vaultRoot: recoveryVault
@@ -268,6 +273,7 @@ try {
   assert.equal(captured.data.repository_id.length, 16);
   assert.equal(captured.data.recovery_point.durability, "captured");
   const repositoryId = Buffer.from(captured.data.repository_id).toString("hex");
+  assert.equal(repositoryId, Buffer.from(repositoryInitialized.data.repository_id).toString("hex"));
   assert.equal(repositoryId, Buffer.from(registered.data.repository_id).toString("hex"));
   const recoveryPointId = captured.data.recovery_point.recovery_point_id;
   const recoveryList = await tool("hig_recovery_list", { vaultRoot: recoveryVault });

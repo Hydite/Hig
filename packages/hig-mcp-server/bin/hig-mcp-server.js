@@ -283,7 +283,8 @@ const tools = [
       dir: pathProp("Repository root. Defaults to workspace root."),
       debounceMs: { type: "integer", minimum: 1, description: "Quiet period before snapshot. Defaults to 750 ms." },
       message: { type: "string", minLength: 1, description: "Automatic snapshot message." },
-      author: { type: "string", minLength: 1, description: "Optional author identity." }
+      author: { type: "string", minLength: 1, description: "Optional author identity." },
+      recoveryVault: pathProp("Optional existing or creatable Recovery Vault root for required automatic capture.")
     })
   },
   {
@@ -1060,26 +1061,36 @@ async function runHig(args, options = {}) {
 
 async function startRepositoryWatcher(args) {
   const root = resolveInputPath(args.dir || ".");
-  const existing = repositoryWatchers.get(root);
-  if (existing?.active) {
-    return watcherResult(existing, { reused: true });
-  }
-
-  const preflight = await runHig(["repo", "refs", root, "--json"], { parseJson: true });
-  if (preflight.code !== 0) return preflight;
-
   const debounceMs = args.debounceMs ?? 750;
   if (!Number.isInteger(debounceMs) || debounceMs < 1) {
     throw new Error("debounceMs must be an integer >= 1");
   }
   const message = args.message || "IDE automatic snapshot";
   const author = args.author || null;
+  const recoveryVault = args.recoveryVault ? resolveOutputPath(args.recoveryVault) : null;
+  const existing = repositoryWatchers.get(root);
+  if (existing?.active) {
+    if (
+      existing.debounceMs !== debounceMs
+      || existing.message !== message
+      || existing.author !== author
+      || existing.recoveryVault !== recoveryVault
+    ) {
+      throw new Error("repository watcher is already active with different policy or Recovery Vault settings");
+    }
+    return watcherResult(existing, { reused: true });
+  }
+
+  const preflight = await runHig(["repo", "refs", root, "--json"], { parseJson: true });
+  if (preflight.code !== 0) return preflight;
+
   const higBin = resolveHigBinary({ packageRoot });
   const command = [
     "repo", "watch", root,
     "--debounce-ms", String(debounceMs),
     "--message", message,
     ...(author ? ["--author", author] : []),
+    ...(recoveryVault ? ["--recovery-vault", recoveryVault] : []),
     "--catch-up", "true",
     "--lifecycle-stdin",
     "--json"
@@ -1098,6 +1109,7 @@ async function startRepositoryWatcher(args) {
     debounceMs,
     message,
     author,
+    recoveryVault,
     snapshots: 0,
     lastSnapshot: null,
     stdout: Buffer.alloc(0),
@@ -1179,6 +1191,7 @@ function watcherResult(watcher, overrides = {}) {
       debounce_ms: watcher.debounceMs,
       message: watcher.message,
       author: watcher.author,
+      recovery_vault: watcher.recoveryVault,
       snapshots: watcher.snapshots,
       last_snapshot: watcher.lastSnapshot,
       exit_code: watcher.exitCode,

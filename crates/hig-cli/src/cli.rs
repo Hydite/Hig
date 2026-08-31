@@ -421,6 +421,8 @@ pub(crate) enum RepositoryCommand {
         #[arg(long, hide = true)]
         lifecycle_stdin: bool,
         #[arg(long)]
+        recovery_vault: Option<PathBuf>,
+        #[arg(long)]
         json: bool,
     },
     Verify {

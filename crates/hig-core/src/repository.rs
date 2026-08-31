@@ -491,9 +491,29 @@ struct TreeEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct TreeObject {
+struct TreeObjectV1 {
     schema: u16,
     entries: Vec<TreeEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TreeObjectV2 {
+    schema: u16,
+    permissions: u32,
+    mtime_ns: i128,
+    entries: Vec<TreeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeObject {
+    metadata: Option<DirectoryMetadata>,
+    entries: Vec<TreeEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+struct DirectoryMetadata {
+    permissions: u32,
+    mtime_ns: i128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -570,6 +590,7 @@ struct SemanticHistoryRecord {
 
 #[derive(Debug, Default)]
 struct DirectoryNode {
+    metadata: Option<DirectoryMetadata>,
     files: BTreeMap<String, RepositoryObjectId>,
     directories: BTreeMap<String, DirectoryNode>,
 }
@@ -585,8 +606,15 @@ struct StoreStats {
 
 #[derive(Debug, Default)]
 struct SourceTreePaths {
-    directories: Vec<String>,
+    directories: Vec<SourceDirectoryPath>,
     files: Vec<SourceFilePath>,
+}
+
+#[derive(Debug)]
+struct SourceDirectoryPath {
+    path: PathBuf,
+    relative: String,
+    metadata: DirectoryMetadata,
 }
 
 #[derive(Debug)]
@@ -606,6 +634,12 @@ struct Repository {
 struct FileState {
     object_id: RepositoryObjectId,
     object: FileObject,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryState {
+    path: String,
+    metadata: Option<DirectoryMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -986,9 +1020,6 @@ pub fn snapshot_repository(
     let mut input_bytes = 0_u64;
 
     let source_paths = repository.source_tree_paths()?;
-    for directory in &source_paths.directories {
-        insert_directory(&mut root_node, directory)?;
-    }
     for source in source_paths.files {
         let relative = source.path.strip_prefix(&repository.root)?;
         let relative = normalize_relative_path(relative)?;
@@ -1029,6 +1060,16 @@ pub fn snapshot_repository(
         insert_file(&mut root_node, &relative, file_id)?;
         files += 1;
         input_bytes += content.len() as u64;
+    }
+
+    for directory in source_paths.directories {
+        let current = directory_metadata(&fs::symlink_metadata(&directory.path)?)?;
+        anyhow::ensure!(
+            current == directory.metadata,
+            "directory changed while creating repository snapshot: {}",
+            directory.path.display()
+        );
+        insert_directory(&mut root_node, &directory.relative, current)?;
     }
 
     let tree_id = write_tree(&repository, &root_node, &mut stats)?;
@@ -1238,19 +1279,22 @@ pub fn restore_repository(
         let mut restored_bytes = 0_u64;
         let mut selected_directory = false;
         for directory in &directories {
+            if directory.path.is_empty() {
+                continue;
+            }
             if let Some(selected) = &selected
-                && directory != selected
-                && !directory.starts_with(&format!("{selected}/"))
+                && directory.path != *selected
+                && !directory.path.starts_with(&format!("{selected}/"))
             {
                 continue;
             }
             if selected
                 .as_ref()
-                .is_some_and(|selected| selected == directory)
+                .is_some_and(|selected| selected == &directory.path)
             {
                 selected_directory = true;
             }
-            fs::create_dir_all(safe_join(&stage, directory)?)?;
+            fs::create_dir_all(safe_join(&stage, &directory.path)?)?;
         }
         for (path, state) in &files {
             if let Some(selected) = &selected
@@ -1266,6 +1310,27 @@ pub fn restore_repository(
             restore_file(&repository, state, &destination)?;
             restored_files += 1;
             restored_bytes += state.object.size;
+        }
+        for directory in directories.iter().rev() {
+            let should_restore = if directory.path.is_empty() {
+                selected.is_none()
+            } else {
+                selected.as_ref().map_or(true, |selected| {
+                    directory.path == *selected
+                        || directory.path.starts_with(&format!("{selected}/"))
+                })
+            };
+            if !should_restore {
+                continue;
+            }
+            if let Some(metadata) = directory.metadata {
+                let destination = if directory.path.is_empty() {
+                    stage.clone()
+                } else {
+                    safe_join(&stage, &directory.path)?
+                };
+                set_directory_metadata(&destination, metadata)?;
+            }
         }
         anyhow::ensure!(
             selected.is_none() || restored_files > 0 || selected_directory,
@@ -1883,13 +1948,17 @@ impl Repository {
             })
         {
             let entry = entry?;
-            if entry.path() == self.root {
-                continue;
-            }
             if entry.file_type().is_dir() {
-                paths.directories.push(normalize_relative_path(
-                    entry.path().strip_prefix(&self.root)?,
-                )?);
+                let relative = if entry.path() == self.root {
+                    String::new()
+                } else {
+                    normalize_relative_path(entry.path().strip_prefix(&self.root)?)?
+                };
+                paths.directories.push(SourceDirectoryPath {
+                    path: entry.path().to_path_buf(),
+                    relative,
+                    metadata: directory_metadata(&entry.metadata()?)?,
+                });
             } else if entry.file_type().is_file() {
                 paths.files.push(SourceFilePath {
                     path: entry.into_path(),
@@ -2379,7 +2448,15 @@ fn write_tree(
         });
     }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
-    let tree = TreeObject { schema: 1, entries };
+    let metadata = node
+        .metadata
+        .ok_or_else(|| anyhow::anyhow!("directory metadata is missing while writing tree"))?;
+    let tree = TreeObjectV2 {
+        schema: 2,
+        permissions: metadata.permissions,
+        mtime_ns: metadata.mtime_ns,
+        entries,
+    };
     let (object_id, written, stored_bytes) = repository.put(ObjectKind::Tree, &tree)?;
     if written {
         stats.objects_written += 1;
@@ -2411,14 +2488,60 @@ fn insert_file(
     Ok(())
 }
 
-fn insert_directory(root: &mut DirectoryNode, relative: &str) -> anyhow::Result<()> {
+fn insert_directory(
+    root: &mut DirectoryNode,
+    relative: &str,
+    metadata: DirectoryMetadata,
+) -> anyhow::Result<()> {
+    if relative.is_empty() {
+        anyhow::ensure!(root.metadata.is_none(), "duplicate root directory metadata");
+        root.metadata = Some(metadata);
+        return Ok(());
+    }
     let mut node = root;
     for directory in relative.split('/') {
         validate_entry_name(directory)?;
         anyhow::ensure!(!node.files.contains_key(directory), "path type collision");
         node = node.directories.entry(directory.to_string()).or_default();
     }
+    anyhow::ensure!(node.metadata.is_none(), "duplicate directory metadata");
+    node.metadata = Some(metadata);
     Ok(())
+}
+
+fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
+    anyhow::ensure!(raw.len() >= 2, "tree object is truncated");
+    match u16::from_le_bytes([raw[0], raw[1]]) {
+        1 => {
+            let tree: TreeObjectV1 = deserialize_canonical(raw)?;
+            anyhow::ensure!(tree.schema == 1, "unsupported tree schema");
+            Ok(TreeObject {
+                metadata: None,
+                entries: tree.entries,
+            })
+        }
+        2 => {
+            let tree: TreeObjectV2 = deserialize_canonical(raw)?;
+            anyhow::ensure!(tree.schema == 2, "unsupported tree schema");
+            Ok(TreeObject {
+                metadata: Some(DirectoryMetadata {
+                    permissions: tree.permissions,
+                    mtime_ns: tree.mtime_ns,
+                }),
+                entries: tree.entries,
+            })
+        }
+        schema => anyhow::bail!("unsupported tree schema {schema}"),
+    }
+}
+
+fn read_tree_object(
+    repository: &Repository,
+    tree_id: RepositoryObjectId,
+) -> anyhow::Result<TreeObject> {
+    let (kind, raw) = repository.read_raw(tree_id)?;
+    anyhow::ensure!(kind == ObjectKind::Tree, "expected repository Tree object");
+    deserialize_tree_object(&raw)
 }
 
 fn flatten_tree(
@@ -2436,8 +2559,7 @@ fn flatten_tree_at(
     prefix: &str,
     files: &mut BTreeMap<String, FileState>,
 ) -> anyhow::Result<()> {
-    let tree: TreeObject = repository.read(tree_id, ObjectKind::Tree)?;
-    anyhow::ensure!(tree.schema == 1, "unsupported tree schema");
+    let tree = read_tree_object(repository, tree_id)?;
     let mut previous = None;
     for entry in tree.entries {
         validate_entry_name(&entry.name)?;
@@ -2476,20 +2598,23 @@ fn flatten_tree_at(
 fn tree_directories(
     repository: &Repository,
     root: RepositoryObjectId,
-) -> anyhow::Result<Vec<String>> {
-    let mut directories = Vec::new();
-    tree_directories_at(repository, root, "", &mut directories)?;
+) -> anyhow::Result<Vec<DirectoryState>> {
+    let root_tree = read_tree_object(repository, root)?;
+    let mut directories = vec![DirectoryState {
+        path: String::new(),
+        metadata: root_tree.metadata,
+    }];
+    tree_directories_entries_at(repository, root_tree.entries, "", &mut directories)?;
     Ok(directories)
 }
 
-fn tree_directories_at(
+fn tree_directories_entries_at(
     repository: &Repository,
-    tree_id: RepositoryObjectId,
+    entries: Vec<TreeEntry>,
     prefix: &str,
-    directories: &mut Vec<String>,
+    directories: &mut Vec<DirectoryState>,
 ) -> anyhow::Result<()> {
-    let tree: TreeObject = repository.read(tree_id, ObjectKind::Tree)?;
-    for entry in tree.entries {
+    for entry in entries {
         validate_entry_name(&entry.name)?;
         if entry.kind != TreeEntryKind::Tree {
             continue;
@@ -2499,8 +2624,12 @@ fn tree_directories_at(
         } else {
             format!("{prefix}/{}", entry.name)
         };
-        directories.push(path.clone());
-        tree_directories_at(repository, entry.object_id, &path, directories)?;
+        let tree = read_tree_object(repository, entry.object_id)?;
+        directories.push(DirectoryState {
+            path: path.clone(),
+            metadata: tree.metadata,
+        });
+        tree_directories_entries_at(repository, tree.entries, &path, directories)?;
     }
     Ok(())
 }
@@ -2509,6 +2638,7 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
     if state.object.file_type == RepositoryFileType::Symlink {
         let target = reconstruct_file_bytes(repository, state)?;
         create_symlink(&target, path)?;
+        set_symlink_modified_time(path, state.object.mtime_ns)?;
         return Ok(());
     }
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
@@ -2534,6 +2664,7 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
         "restored file checksum mismatch"
     );
     file.sync_all()?;
+    set_file_modified_time(&file, state.object.mtime_ns)?;
     set_permissions(path, state.object.permissions)?;
     Ok(())
 }
@@ -3397,7 +3528,7 @@ fn verify_reachable(
         }
         ObjectKind::Tree => {
             report.trees += 1;
-            let tree: TreeObject = deserialize_canonical(&raw)?;
+            let tree = deserialize_tree_object(&raw)?;
             for entry in tree.entries {
                 verify_reachable(repository, entry.object_id, visited, report)?;
             }
@@ -3559,23 +3690,39 @@ fn create_symlink(target: &[u8], path: &Path) -> anyhow::Result<()> {
 }
 
 fn file_fingerprint(metadata: &fs::Metadata) -> anyhow::Result<FileFingerprint> {
-    let modified_ns = metadata
+    Ok(FileFingerprint {
+        size: metadata.len(),
+        modified_ns: metadata_modified_ns(metadata)?,
+        permissions: metadata_permissions(metadata),
+    })
+}
+
+fn directory_metadata(metadata: &fs::Metadata) -> anyhow::Result<DirectoryMetadata> {
+    anyhow::ensure!(metadata.is_dir(), "repository directory changed type");
+    Ok(DirectoryMetadata {
+        permissions: metadata_permissions(metadata),
+        mtime_ns: metadata_modified_ns(metadata)?,
+    })
+}
+
+fn metadata_modified_ns(metadata: &fs::Metadata) -> anyhow::Result<i128> {
+    Ok(metadata
         .modified()?
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as i128)
-        .unwrap_or_else(|error| -(error.duration().as_nanos() as i128));
+        .unwrap_or_else(|error| -(error.duration().as_nanos() as i128)))
+}
+
+fn metadata_permissions(metadata: &fs::Metadata) -> u32 {
     #[cfg(unix)]
-    let permissions = {
+    {
         use std::os::unix::fs::PermissionsExt;
         metadata.permissions().mode()
-    };
+    }
     #[cfg(not(unix))]
-    let permissions = u32::from(metadata.permissions().readonly());
-    Ok(FileFingerprint {
-        size: metadata.len(),
-        modified_ns,
-        permissions,
-    })
+    {
+        u32::from(metadata.permissions().readonly())
+    }
 }
 
 fn set_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
@@ -3591,6 +3738,111 @@ fn set_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
         fs::set_permissions(path, permissions)?;
     }
     Ok(())
+}
+
+fn set_file_modified_time(file: &File, unix_ns: i128) -> anyhow::Result<()> {
+    let modified = system_time_from_unix_ns(unix_ns)?;
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+    Ok(())
+}
+
+fn set_directory_metadata(path: &Path, metadata: DirectoryMetadata) -> anyhow::Result<()> {
+    set_directory_modified_time(path, metadata.mtime_ns)?;
+    set_permissions(path, metadata.permissions)
+}
+
+#[cfg(unix)]
+fn set_directory_modified_time(path: &Path, unix_ns: i128) -> anyhow::Result<()> {
+    set_file_modified_time(&File::open(path)?, unix_ns)
+}
+
+#[cfg(windows)]
+fn set_directory_modified_time(path: &Path, unix_ns: i128) -> anyhow::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let directory = OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    set_file_modified_time(&directory, unix_ns)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_directory_modified_time(path: &Path, unix_ns: i128) -> anyhow::Result<()> {
+    set_file_modified_time(&File::open(path)?, unix_ns)
+}
+
+fn system_time_from_unix_ns(unix_ns: i128) -> anyhow::Result<SystemTime> {
+    let magnitude: u128 = unix_ns.unsigned_abs();
+    let seconds: u64 = (magnitude / 1_000_000_000)
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("filesystem timestamp is out of range"))?;
+    let nanos = (magnitude % 1_000_000_000) as u32;
+    let duration = Duration::new(seconds, nanos);
+    if unix_ns >= 0 {
+        UNIX_EPOCH
+            .checked_add(duration)
+            .ok_or_else(|| anyhow::anyhow!("filesystem timestamp is out of range"))
+    } else {
+        UNIX_EPOCH
+            .checked_sub(duration)
+            .ok_or_else(|| anyhow::anyhow!("filesystem timestamp is out of range"))
+    }
+}
+
+#[cfg(unix)]
+fn set_symlink_modified_time(path: &Path, unix_ns: i128) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let seconds = unix_ns.div_euclid(1_000_000_000);
+    let nanos = unix_ns.rem_euclid(1_000_000_000);
+    let seconds: libc::time_t = seconds
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("symlink timestamp is out of range"))?;
+    let nanos: libc::c_long = nanos
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("symlink timestamp is out of range"))?;
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: nanos,
+        },
+    ];
+    let result = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_symlink_modified_time(path: &Path, unix_ns: i128) -> anyhow::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    set_file_modified_time(&file, unix_ns)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_symlink_modified_time(_path: &Path, _unix_ns: i128) -> anyhow::Result<()> {
+    anyhow::bail!("symlink timestamp restore is not supported on this platform")
 }
 
 fn compute_object_id(kind: ObjectKind, raw: &[u8]) -> RepositoryObjectId {
@@ -3984,6 +4236,150 @@ mod tests {
         fs::remove_dir_all(output).unwrap();
     }
 
+    #[test]
+    fn legacy_v1_tree_objects_remain_verifiable_and_restorable() {
+        let temp = tempfile::tempdir().unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        let legacy_tree = TreeObjectV1 {
+            schema: 1,
+            entries: Vec::new(),
+        };
+        let (tree_id, _, _) = repository.put(ObjectKind::Tree, &legacy_tree).unwrap();
+        let legacy_commit = CommitObject {
+            schema: 1,
+            root_tree: tree_id,
+            parent: None,
+            created_unix_ns: 1_700_000_000_000_000_000,
+            message: "legacy tree".to_string(),
+            author: None,
+            files: 0,
+            input_bytes: 0,
+            change_index: None,
+            semantic_index: None,
+            compression_tree_index: None,
+        };
+        let (commit_id, _, _) = repository.put(ObjectKind::Commit, &legacy_commit).unwrap();
+        repository.publish_head(commit_id).unwrap();
+
+        let decoded = read_tree_object(&repository, tree_id).unwrap();
+        assert_eq!(decoded.metadata, None);
+        assert!(decoded.entries.is_empty());
+        verify_repository(temp.path()).unwrap();
+
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-v1-tree-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        assert!(output.is_dir());
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn directory_modified_times_are_restored_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("src/generated");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("artifact.bin"), b"directory metadata").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let root_time = 1_700_000_000_123_456_700;
+        let nested_time = 1_700_000_100_765_432_100;
+        set_directory_modified_time(&nested, nested_time).unwrap();
+        set_directory_modified_time(temp.path(), root_time).unwrap();
+        let expected_root = directory_metadata(&fs::metadata(temp.path()).unwrap()).unwrap();
+        let expected_nested = directory_metadata(&fs::metadata(&nested).unwrap()).unwrap();
+
+        snapshot_repository(temp.path(), "directory metadata".to_string(), None).unwrap();
+        fs::remove_dir_all(temp.path().join("src")).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-directory-time-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+
+        let restored_root = directory_metadata(&fs::metadata(&output).unwrap()).unwrap();
+        let restored_nested =
+            directory_metadata(&fs::metadata(output.join("src/generated")).unwrap()).unwrap();
+        assert_eq!(restored_root.mtime_ns, expected_root.mtime_ns);
+        assert_eq!(restored_nested.mtime_ns, expected_nested.mtime_ns);
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_permissions_are_restored_exactly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().join("private/nested");
+        fs::create_dir_all(&private).unwrap();
+        fs::write(private.join("secret.txt"), b"secret").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        fs::set_permissions(
+            temp.path().join("private"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o710)).unwrap();
+
+        snapshot_repository(temp.path(), "directory modes".to_string(), None).unwrap();
+        fs::remove_dir_all(temp.path().join("private")).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-directory-mode-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+
+        assert_eq!(
+            fs::metadata(output.join("private"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(output.join("private/nested"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o710
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn regular_file_modified_time_is_restored_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("time.txt");
+        fs::write(&source, b"timestamp").unwrap();
+        let expected_time = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_700);
+        File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(expected_time))
+            .unwrap();
+        let expected = file_fingerprint(&fs::symlink_metadata(&source).unwrap())
+            .unwrap()
+            .modified_ns;
+        init_repository(temp.path(), Vec::new()).unwrap();
+        snapshot_repository(temp.path(), "timestamp".to_string(), None).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-time-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        let restored = file_fingerprint(&fs::symlink_metadata(output.join("time.txt")).unwrap())
+            .unwrap()
+            .modified_ns;
+        assert_eq!(restored, expected);
+        fs::remove_dir_all(output).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_target_is_preserved_by_restore() {
@@ -3992,6 +4388,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("target.txt"), b"target").unwrap();
         symlink("target.txt", temp.path().join("link.txt")).unwrap();
+        set_symlink_modified_time(&temp.path().join("link.txt"), 1_700_000_000_123_456_700)
+            .unwrap();
+        let expected_mtime =
+            file_fingerprint(&fs::symlink_metadata(temp.path().join("link.txt")).unwrap())
+                .unwrap()
+                .modified_ns;
         init_repository(temp.path(), Vec::new()).unwrap();
         snapshot_repository(temp.path(), "link".to_string(), None).unwrap();
         let output = temp.path().parent().unwrap().join(format!(
@@ -4004,6 +4406,11 @@ mod tests {
             Path::new("target.txt")
         );
         assert_eq!(fs::read(output.join("link.txt")).unwrap(), b"target");
+        let restored_mtime =
+            file_fingerprint(&fs::symlink_metadata(output.join("link.txt")).unwrap())
+                .unwrap()
+                .modified_ns;
+        assert_eq!(restored_mtime, expected_mtime);
         fs::remove_dir_all(output).unwrap();
     }
 
