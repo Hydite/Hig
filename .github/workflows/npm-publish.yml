@@ -97,6 +97,7 @@ jobs:
   main-package:
     name: Publish @zorker/hig
     needs: [native-package, macos-universal-package]
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -110,6 +111,7 @@ jobs:
       - name: Validate resolver and package contents
         run: |
           node scripts/npm-resolver-test.mjs
+          node scripts/verify-npm-registry.mjs --version 1.10.0
           mkdir -p artifacts/npm
           npm pack ./packages/hig-mcp-server --pack-destination artifacts/npm
       - name: Publish main package
