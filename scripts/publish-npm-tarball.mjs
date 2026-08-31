@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { npmInvocation } from "./lib/npm-command.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const tarball = path.resolve(required(args, "tarball"));
@@ -10,9 +11,8 @@ const packageName = required(args, "package");
 const version = required(args, "version");
 const specification = `${packageName}@${version}`;
 const integrity = `sha512-${createHash("sha512").update(fs.readFileSync(tarball)).digest("base64")}`;
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-
-const existing = spawnSync(npm, ["view", specification, "dist.integrity", "--json"], {
+const view = npmInvocation(["view", specification, "dist.integrity", "--json"]);
+const existing = spawnSync(view.command, view.args, {
   encoding: "utf8"
 });
 
@@ -32,14 +32,11 @@ if (!notFound) {
   throw new Error(`unable to query ${specification}: ${existing.stderr || existing.stdout}`);
 }
 
-const published = spawnSync(
-  npm,
-  ["publish", tarball, "--access", "public", "--provenance"],
-  { stdio: "inherit" }
-);
+const publish = npmInvocation(["publish", tarball, "--access", "public", "--provenance"]);
+const published = spawnSync(publish.command, publish.args, { stdio: "inherit" });
 if (published.status !== 0) process.exit(published.status || 1);
 
-const verified = spawnSync(npm, ["view", specification, "dist.integrity", "--json"], {
+const verified = spawnSync(view.command, view.args, {
   encoding: "utf8"
 });
 if (verified.status !== 0) {

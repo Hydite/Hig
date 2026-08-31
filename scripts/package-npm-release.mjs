@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { npmInvocation } from "./lib/npm-command.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
@@ -106,12 +107,14 @@ function assertVersion(version, ...manifests) {
 }
 
 function npmPack(directory, destination) {
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-  const result = spawnSync(npm, ["pack", "--json", "--pack-destination", destination], {
+  const npm = npmInvocation(["pack", "--json", "--pack-destination", destination]);
+  const result = spawnSync(npm.command, npm.args, {
     cwd: directory,
     encoding: "utf8"
   });
-  if (result.status !== 0) throw new Error(`npm pack failed: ${result.stderr || result.stdout}`);
+  if (result.status !== 0) {
+    throw new Error(`npm pack failed: ${result.error?.message || result.stderr || result.stdout}`);
+  }
   const parsed = JSON.parse(result.stdout);
   if (!Array.isArray(parsed) || parsed.length !== 1) throw new Error("npm pack returned an unexpected report");
   return parsed[0];

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { npmInvocation } from "./lib/npm-command.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
@@ -23,7 +24,7 @@ delete cleanEnv.HIG_BIN;
 
 fs.mkdirSync(installRoot, { recursive: true });
 fs.writeFileSync(path.join(installRoot, "package.json"), "{\"private\":true}\n");
-run(npmCommand(), [
+runNpm([
   "install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false",
   nativeTarball, mainTarball
 ], { cwd: installRoot });
@@ -67,8 +68,9 @@ function run(command, commandArgs, options = {}) {
   return result;
 }
 
-function npmCommand() {
-  return process.platform === "win32" ? "npm.cmd" : "npm";
+function runNpm(args, options = {}) {
+  const invocation = npmInvocation(args);
+  return run(invocation.command, invocation.args, options);
 }
 
 function parseArgs(values) {
