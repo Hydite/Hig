@@ -6,7 +6,9 @@ GitHub Actions run: `31805607941`
 
 Run URL: <https://github.com/Hydite/Hig/actions/runs/31805607941>
 
-Source commit: `82543018e9baa4d5850835dd8664e09caf81209e`
+Source commit at execution: `82543018e9baa4d5850835dd8664e09caf81209e`
+
+Identity-rewritten equivalent: `ca07031a49baa138faead466149d46c8c29815b6`
 
 ## Scope and provenance
 
@@ -78,4 +80,6 @@ was true:
 - input identity and exact restore: passed for every sample.
 
 This evidence closes the qualified-NVMe ABBA requirement in the production
-completion matrix for source commit `82543018`.
+completion matrix. The workflow executed against source commit `82543018`;
+the public-history identity correction maps that content-identical commit to
+`ca07031a` without changing its tree, message, or timestamps.

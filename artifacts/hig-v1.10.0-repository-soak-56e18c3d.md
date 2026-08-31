@@ -6,7 +6,9 @@ GitHub Actions run: `33351440350`
 
 Run URL: <https://github.com/Hydite/Hig/actions/runs/33351440350>
 
-Source commit: `56e18c3d57484e2b91205b5d2c52a8c39786fa01`
+Source commit at execution: `56e18c3d57484e2b91205b5d2c52a8c39786fa01`
+
+Identity-rewritten equivalent: `7cc216864a1a377506c073ba8a5dc118d0847436`
 
 ## Scope and acceptance rule
 
@@ -69,4 +71,6 @@ workspace digest were independently asserted after download.
 
 This evidence closes both the long-running repository fault-suite requirement
 and the native three-platform IDE automatic-snapshot soak requirement in the
-production completion matrix.
+production completion matrix. The workflow executed against source commit
+`56e18c3d`; the public-history identity correction maps that content-identical
+commit to `7cc21686` without changing its tree, message, or timestamps.
