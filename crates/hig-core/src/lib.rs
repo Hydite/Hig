@@ -42,12 +42,12 @@ pub use project::{
     stable_read_record, update_snapshot_policy, verify_snapshot_metadata,
 };
 pub use recovery::{
-    RecoveryCaptureReport, RecoveryDurability, RecoveryGcCandidate, RecoveryPinReport,
-    RecoveryPoint, RecoveryPointState, RecoveryRegistration, RecoveryRegistrationReport,
-    RecoveryRepairReport, RecoveryReplicaStatus, RecoveryRestoreReport, RecoveryRetentionPolicy,
-    RecoveryScrubLocationReport, RecoveryScrubReport, RecoveryTombstone, RecoveryTombstoneKind,
-    RecoveryTombstoneReport, RecoveryVaultConfig, RecoveryVaultGcReport, RecoveryVaultInitReport,
-    RecoveryVaultListReport, RecoveryVerifyReport, capture_recovery_point,
+    RecoveryAtRestPolicy, RecoveryCaptureReport, RecoveryDurability, RecoveryGcCandidate,
+    RecoveryPinReport, RecoveryPoint, RecoveryPointState, RecoveryRegistration,
+    RecoveryRegistrationReport, RecoveryRepairReport, RecoveryReplicaStatus, RecoveryRestoreReport,
+    RecoveryRetentionPolicy, RecoveryScrubLocationReport, RecoveryScrubReport, RecoveryTombstone,
+    RecoveryTombstoneKind, RecoveryTombstoneReport, RecoveryVaultConfig, RecoveryVaultGcReport,
+    RecoveryVaultInitReport, RecoveryVaultListReport, RecoveryVerifyReport, capture_recovery_point,
     default_recovery_vault_root, gc_recovery_vault, init_recovery_vault, list_recovery_vault,
     record_recovery_tombstone, recovery_vault_config, register_recovery_repository,
     repair_recovery_point, restore_recovery_point, scrub_recovery_vault, set_recovery_point_pin,

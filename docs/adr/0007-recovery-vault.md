@@ -53,6 +53,23 @@ protected references, verifies the reachable graph, restores to a newly created
 or explicitly approved destination, verifies every reconstructed file, and
 publishes no workspace metadata until restore succeeds.
 
+The first production profile does not provide HIG-native confidentiality for
+vault objects. Its machine-readable `at_rest_policy` is
+`external_encryption_required`: operators MUST place every primary and mirror
+vault in an encrypted operating-system account, encrypted volume, or equivalent
+externally managed durability domain. HIG verifies object identity, integrity,
+and recovery availability; it does not claim that an unencrypted vault is
+confidential. HIG does not store an encryption key beside the vault and does not
+silently downgrade this requirement when external encryption cannot be
+established or inspected.
+
+Any future HIG-native encryption profile requires authenticated encryption per
+immutable object, unique nonce construction, authenticated mutable documents,
+recoverable key custody outside every protected vault copy, rotation and
+migration procedures, and source-loss recovery tests. Adding an opaque wrapper
+around the current files or deriving a key solely from state stored in the vault
+is explicitly prohibited.
+
 Deletion detection creates a tombstone event; it never deletes recovery data.
 Retention is controlled by protected refs, explicit pins, minimum age, minimum
 generation count, and quota policy. Vault garbage collection traverses every
@@ -133,6 +150,7 @@ filesystems make physical undelete nondeterministic and outside HIG's contract.
 - A restore to a different operating-system ACL family must fail when stored
   platform metadata cannot be represented exactly; silent translation is not
   permitted by the first production profile.
-- Encryption at rest, key custody, anti-ransomware controls, and off-host
-  replication are separate policy layers; local permissions alone are not a
+- Encryption at rest is mandatory but externally supplied in the first
+  production profile. Key custody, anti-ransomware controls, and off-host
+  replication remain separate policy layers; local permissions alone are not a
   substitute for them.

@@ -25,6 +25,23 @@ pub struct RecoveryVaultConfig {
     pub mirror_roots: Vec<PathBuf>,
     #[serde(default)]
     pub retention: RecoveryRetentionPolicy,
+    #[serde(default)]
+    pub at_rest_policy: RecoveryAtRestPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAtRestPolicy {
+    #[default]
+    ExternalEncryptionRequired,
+}
+
+impl RecoveryAtRestPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExternalEncryptionRequired => "external_encryption_required",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1293,6 +1310,7 @@ fn initialize_vault_root(root: &Path, mirror_roots: Vec<PathBuf>) -> anyhow::Res
                 created_unix_ns: existing.created_unix_ns,
                 mirror_roots,
                 retention: existing.retention,
+                at_rest_policy: existing.at_rest_policy,
             };
             write_checked_json(&config_path, &updated)?;
         }
@@ -1304,6 +1322,7 @@ fn initialize_vault_root(root: &Path, mirror_roots: Vec<PathBuf>) -> anyhow::Res
                 created_unix_ns: now_unix_ns(),
                 mirror_roots,
                 retention: RecoveryRetentionPolicy::default(),
+                at_rest_policy: RecoveryAtRestPolicy::default(),
             },
         )?;
     }
@@ -1780,6 +1799,34 @@ mod tests {
             ..RecoveryRetentionPolicy::default()
         };
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_vault_config_defaults_to_the_external_encryption_policy() {
+        let legacy = r#"{
+            "schema": 1,
+            "created_unix_ns": 1,
+            "mirror_roots": [],
+            "retention": {
+                "schema": 1,
+                "minimum_points_per_repository": 3,
+                "minimum_retention_days": 7,
+                "maximum_points_per_repository": null,
+                "maximum_vault_bytes": null
+            }
+        }"#;
+
+        let config: RecoveryVaultConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            config.at_rest_policy,
+            RecoveryAtRestPolicy::ExternalEncryptionRequired
+        );
+
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            encoded["at_rest_policy"],
+            serde_json::Value::String("external_encryption_required".into())
+        );
     }
 
     #[test]

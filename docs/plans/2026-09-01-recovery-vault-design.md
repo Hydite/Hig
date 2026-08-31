@@ -130,12 +130,27 @@ evidence must still close before the completion matrix can be marked complete.
 
 ## Security Model
 
-The trust boundary includes the HIG process, vault configuration, and key
-material. Source files and repository objects are untrusted inputs. Local vault
-permissions should be owner-only. Mirrors must authenticate storage identity.
-Future encrypted vault objects must use authenticated encryption with distinct
-nonces and externally recoverable keys; encryption must not be added as an
-unreviewed wrapper around filenames or refs.
+The trust boundary includes the HIG process and vault configuration. Source
+files and repository objects are untrusted inputs. Local vault permissions are
+owner-only. Mirrors must authenticate storage identity.
+
+The first production profile records
+`at_rest_policy=external_encryption_required`. HIG does not encrypt individual
+vault objects in this profile. Operators MUST use encrypted operating-system
+accounts, encrypted volumes, or an equivalently protected external durability
+domain for every primary and mirror. This is a deployment prerequisite, not a
+claim that HIG has detected or certified the surrounding storage. HIG provides
+authenticated object identity and complete verification, but an unencrypted
+vault is not confidential.
+
+HIG MUST NOT place a decryption key in the same vault, manufacture an
+unrecoverable local-only key for an unattended IDE watcher, or silently fall
+back to plaintext after a requested native-encryption profile fails. A future
+native profile requires AEAD protection per immutable object, unique nonce
+construction, authenticated mutable metadata, key rotation, schema migration,
+external recoverable key custody, and source-and-primary-loss recovery tests.
+It requires a distinct schema/profile decision and cannot be introduced as an
+unreviewed wrapper around filenames, objects, or refs.
 
 MCP defaults to configured workspace and vault roots. Destructive operations
 are report-only unless `apply` is explicit. Restore refuses overwrite by

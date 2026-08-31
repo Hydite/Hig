@@ -307,7 +307,7 @@ fn handle_policy(command: RecoveryPolicyCommand) -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&config)?);
             } else {
-                print_policy(&config.retention);
+                print_policy(&config);
             }
         }
         RecoveryPolicyCommand::Set {
@@ -349,16 +349,17 @@ fn handle_policy(command: RecoveryPolicyCommand) -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&config)?);
             } else {
-                print_policy(&config.retention);
+                print_policy(&config);
             }
         }
     }
     Ok(())
 }
 
-fn print_policy(policy: &hig_core::RecoveryRetentionPolicy) {
+fn print_policy(config: &hig_core::RecoveryVaultConfig) {
+    let policy = &config.retention;
     println!(
-        "recovery: policy minimum_points={} minimum_days={} maximum_points={} maximum_bytes={}",
+        "recovery: policy minimum_points={} minimum_days={} maximum_points={} maximum_bytes={} at_rest={}",
         policy.minimum_points_per_repository,
         policy.minimum_retention_days,
         policy
@@ -368,6 +369,7 @@ fn print_policy(policy: &hig_core::RecoveryRetentionPolicy) {
         policy
             .maximum_vault_bytes
             .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".into())
+            .unwrap_or_else(|| "none".into()),
+        config.at_rest_policy.as_str()
     );
 }
