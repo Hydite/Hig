@@ -38,6 +38,8 @@ const report = {
   mcp_restart_recoveries: 0,
   commit_ids: [],
   interruption: {},
+  final_gc: null,
+  final_verification: null,
   final_digest: null,
   status: "running"
 };
@@ -104,7 +106,8 @@ async function main() {
   const finalGc = await runHig(["repo", "gc", workspace, "--apply", "--json"]);
   assert.equal(finalGc.unreachable_objects, 0, "final GC found unreachable objects");
   assert.equal(finalGc.temporary_files, 0, "final GC found temporary objects");
-  await runHig(["repo", "verify", workspace, "--json"]);
+  report.final_gc = finalGc;
+  report.final_verification = await runHig(["repo", "verify", workspace, "--json"]);
   report.final_digest = digestTree(workspace);
   report.status = "passed";
   } catch (error) {

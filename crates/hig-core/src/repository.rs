@@ -27,6 +27,7 @@ const MICRO_CHUNK_TARGET_BYTES: usize = 64 * 1024;
 const MICRO_CHUNK_MAX_BYTES: usize = 256 * 1024;
 const MIN_REVISION_PREFIX: usize = 8;
 const SEMANTIC_PARSER_SCHEMA: u16 = 3;
+const REPOSITORY_WATCH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
 
 pub const DEFAULT_REPOSITORY_EXCLUDES: &[&str] = &[
     ".git",
@@ -604,17 +605,35 @@ struct FileFingerprint {
 pub struct RepositoryWatcher {
     root: PathBuf,
     debounce: Duration,
+    reconciliation_interval: Duration,
     receiver: Receiver<notify::Result<Event>>,
     _watcher: RecommendedWatcher,
     pending: bool,
     last_event: Option<Instant>,
+    last_snapshot: Instant,
 }
 
 impl RepositoryWatcher {
     pub fn start(start: &Path, debounce: Duration) -> anyhow::Result<Self> {
+        Self::start_with_reconciliation_interval(
+            start,
+            debounce,
+            REPOSITORY_WATCH_RECONCILIATION_INTERVAL,
+        )
+    }
+
+    fn start_with_reconciliation_interval(
+        start: &Path,
+        debounce: Duration,
+        reconciliation_interval: Duration,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !debounce.is_zero(),
             "watch debounce must be greater than zero"
+        );
+        anyhow::ensure!(
+            !reconciliation_interval.is_zero(),
+            "watch reconciliation interval must be greater than zero"
         );
         let repository = Repository::discover(start)?;
         let root = repository.root.clone();
@@ -626,10 +645,12 @@ impl RepositoryWatcher {
         Ok(Self {
             root,
             debounce,
+            reconciliation_interval,
             receiver,
             _watcher: watcher,
             pending: false,
             last_event: None,
+            last_snapshot: Instant::now(),
         })
     }
 
@@ -674,14 +695,23 @@ impl RepositoryWatcher {
         {
             self.pending = false;
             self.last_event = None;
-            return snapshot_repository(
-                &self.root,
-                message.to_string(),
-                author.map(str::to_string),
-            )
-            .map(Some);
+            return self.snapshot(message, author);
+        }
+        if self.last_snapshot.elapsed() >= self.reconciliation_interval {
+            return self.snapshot(message, author);
         }
         Ok(None)
+    }
+
+    fn snapshot(
+        &mut self,
+        message: &str,
+        author: Option<&str>,
+    ) -> anyhow::Result<Option<RepositorySnapshotReport>> {
+        let report =
+            snapshot_repository(&self.root, message.to_string(), author.map(str::to_string));
+        self.last_snapshot = Instant::now();
+        report.map(Some)
     }
 }
 
@@ -3934,6 +3964,31 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         };
+        assert_eq!(second.parent_id, Some(first.commit_id));
+        assert_eq!(repository_log(temp.path(), 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn watcher_reconciles_changes_without_a_native_event() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("watched.txt"), b"first").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "first".to_string(), None).unwrap();
+
+        fs::write(temp.path().join("watched.txt"), b"changed before watch").unwrap();
+        let mut watcher = RepositoryWatcher::start_with_reconciliation_interval(
+            temp.path(),
+            Duration::from_millis(50),
+            Duration::from_millis(25),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let second = watcher
+            .poll("reconciliation", Some("watcher"))
+            .unwrap()
+            .expect("reconciliation did not run");
+        assert!(second.created);
         assert_eq!(second.parent_id, Some(first.commit_id));
         assert_eq!(repository_log(temp.path(), 10).unwrap().len(), 2);
     }
