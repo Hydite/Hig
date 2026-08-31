@@ -402,6 +402,8 @@ pub struct RepositoryVerifyReport {
 pub struct RepositoryGcReport {
     pub dry_run: bool,
     pub total_objects: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
     pub reachable_objects: u64,
     pub unreachable_objects: u64,
     pub unreachable_bytes: u64,
@@ -411,6 +413,17 @@ pub struct RepositoryGcReport {
     pub temporary_bytes: u64,
     pub removed_temporary_files: u64,
     pub removed_temporary_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RepositoryReplicationReport {
+    pub repository_id: [u8; 16],
+    pub commit_id: RepositoryObjectId,
+    pub ref_name: String,
+    pub reachable_objects: u64,
+    pub objects_written: u64,
+    pub objects_repaired: u64,
+    pub object_bytes_written: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1553,10 +1566,188 @@ pub fn verify_repository(start: &Path) -> anyhow::Result<RepositoryVerifyReport>
     Ok(report)
 }
 
+pub(crate) fn repository_root_and_config(
+    start: &Path,
+) -> anyhow::Result<(PathBuf, RepositoryConfig)> {
+    let repository = Repository::discover(start)?;
+    Ok((repository.root, repository.config))
+}
+
+pub(crate) fn repository_revision_id(
+    start: &Path,
+    revision: &str,
+) -> anyhow::Result<RepositoryObjectId> {
+    Repository::discover(start)?.resolve_revision(revision)
+}
+
+pub(crate) fn replicate_repository_revision(
+    source_start: &Path,
+    revision: &str,
+    destination_root: &Path,
+    recovery_ref: &str,
+) -> anyhow::Result<RepositoryReplicationReport> {
+    replicate_or_repair_repository_revision(
+        source_start,
+        revision,
+        destination_root,
+        recovery_ref,
+        false,
+    )
+}
+
+pub(crate) fn repair_repository_revision(
+    source_start: &Path,
+    revision: &str,
+    destination_root: &Path,
+    recovery_ref: &str,
+) -> anyhow::Result<RepositoryReplicationReport> {
+    replicate_or_repair_repository_revision(
+        source_start,
+        revision,
+        destination_root,
+        recovery_ref,
+        true,
+    )
+}
+
+fn replicate_or_repair_repository_revision(
+    source_start: &Path,
+    revision: &str,
+    destination_root: &Path,
+    recovery_ref: &str,
+    repair_corrupt: bool,
+) -> anyhow::Result<RepositoryReplicationReport> {
+    validate_ref_component(recovery_ref, "recovery")?;
+    let source = Repository::discover(source_start)?;
+    let _source_lock = source.lock_writer()?;
+    let commit_id = source.resolve_revision(revision)?;
+    source.ensure_commit(commit_id)?;
+
+    let mut source_verify = RepositoryVerifyReport::default();
+    let mut reachable = BTreeSet::new();
+    verify_reachable(&source, commit_id, &mut reachable, &mut source_verify)?;
+
+    let destination_state = repository_state_dir(destination_root);
+    let destination_config_path = destination_state.join("config.json");
+    fs::create_dir_all(destination_state.join("objects"))?;
+    fs::create_dir_all(destination_state.join("refs").join("heads"))?;
+    fs::create_dir_all(destination_state.join("refs").join("tags"))?;
+    fs::create_dir_all(destination_state.join("locks"))?;
+    if destination_config_path.exists() {
+        let existing: RepositoryConfig =
+            serde_json::from_slice(&fs::read(&destination_config_path)?)?;
+        anyhow::ensure!(
+            existing.repository_id == source.config.repository_id,
+            "recovery destination repository identity mismatch"
+        );
+        anyhow::ensure!(
+            existing.schema == source.config.schema,
+            "recovery destination repository schema mismatch"
+        );
+    } else {
+        atomic_write(
+            &destination_config_path,
+            &serde_json::to_vec_pretty(&source.config)?,
+        )?;
+        atomic_write(&destination_state.join("HEAD"), b"ref: refs/heads/main\n")?;
+        sync_directory(&destination_state)?;
+    }
+
+    let destination = Repository::open_exact(destination_root)?;
+    let _destination_lock = destination.lock_writer()?;
+    let mut new_objects = Vec::new();
+    let mut objects_repaired = 0_u64;
+    let mut object_bytes_written = 0_u64;
+    for object_id in &reachable {
+        let (kind, raw) = source.read_raw(*object_id)?;
+        if repair_corrupt && destination.object_path(*object_id).exists() {
+            match destination.read_raw(*object_id) {
+                Ok((existing_kind, existing_raw)) => {
+                    anyhow::ensure!(
+                        existing_kind == kind && existing_raw == raw,
+                        "recovery object collision during repair"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    destination.quarantine_object(*object_id)?;
+                    objects_repaired = objects_repaired.saturating_add(1);
+                }
+            }
+        }
+        let (written_id, written, stored_bytes) = destination.put_raw(kind, &raw)?;
+        anyhow::ensure!(written_id == *object_id, "replicated object id mismatch");
+        if written {
+            new_objects.push(*object_id);
+            object_bytes_written = object_bytes_written.saturating_add(stored_bytes);
+        }
+    }
+    destination.sync_new_objects(&new_objects)?;
+
+    let mut destination_verify = RepositoryVerifyReport::default();
+    let mut destination_reachable = BTreeSet::new();
+    verify_reachable(
+        &destination,
+        commit_id,
+        &mut destination_reachable,
+        &mut destination_verify,
+    )?;
+    anyhow::ensure!(
+        destination_reachable == reachable,
+        "recovery destination reachable graph mismatch"
+    );
+
+    let ref_name = format!("recovery/{recovery_ref}");
+    destination.update_ref_path(&destination.tag_path(&ref_name), commit_id)?;
+    Ok(RepositoryReplicationReport {
+        repository_id: source.config.repository_id,
+        commit_id,
+        ref_name: format!("tags/{ref_name}"),
+        reachable_objects: reachable.len() as u64,
+        objects_written: new_objects.len() as u64,
+        objects_repaired,
+        object_bytes_written,
+    })
+}
+
 pub fn gc_repository(start: &Path, dry_run: bool) -> anyhow::Result<RepositoryGcReport> {
     let repository = Repository::discover(start)?;
     let _lock = repository.lock_writer()?;
-    let refs = repository.read_refs()?;
+    gc_repository_locked(&repository, dry_run, &BTreeSet::new())
+}
+
+pub(crate) fn gc_repository_excluding_recovery_refs(
+    start: &Path,
+    recovery_point_ids: &BTreeSet<String>,
+    dry_run: bool,
+) -> anyhow::Result<RepositoryGcReport> {
+    for point_id in recovery_point_ids {
+        validate_ref_component(point_id, "recovery point")?;
+    }
+    let repository = Repository::discover(start)?;
+    let _lock = repository.lock_writer()?;
+    if !dry_run {
+        for point_id in recovery_point_ids {
+            let path = repository.tag_path(&format!("recovery/{point_id}"));
+            if path.exists() {
+                repository.delete_ref_file(&path)?;
+            }
+        }
+    }
+    let excluded = recovery_point_ids
+        .iter()
+        .map(|point_id| format!("tags/recovery/{point_id}"))
+        .collect();
+    gc_repository_locked(&repository, dry_run, &excluded)
+}
+
+fn gc_repository_locked(
+    repository: &Repository,
+    dry_run: bool,
+    excluded_refs: &BTreeSet<String>,
+) -> anyhow::Result<RepositoryGcReport> {
+    let mut refs = repository.read_refs()?;
+    refs.retain(|name, _| !excluded_refs.contains(name));
     let mut reachable = BTreeSet::new();
     let mut verify = RepositoryVerifyReport::default();
     for object_id in refs.values() {
@@ -1567,9 +1758,11 @@ pub fn gc_repository(start: &Path, dry_run: bool) -> anyhow::Result<RepositoryGc
         verify_reachable(&repository, *object_id, &mut reachable, &mut verify)?;
     }
     let objects = repository.list_objects()?;
+    let total_bytes = objects.iter().map(|(_, _, bytes)| *bytes).sum();
     let mut report = RepositoryGcReport {
         dry_run,
         total_objects: objects.len() as u64,
+        total_bytes,
         reachable_objects: reachable.len() as u64,
         unreachable_objects: 0,
         unreachable_bytes: 0,
@@ -1844,6 +2037,35 @@ impl Repository {
     fn object_path(&self, object_id: RepositoryObjectId) -> PathBuf {
         let hex = object_id.to_hex();
         self.state.join("objects").join(&hex[..2]).join(&hex[2..])
+    }
+
+    fn quarantine_object(&self, object_id: RepositoryObjectId) -> anyhow::Result<PathBuf> {
+        let source = self.object_path(object_id);
+        anyhow::ensure!(
+            source.exists(),
+            "repository object is missing during quarantine"
+        );
+        let quarantine = self.state.join("quarantine").join(format!(
+            "{}.{}.{}",
+            object_id,
+            std::process::id(),
+            hex::encode(crate::random_bytes::<8>())
+        ));
+        fs::create_dir_all(
+            quarantine
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("invalid repository quarantine path"))?,
+        )?;
+        fs::rename(&source, &quarantine)?;
+        if let Some(parent) = source.parent() {
+            sync_directory(parent)?;
+        }
+        sync_directory(
+            quarantine
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("invalid repository quarantine path"))?,
+        )?;
+        Ok(quarantine)
     }
 
     fn stored_object_size(&self, object_id: RepositoryObjectId) -> anyhow::Result<u64> {

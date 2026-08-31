@@ -15,6 +15,7 @@ const packageRoot = path.resolve(__dirname, "..");
 const MAX_OUTPUT_BYTES = Number(process.env.HIG_MCP_MAX_OUTPUT_BYTES || 1_000_000);
 const DEFAULT_TIMEOUT_MS = Number(process.env.HIG_MCP_TIMEOUT_MS || 20 * 60 * 1000);
 const allowAnyPath = process.env.HIG_MCP_ALLOW_ANY_PATH === "1";
+const allowGlobalRecovery = process.env.HIG_MCP_ALLOW_GLOBAL_RECOVERY === "1";
 const allowedRoots = computeAllowedRoots();
 const repositoryWatchers = new Map();
 let shuttingDown = false;
@@ -456,6 +457,130 @@ const tools = [
     })
   },
   {
+    name: "hig_recovery_init",
+    description: "Initialize a versioned Recovery Vault and optional independent filesystem mirrors.",
+    inputSchema: objectSchema({
+      vaultRoot: pathProp("Recovery Vault root. Required unless global recovery is explicitly enabled."),
+      mirrors: { type: "array", items: { type: "string" }, description: "Independent mirror roots." }
+    })
+  },
+  {
+    name: "hig_recovery_register",
+    description: "Register a repository's stable identity and source path in a Recovery Vault.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root."),
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    })
+  },
+  {
+    name: "hig_recovery_capture",
+    description: "Verify and replicate a complete reachable repository revision, then atomically publish a recovery point.",
+    inputSchema: objectSchema({
+      dir: pathProp("Repository root. Defaults to workspace root."),
+      revision: { type: "string", description: "Revision. Defaults to HEAD." },
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    })
+  },
+  {
+    name: "hig_recovery_list",
+    description: "List registered repositories and published recovery points without requiring source workspaces.",
+    inputSchema: objectSchema({
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    })
+  },
+  {
+    name: "hig_recovery_pin",
+    description: "Pin a recovery point so retention and quota GC cannot remove it.",
+    inputSchema: objectSchema({
+      repositoryId: { type: "string", pattern: "^[0-9a-fA-F]{32}$" },
+      recoveryPointId: { type: "string", pattern: "^[0-9a-fA-F]{64}$" },
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    }, ["repositoryId", "recoveryPointId"])
+  },
+  {
+    name: "hig_recovery_unpin",
+    description: "Remove an explicit recovery-point pin without deleting data.",
+    inputSchema: objectSchema({
+      repositoryId: { type: "string", pattern: "^[0-9a-fA-F]{32}$" },
+      recoveryPointId: { type: "string", pattern: "^[0-9a-fA-F]{64}$" },
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    }, ["repositoryId", "recoveryPointId"])
+  },
+  {
+    name: "hig_recovery_tombstone",
+    description: "Record an observed file, workspace, or registration deletion without removing recovery data.",
+    inputSchema: objectSchema({
+      repositoryId: { type: "string", pattern: "^[0-9a-fA-F]{32}$" },
+      kind: { type: "string", enum: ["file", "workspace", "registration"] },
+      sourcePath: pathProp("Optional exact registered source-path label."),
+      path: pathProp("Repository-relative path for a file tombstone."),
+      reason: { type: "string", minLength: 1 },
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    }, ["repositoryId", "kind", "reason"])
+  },
+  {
+    name: "hig_recovery_policy_show",
+    description: "Return the versioned Recovery Vault retention and quota policy.",
+    inputSchema: objectSchema({ vaultRoot: pathProp("Existing Recovery Vault root.") })
+  },
+  {
+    name: "hig_recovery_policy_set",
+    description: "Atomically update validated Recovery Vault retention limits and mirror policy copies.",
+    inputSchema: objectSchema({
+      vaultRoot: pathProp("Existing Recovery Vault root."),
+      minimumPoints: { type: "integer", minimum: 0 },
+      minimumRetentionDays: { type: "integer", minimum: 0 },
+      maximumPoints: { type: "integer", minimum: 0 },
+      maximumVaultBytes: { type: "integer", minimum: 1 },
+      clearMaximumPoints: { type: "boolean" },
+      clearMaximumVaultBytes: { type: "boolean" }
+    })
+  },
+  {
+    name: "hig_recovery_gc",
+    description: "Preview retention and quota GC, or explicitly apply mirror-first protected deletion.",
+    inputSchema: objectSchema({
+      vaultRoot: pathProp("Existing Recovery Vault root."),
+      apply: { type: "boolean", description: "Apply deletion when true; defaults to report-only." }
+    })
+  },
+  {
+    name: "hig_recovery_scrub",
+    description: "Scrub primary and configured mirrors, verifying catalogs, refs, identities, and every reachable object.",
+    inputSchema: objectSchema({ vaultRoot: pathProp("Existing Recovery Vault root.") })
+  },
+  {
+    name: "hig_recovery_repair",
+    description: "Repair missing or corrupt primary objects only from a currently verified configured mirror.",
+    inputSchema: objectSchema({
+      repositoryId: { type: "string", pattern: "^[0-9a-fA-F]{32}$" },
+      recoveryPointId: { type: "string", pattern: "^[0-9a-fA-F]{64}$" },
+      mirror: pathProp("Optional configured mirror root; otherwise the first verified mirror is selected."),
+      vaultRoot: pathProp("Existing primary Recovery Vault root.")
+    }, ["repositoryId", "recoveryPointId"])
+  },
+  {
+    name: "hig_recovery_verify",
+    description: "Verify the complete protected object graph for a recovery point.",
+    inputSchema: objectSchema({
+      repositoryId: { type: "string", pattern: "^[0-9a-fA-F]{32}$" },
+      recoveryPointId: { type: "string", pattern: "^[0-9a-fA-F]{64}$" },
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    }, ["repositoryId", "recoveryPointId"])
+  },
+  {
+    name: "hig_recovery_restore",
+    description: "Verify and restore exact bytes from a Recovery Vault, even when the source workspace is absent.",
+    inputSchema: objectSchema({
+      repositoryId: { type: "string", pattern: "^[0-9a-fA-F]{32}$" },
+      recoveryPointId: { type: "string", pattern: "^[0-9a-fA-F]{64}$" },
+      outputDir: pathProp("Destination directory."),
+      path: pathProp("Optional repository-relative path."),
+      overwrite: { type: "boolean", description: "Replace an existing destination." },
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    }, ["repositoryId", "recoveryPointId", "outputDir"])
+  },
+  {
     name: "hig_bench",
     description: "Run Hig benchmark. Use carefully; can be long-running.",
     inputSchema: objectSchema({
@@ -706,6 +831,73 @@ async function callTool(name, args) {
       return runHig(["repo", "verify", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_repo_gc":
       return runHig(["repo", "gc", resolveInputPath(args.dir || "."), ...(args.apply ? ["--apply"] : []), "--json"], { parseJson: true });
+    case "hig_recovery_init":
+      return runHig([
+        "recovery", "init",
+        ...recoveryVaultArgs(args, true),
+        ...repeatPathOption("--mirror", args.mirrors, true),
+        "--json"
+      ], { parseJson: true });
+    case "hig_recovery_register":
+      return runHig(["recovery", "register", resolveInputPath(args.dir || "."), ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_capture":
+      return runHig(["recovery", "capture", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_list":
+      return runHig(["recovery", "list", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_pin":
+      return runHig(["recovery", "pin", stringArg(args.repositoryId, "repositoryId"), stringArg(args.recoveryPointId, "recoveryPointId"), ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_unpin":
+      return runHig(["recovery", "unpin", stringArg(args.repositoryId, "repositoryId"), stringArg(args.recoveryPointId, "recoveryPointId"), ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_tombstone":
+      return runHig([
+        "recovery", "tombstone", stringArg(args.repositoryId, "repositoryId"),
+        "--kind", stringArg(args.kind, "kind"),
+        ...optionValue("--source-path", args.sourcePath),
+        ...optionValue("--path", args.path),
+        "--reason", stringArg(args.reason, "reason"),
+        ...recoveryVaultArgs(args, false),
+        "--json"
+      ], { parseJson: true });
+    case "hig_recovery_policy_show":
+      return runHig(["recovery", "policy", "show", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_policy_set":
+      return runHig([
+        "recovery", "policy", "set",
+        ...optionValue("--minimum-points", args.minimumPoints),
+        ...optionValue("--minimum-retention-days", args.minimumRetentionDays),
+        ...optionValue("--maximum-points", args.maximumPoints),
+        ...optionValue("--maximum-vault-bytes", args.maximumVaultBytes),
+        ...(args.clearMaximumPoints ? ["--clear-maximum-points"] : []),
+        ...(args.clearMaximumVaultBytes ? ["--clear-maximum-vault-bytes"] : []),
+        ...recoveryVaultArgs(args, false),
+        "--json"
+      ], { parseJson: true });
+    case "hig_recovery_gc":
+      return runHig(["recovery", "gc", ...recoveryVaultArgs(args, false), ...(args.apply ? ["--apply"] : []), "--json"], { parseJson: true });
+    case "hig_recovery_scrub":
+      return runHig(["recovery", "scrub", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_repair":
+      return runHig([
+        "recovery", "repair",
+        stringArg(args.repositoryId, "repositoryId"),
+        stringArg(args.recoveryPointId, "recoveryPointId"),
+        ...(args.mirror ? ["--mirror", resolveInputPath(args.mirror)] : []),
+        ...recoveryVaultArgs(args, false),
+        "--json"
+      ], { parseJson: true });
+    case "hig_recovery_verify":
+      return runHig(["recovery", "verify", stringArg(args.repositoryId, "repositoryId"), stringArg(args.recoveryPointId, "recoveryPointId"), ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_restore":
+      return runHig([
+        "recovery", "restore",
+        stringArg(args.repositoryId, "repositoryId"),
+        stringArg(args.recoveryPointId, "recoveryPointId"),
+        "--output-dir", resolveOutputPath(args.outputDir),
+        ...optionValue("--path", args.path),
+        ...(args.overwrite ? ["--overwrite"] : []),
+        ...recoveryVaultArgs(args, false),
+        "--json"
+      ], { parseJson: true });
     case "hig_bench":
       return runHig(buildBenchArgs(args), { parseJson: true, timeoutMs: Number(process.env.HIG_MCP_BENCH_TIMEOUT_MS || 60 * 60 * 1000) });
     default:
@@ -772,6 +964,21 @@ function optionPath(flag, value) {
 function repeatOption(flag, values) {
   if (!Array.isArray(values)) return [];
   return values.flatMap((value) => [flag, String(value)]);
+}
+
+function repeatPathOption(flag, values, output) {
+  if (!Array.isArray(values)) return [];
+  return values.flatMap((value) => [flag, output ? resolveOutputPath(value) : resolveInputPath(value)]);
+}
+
+function recoveryVaultArgs(args, output) {
+  if (args.vaultRoot) {
+    return ["--vault-root", output ? resolveOutputPath(args.vaultRoot) : resolveInputPath(args.vaultRoot)];
+  }
+  if (allowGlobalRecovery) return [];
+  throw new Error(
+    "vaultRoot is required for MCP recovery operations unless HIG_MCP_ALLOW_GLOBAL_RECOVERY=1"
+  );
 }
 
 function stringArg(value, name) {

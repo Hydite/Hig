@@ -92,6 +92,10 @@ enum Command {
         #[command(subcommand)]
         command: RepositoryCommand,
     },
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCommand,
+    },
     Pack(commands::archive::PackArgs),
     Unpack(commands::archive::UnpackArgs),
     Inspect(commands::archive::InspectArgs),
@@ -436,6 +440,161 @@ pub(crate) enum RepositoryCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub(crate) enum RecoveryCommand {
+    Init {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long = "mirror")]
+        mirrors: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Register {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Capture {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long, default_value = "HEAD")]
+        revision: String,
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Pin {
+        repository_id: String,
+        recovery_point_id: String,
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Unpin {
+        repository_id: String,
+        recovery_point_id: String,
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Tombstone {
+        repository_id: String,
+        #[arg(long)]
+        kind: RecoveryTombstoneKindArg,
+        #[arg(long)]
+        source_path: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Policy {
+        #[command(subcommand)]
+        command: RecoveryPolicyCommand,
+    },
+    Gc {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Apply eligible recovery-point and object deletion; default is report-only"
+        )]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Scrub {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Repair {
+        repository_id: String,
+        recovery_point_id: String,
+        #[arg(long)]
+        mirror: Option<PathBuf>,
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Verify {
+        repository_id: String,
+        recovery_point_id: String,
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Restore {
+        repository_id: String,
+        recovery_point_id: String,
+        #[arg(short = 'd', long)]
+        output_dir: PathBuf,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        overwrite: bool,
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum RecoveryTombstoneKindArg {
+    File,
+    Workspace,
+    Registration,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RecoveryPolicyCommand {
+    Show {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Set {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        minimum_points: Option<u32>,
+        #[arg(long)]
+        minimum_retention_days: Option<u32>,
+        #[arg(long)]
+        maximum_points: Option<u32>,
+        #[arg(long)]
+        maximum_vault_bytes: Option<u64>,
+        #[arg(long)]
+        clear_maximum_points: bool,
+        #[arg(long)]
+        clear_maximum_vault_bytes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub(crate) enum RepositoryBranchCommand {
     List {
         #[arg(default_value = ".")]
@@ -509,6 +668,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         } => handle_project_watch(&dir, cache_dir, verbose)?,
         Command::Project { command } => handle_project(command)?,
         Command::Repo { command } => commands::repository::handle(command)?,
+        Command::Recovery { command } => commands::recovery::handle(command)?,
         Command::Pack(args) => commands::archive::handle_pack(args)?,
         Command::Unpack(args) => commands::archive::handle_unpack(args)?,
         Command::Inspect(args) => commands::archive::handle_inspect(args)?,
@@ -646,6 +806,90 @@ mod tests {
                     json: true,
                 }
             } if dir == Path::new("project") && message == "micro change" && author == "tester"
+        ));
+    }
+
+    #[test]
+    fn recovery_restore_requires_explicit_identity_and_destination() {
+        let cli = Cli::try_parse_from([
+            "hig",
+            "recovery",
+            "restore",
+            "00112233445566778899aabbccddeeff",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--output-dir",
+            "restored",
+            "--vault-root",
+            "vault",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Recovery {
+                command: RecoveryCommand::Restore {
+                    repository_id,
+                    recovery_point_id,
+                    output_dir,
+                    vault_root: Some(vault_root),
+                    overwrite: false,
+                    json: true,
+                    ..
+                }
+            } if repository_id == "00112233445566778899aabbccddeeff"
+                && recovery_point_id.len() == 64
+                && output_dir == Path::new("restored")
+                && vault_root == Path::new("vault")
+        ));
+    }
+
+    #[test]
+    fn recovery_scrub_and_repair_parse_in_the_recovery_namespace() {
+        let scrub = Cli::try_parse_from([
+            "hig",
+            "recovery",
+            "scrub",
+            "--vault-root",
+            "vault",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            scrub.command,
+            Command::Recovery {
+                command: RecoveryCommand::Scrub {
+                    vault_root: Some(root),
+                    json: true,
+                }
+            } if root == Path::new("vault")
+        ));
+
+        let repair = Cli::try_parse_from([
+            "hig",
+            "recovery",
+            "repair",
+            "00112233445566778899aabbccddeeff",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--mirror",
+            "mirror",
+            "--vault-root",
+            "vault",
+        ])
+        .unwrap();
+        assert!(matches!(
+            repair.command,
+            Command::Recovery {
+                command: RecoveryCommand::Repair {
+                    repository_id,
+                    recovery_point_id,
+                    mirror: Some(mirror),
+                    vault_root: Some(root),
+                    json: false,
+                }
+            } if repository_id.len() == 32
+                && recovery_point_id.len() == 64
+                && mirror == Path::new("mirror")
+                && root == Path::new("vault")
         ));
     }
 

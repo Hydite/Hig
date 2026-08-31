@@ -131,7 +131,12 @@ const requiredTools = [
   "hig_repo_tag_create", "hig_repo_tag_delete", "hig_repo_log", "hig_repo_diff",
   "hig_repo_path_history", "hig_repo_restore", "hig_repo_restore_range",
   "hig_repo_storage_tree", "hig_repo_symbols", "hig_repo_symbol_history",
-  "hig_repo_restore_symbol", "hig_repo_verify", "hig_repo_gc", "hig_bench"
+  "hig_repo_restore_symbol", "hig_repo_verify", "hig_repo_gc",
+  "hig_recovery_init", "hig_recovery_register", "hig_recovery_capture",
+  "hig_recovery_list", "hig_recovery_pin", "hig_recovery_unpin",
+  "hig_recovery_tombstone", "hig_recovery_policy_show", "hig_recovery_policy_set",
+  "hig_recovery_gc", "hig_recovery_scrub", "hig_recovery_repair",
+  "hig_recovery_verify", "hig_recovery_restore", "hig_bench"
 ];
 
 try {
@@ -248,6 +253,70 @@ try {
     output: range
   });
   assert.equal(fs.readFileSync(range, "utf8"), "fn");
+
+  const recoveryVault = path.join(work, "recovery-vault");
+  await tool("hig_recovery_init", { vaultRoot: recoveryVault });
+  const registered = await tool("hig_recovery_register", {
+    dir: workspace,
+    vaultRoot: recoveryVault
+  });
+  const captured = await tool("hig_recovery_capture", {
+    dir: workspace,
+    revision: "HEAD",
+    vaultRoot: recoveryVault
+  });
+  assert.equal(captured.data.repository_id.length, 16);
+  assert.equal(captured.data.recovery_point.durability, "captured");
+  const repositoryId = Buffer.from(captured.data.repository_id).toString("hex");
+  assert.equal(repositoryId, Buffer.from(registered.data.repository_id).toString("hex"));
+  const recoveryPointId = captured.data.recovery_point.recovery_point_id;
+  const recoveryList = await tool("hig_recovery_list", { vaultRoot: recoveryVault });
+  assert.equal(recoveryList.data.repositories.length, 1);
+  const policy = await tool("hig_recovery_policy_show", { vaultRoot: recoveryVault });
+  assert.equal(policy.data.retention.schema, 1);
+  const recoveryGc = await tool("hig_recovery_gc", { vaultRoot: recoveryVault });
+  assert.equal(recoveryGc.data.dry_run, true);
+  assert.equal(recoveryGc.data.removed_recovery_points, 0);
+  const pinned = await tool("hig_recovery_pin", {
+    repositoryId,
+    recoveryPointId,
+    vaultRoot: recoveryVault
+  });
+  assert.equal(pinned.data.pinned, true);
+  const unpinned = await tool("hig_recovery_unpin", {
+    repositoryId,
+    recoveryPointId,
+    vaultRoot: recoveryVault
+  });
+  assert.equal(unpinned.data.pinned, false);
+  await tool("hig_recovery_verify", {
+    repositoryId,
+    recoveryPointId,
+    vaultRoot: recoveryVault
+  });
+  const recoveryScrub = await tool("hig_recovery_scrub", { vaultRoot: recoveryVault });
+  assert.equal(recoveryScrub.data.healthy, true);
+  fs.rmSync(path.join(workspace, "README.md"));
+  const tombstone = await tool("hig_recovery_tombstone", {
+    repositoryId,
+    kind: "file",
+    sourcePath: workspace,
+    path: "README.md",
+    reason: "MCP integration deletion drill",
+    vaultRoot: recoveryVault
+  });
+  assert.equal(tombstone.data.tombstone.kind, "file");
+  const recoveryOutput = path.join(work, "recovery-output");
+  await tool("hig_recovery_restore", {
+    repositoryId,
+    recoveryPointId,
+    outputDir: recoveryOutput,
+    vaultRoot: recoveryVault
+  });
+  assert.equal(
+    fs.readFileSync(path.join(recoveryOutput, "README.md"), "utf8"),
+    "synthetic MCP integration fixture\n"
+  );
 
   const denied = await tool("hig_init_project", { dir: outside }, false);
   assert.match(denied.error, /outside allowed roots/i);
