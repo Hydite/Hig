@@ -40,15 +40,25 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Install release npm client
         run: npm install --global npm@12.0.2
+      - name: Check whether native package is already published
+        id: registry
+        shell: bash
+        run: |
+          present="$(node scripts/check-npm-package.mjs --package "@zorker/${{ matrix.npm_package }}" --version 1.10.0)"
+          echo "present=${present}" >> "$GITHUB_OUTPUT"
       - name: Build native CLI
+        if: steps.registry.outputs.present != 'true'
         run: cargo build --release -p hig-cli
       - name: Assemble npm packages
+        if: steps.registry.outputs.present != 'true'
         shell: bash
         run: node scripts/package-npm-release.mjs --binary "${{ matrix.binary }}" --platform "${{ matrix.platform }}" --output-dir artifacts/npm
       - name: Verify clean npm installation
+        if: steps.registry.outputs.present != 'true'
         shell: bash
         run: node scripts/verify-npm-package.mjs --main artifacts/npm/zorker-hig-1.10.0.tgz --native "artifacts/npm/zorker-${{ matrix.npm_package }}-1.10.0.tgz" --platform-package "${{ matrix.npm_package }}"
       - name: Publish native package
+        if: steps.registry.outputs.present != 'true'
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -73,7 +83,13 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Install release npm client
         run: npm install --global npm@12.0.2
+      - name: Check whether native package is already published
+        id: registry
+        run: |
+          present="$(node scripts/check-npm-package.mjs --package @zorker/hig-darwin-universal --version 1.10.0)"
+          echo "present=${present}" >> "$GITHUB_OUTPUT"
       - name: Build universal CLI
+        if: steps.registry.outputs.present != 'true'
         run: |
           cargo build --release -p hig-cli --target aarch64-apple-darwin
           cargo build --release -p hig-cli --target x86_64-apple-darwin
@@ -84,10 +100,13 @@ jobs:
             -output target/release-universal/hig
           lipo target/release-universal/hig -verify_arch arm64 x86_64
       - name: Assemble npm packages
+        if: steps.registry.outputs.present != 'true'
         run: node scripts/package-npm-release.mjs --binary target/release-universal/hig --platform macos-universal --output-dir artifacts/npm
       - name: Verify clean npm installation
+        if: steps.registry.outputs.present != 'true'
         run: node scripts/verify-npm-package.mjs --main artifacts/npm/zorker-hig-1.10.0.tgz --native artifacts/npm/zorker-hig-darwin-universal-1.10.0.tgz --platform-package hig-darwin-universal
       - name: Publish native package
+        if: steps.registry.outputs.present != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -108,13 +127,22 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Install release npm client
         run: npm install --global npm@12.0.2
+      - name: Check whether main package is already published
+        id: registry
+        run: |
+          present="$(node scripts/check-npm-package.mjs --package @zorker/hig --version 1.10.0)"
+          echo "present=${present}" >> "$GITHUB_OUTPUT"
       - name: Validate resolver and package contents
         run: |
           node scripts/npm-resolver-test.mjs
           node scripts/verify-npm-registry.mjs --version 1.10.0
+      - name: Pack main package
+        if: steps.registry.outputs.present != 'true'
+        run: |
           mkdir -p artifacts/npm
           npm pack ./packages/hig-mcp-server --pack-destination artifacts/npm
       - name: Publish main package
+        if: steps.registry.outputs.present != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
