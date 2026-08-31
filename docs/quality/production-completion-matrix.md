@@ -13,7 +13,7 @@ are descriptive only; the `Complete` state requires every listed gate.
 - [x] Golden legacy repository fixture passes verify, migrate, restore, and idempotence locally.
 - [x] Golden legacy repository fixture passes the required CI gate.
 - [x] Branch/tag/history/MCP workflow passes on macOS, Linux, and Windows packages.
-- [ ] Long-running snapshot/restore/GC fault and interruption suite passes.
+- [x] Long-running snapshot/restore/GC fault and interruption suite passes.
 
 ## IDE Automatic Snapshot
 
@@ -21,7 +21,7 @@ are descriptive only; the `Complete` state requires every listed gate.
 - [x] Watcher overflow recovery and monotonic generation/event sequence.
 - [x] CLI and MCP policy/status control surface.
 - [x] Deterministic event-burst, queue-overflow, pressure pause/resume, restart, periodic, and corruption suite.
-- [ ] Multi-hour native macOS/Linux/Windows soak with exact repository verification.
+- [x] Multi-hour native macOS/Linux/Windows soak with exact repository verification.
 - [x] IDE package integration verifies automatic snapshots without shell access.
 
 ## Cold Path Performance
@@ -30,7 +30,7 @@ are descriptive only; the `Complete` state requires every listed gate.
 - [x] Runtime-adaptive full-pipeline I/O controller.
 - [x] Adaptive payload memory and write coalescing.
 - [x] Stage-level scan/hash/compression/write telemetry and exact restore checks.
-- [ ] Same-host ABBA gate against retained v1.9.6 and v1.9.7 binaries on qualified NVMe.
+- [x] Same-host ABBA gate against retained v1.9.6 and v1.9.7 binaries on qualified NVMe.
 - [x] Current scan/hash hotspot receives a measured, no-regression improvement.
 - [x] CI benchmark policy rejects quality, memory, archive-size, or protected-stage regression.
 
