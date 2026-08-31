@@ -73,11 +73,12 @@ It is report-only by default.
   that share one failure domain cannot be recovered by hashes or indexes.
 
 Filesystem fidelity is part of the immutable repository object contract rather
-than a best-effort restore option. Current snapshots use file schema 5 and tree
-schema 4. They retain regular-file and symlink type, exact file bytes, directory
+than a best-effort restore option. Current snapshots use file schema 6 and tree
+schema 5. They retain regular-file and symlink type, exact file bytes, directory
 structure, modification time, permission mode, hardlink identity, allocated
-sparse extents, managed extended attributes, and platform access-control
-metadata. Readers keep explicit decoders for every earlier file and tree schema;
+sparse extents, Unix owner/group identity, managed extended attributes, and
+platform access-control metadata. Readers keep explicit decoders for every
+earlier file and tree schema;
 missing fields in an older object mean that the older snapshot did not capture
 that property, not that the reader may synthesize it.
 

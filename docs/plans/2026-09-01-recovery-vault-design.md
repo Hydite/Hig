@@ -95,9 +95,9 @@ bytes are corruption and stop publication.
 
 ## Filesystem Fidelity Contract
 
-The repository wire format is append-only by schema. File schema 5 and tree
-schema 4 are the current writers; file schemas 1 through 4 and tree schemas 1
-through 3 remain explicit read paths. A newer reader never rewrites an old
+The repository wire format is append-only by schema. File schema 6 and tree
+schema 5 are the current writers; file schemas 1 through 5 and tree schemas 1
+through 4 remain explicit read paths. A newer reader never rewrites an old
 reachable object solely to upgrade its schema.
 
 | Property | macOS | Linux/Android | Windows |
@@ -109,6 +109,7 @@ reachable object solely to upgrade its schema.
 | Sparse allocation | `SEEK_DATA`/`SEEK_HOLE` when supported | `SEEK_DATA`/`SEEK_HOLE` when supported | allocated-range query + sparse restore |
 | Extended attributes | User-managed xattrs; resource forks included | User-managed xattrs | Not represented; NTFS ADS is an open gate |
 | ACL | Extended ACL text | Raw POSIX access/default ACL xattrs | Owner, group, DACL, inheritance protection |
+| Owner/group | Numeric UID/GID, exact or fail | Numeric UID/GID, exact or fail | Represented by security descriptor |
 | Audit ACL | Not a separate namespace | Not a separate namespace | SACL explicitly excluded from ordinary-user profile |
 
 Capture sorts and bounds variable metadata before canonical serialization.
@@ -119,9 +120,9 @@ rejects any mismatch before atomic publication. System-managed macOS attributes
 ACL codec and cannot also appear as generic xattrs. Cross-family ACL conversion
 is prohibited because a lossy translation would violate exact recovery.
 
-The remaining platform-fidelity work is tracked rather than inferred: Unix
-owner/group policy, Windows alternate data streams, Windows directory-symlink
-typing, and native multi-platform fault/soak evidence must close before the
+The remaining platform-fidelity work is tracked rather than inferred: Windows
+alternate data streams, Windows directory-symlink typing, and native
+multi-platform fault/soak evidence must close before the
 completion matrix can be marked complete.
 
 ## Security Model

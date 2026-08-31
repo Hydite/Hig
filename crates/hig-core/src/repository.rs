@@ -535,6 +535,23 @@ struct FileObjectV5 {
     chunks: Vec<ChunkReference>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileObjectV6 {
+    schema: u16,
+    file_type: RepositoryFileType,
+    size: u64,
+    permissions: u32,
+    mtime_ns: i128,
+    content_hash: [u8; 32],
+    chunking_schema: u16,
+    hardlink_id: Option<[u8; 32]>,
+    allocated_extents: Option<Vec<FileExtent>>,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
+    ownership: Option<OwnershipMetadata>,
+    chunks: Vec<ChunkReference>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileObject {
     schema: u16,
@@ -548,6 +565,7 @@ struct FileObject {
     allocated_extents: Option<Vec<FileExtent>>,
     extended_attributes: Vec<ExtendedAttribute>,
     access_control: Option<AccessControlMetadata>,
+    ownership: Option<OwnershipMetadata>,
     chunks: Vec<ChunkReference>,
 }
 
@@ -575,6 +593,12 @@ enum AccessControlMetadata {
     WindowsSecurityDescriptor {
         sddl: Vec<u8>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+struct OwnershipMetadata {
+    user_id: u32,
+    group_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -636,6 +660,17 @@ struct TreeObjectV4 {
     entries: Vec<TreeEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TreeObjectV5 {
+    schema: u16,
+    permissions: u32,
+    mtime_ns: i128,
+    extended_attributes: Vec<ExtendedAttribute>,
+    access_control: Option<AccessControlMetadata>,
+    ownership: Option<OwnershipMetadata>,
+    entries: Vec<TreeEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TreeObject {
     metadata: Option<DirectoryMetadata>,
@@ -648,6 +683,7 @@ struct DirectoryMetadata {
     mtime_ns: i128,
     extended_attributes: Vec<ExtendedAttribute>,
     access_control: Option<AccessControlMetadata>,
+    ownership: Option<OwnershipMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -781,6 +817,7 @@ struct FileFingerprint {
     size: u64,
     modified_ns: i128,
     permissions: u32,
+    ownership: Option<OwnershipMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1211,8 +1248,8 @@ pub fn snapshot_repository(
         }
         let (file_id, written, stored_bytes) = repository.put(
             ObjectKind::File,
-            &FileObjectV5 {
-                schema: 5,
+            &FileObjectV6 {
+                schema: 6,
                 file_type: source.file_type,
                 size: stable.logical_size,
                 permissions: stable.fingerprint.permissions,
@@ -1223,6 +1260,7 @@ pub fn snapshot_repository(
                 allocated_extents: stable.allocated_extents,
                 extended_attributes: stable.extended_attributes,
                 access_control: stable.access_control,
+                ownership: stable.fingerprint.ownership,
                 chunks,
             },
         )?;
@@ -2667,12 +2705,13 @@ fn write_tree(
         .metadata
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("directory metadata is missing while writing tree"))?;
-    let tree = TreeObjectV4 {
-        schema: 4,
+    let tree = TreeObjectV5 {
+        schema: 5,
         permissions: metadata.permissions,
         mtime_ns: metadata.mtime_ns,
         extended_attributes: metadata.extended_attributes.clone(),
         access_control: metadata.access_control.clone(),
+        ownership: metadata.ownership,
         entries,
     };
     let (object_id, written, stored_bytes) = repository.put(ObjectKind::Tree, &tree)?;
@@ -2745,6 +2784,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 allocated_extents: None,
                 extended_attributes: Vec::new(),
                 access_control: None,
+                ownership: None,
                 chunks: file.chunks,
             }
         }
@@ -2763,6 +2803,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 allocated_extents: None,
                 extended_attributes: Vec::new(),
                 access_control: None,
+                ownership: None,
                 chunks: file.chunks,
             }
         }
@@ -2781,6 +2822,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 allocated_extents: Some(file.allocated_extents),
                 extended_attributes: Vec::new(),
                 access_control: None,
+                ownership: None,
                 chunks: file.chunks,
             }
         }
@@ -2799,6 +2841,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 allocated_extents: file.allocated_extents,
                 extended_attributes: file.extended_attributes,
                 access_control: None,
+                ownership: None,
                 chunks: file.chunks,
             }
         }
@@ -2817,6 +2860,26 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 allocated_extents: file.allocated_extents,
                 extended_attributes: file.extended_attributes,
                 access_control: file.access_control,
+                ownership: None,
+                chunks: file.chunks,
+            }
+        }
+        6 => {
+            let file: FileObjectV6 = deserialize_canonical(raw)?;
+            anyhow::ensure!(file.schema == 6, "unsupported file object schema");
+            FileObject {
+                schema: file.schema,
+                file_type: file.file_type,
+                size: file.size,
+                permissions: file.permissions,
+                mtime_ns: file.mtime_ns,
+                content_hash: file.content_hash,
+                chunking_schema: file.chunking_schema,
+                hardlink_id: file.hardlink_id,
+                allocated_extents: file.allocated_extents,
+                extended_attributes: file.extended_attributes,
+                access_control: file.access_control,
+                ownership: file.ownership,
                 chunks: file.chunks,
             }
         }
@@ -3016,6 +3079,7 @@ fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
                     mtime_ns: tree.mtime_ns,
                     extended_attributes: Vec::new(),
                     access_control: None,
+                    ownership: None,
                 }),
                 entries: tree.entries,
             })
@@ -3030,6 +3094,7 @@ fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
                     mtime_ns: tree.mtime_ns,
                     extended_attributes: tree.extended_attributes,
                     access_control: None,
+                    ownership: None,
                 }),
                 entries: tree.entries,
             })
@@ -3045,6 +3110,23 @@ fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
                     mtime_ns: tree.mtime_ns,
                     extended_attributes: tree.extended_attributes,
                     access_control: tree.access_control,
+                    ownership: None,
+                }),
+                entries: tree.entries,
+            })
+        }
+        5 => {
+            let tree: TreeObjectV5 = deserialize_canonical(raw)?;
+            anyhow::ensure!(tree.schema == 5, "unsupported tree schema");
+            validate_extended_attributes(&tree.extended_attributes)?;
+            validate_access_control(tree.access_control.as_ref())?;
+            Ok(TreeObject {
+                metadata: Some(DirectoryMetadata {
+                    permissions: tree.permissions,
+                    mtime_ns: tree.mtime_ns,
+                    extended_attributes: tree.extended_attributes,
+                    access_control: tree.access_control,
+                    ownership: tree.ownership,
                 }),
                 entries: tree.entries,
             })
@@ -3185,6 +3267,7 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
     if state.object.file_type == RepositoryFileType::Symlink {
         let target = reconstruct_file_bytes(repository, state)?;
         create_symlink(&target, path)?;
+        restore_ownership(path, state.object.ownership)?;
         restore_extended_attributes(path, &state.object.extended_attributes)?;
         restore_access_control(
             path,
@@ -3232,6 +3315,7 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
     if let Some(extents) = &state.object.allocated_extents {
         verify_restored_sparse_layout(&file, state.object.size, extents)?;
     }
+    restore_ownership(path, state.object.ownership)?;
     restore_extended_attributes(path, &state.object.extended_attributes)?;
     set_permissions(path, state.object.permissions)?;
     restore_access_control(
@@ -3524,7 +3608,8 @@ fn build_indexed_changes(
                     || left.object.hardlink_id != right.object.hardlink_id
                     || left.object.allocated_extents != right.object.allocated_extents
                     || left.object.extended_attributes != right.object.extended_attributes
-                    || left.object.access_control != right.object.access_control =>
+                    || left.object.access_control != right.object.access_control
+                    || left.object.ownership != right.object.ownership =>
             {
                 (RepositoryChangeKind::Metadata, None, Vec::new())
             }
@@ -4754,6 +4839,7 @@ fn file_fingerprint(metadata: &fs::Metadata) -> anyhow::Result<FileFingerprint> 
         size: metadata.len(),
         modified_ns: metadata_modified_ns(metadata)?,
         permissions: metadata_permissions(metadata),
+        ownership: metadata_ownership(metadata),
     })
 }
 
@@ -4766,6 +4852,7 @@ fn directory_metadata(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<Di
             .context("failed to read directory extended attributes")?,
         access_control: read_access_control(path, AccessControlNodeKind::Directory)
             .context("failed to read directory ACL")?,
+        ownership: metadata_ownership(metadata),
     })
 }
 
@@ -4787,6 +4874,21 @@ fn metadata_permissions(metadata: &fs::Metadata) -> u32 {
     {
         u32::from(metadata.permissions().readonly())
     }
+}
+
+#[cfg(unix)]
+fn metadata_ownership(metadata: &fs::Metadata) -> Option<OwnershipMetadata> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(OwnershipMetadata {
+        user_id: metadata.uid(),
+        group_id: metadata.gid(),
+    })
+}
+
+#[cfg(not(unix))]
+fn metadata_ownership(_metadata: &fs::Metadata) -> Option<OwnershipMetadata> {
+    None
 }
 
 #[cfg(unix)]
@@ -5341,6 +5443,40 @@ mod apple_access_control {
     }
 }
 
+#[cfg(unix)]
+fn restore_ownership(path: &Path, expected: Option<OwnershipMetadata>) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let current = metadata_ownership(&fs::symlink_metadata(path)?);
+    if current == Some(expected) {
+        return Ok(());
+    }
+    let original_path = path;
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let result = unsafe { libc::lchown(path.as_ptr(), expected.user_id, expected.group_id) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    anyhow::ensure!(
+        metadata_ownership(&fs::symlink_metadata(original_path)?) == Some(expected),
+        "restored Unix ownership failed exact verification"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restore_ownership(_path: &Path, expected: Option<OwnershipMetadata>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        expected.is_none(),
+        "Unix ownership metadata is not supported on this destination"
+    );
+    Ok(())
+}
+
 fn set_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -5363,6 +5499,7 @@ fn set_file_modified_time(file: &File, unix_ns: i128) -> anyhow::Result<()> {
 }
 
 fn set_directory_metadata(path: &Path, metadata: &DirectoryMetadata) -> anyhow::Result<()> {
+    restore_ownership(path, metadata.ownership)?;
     restore_extended_attributes(path, &metadata.extended_attributes)?;
     set_permissions(path, metadata.permissions)?;
     restore_access_control(
@@ -6066,6 +6203,60 @@ mod tests {
         fs::remove_dir_all(output).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_ownership_survives_source_deletion_for_files_directories_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("owned");
+        let file = directory.join("payload.bin");
+        let link = directory.join("payload.link");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, b"owned payload").unwrap();
+        symlink("payload.bin", &link).unwrap();
+        let expected_root = metadata_ownership(&fs::symlink_metadata(temp.path()).unwrap());
+        let expected_directory = metadata_ownership(&fs::symlink_metadata(&directory).unwrap());
+        let expected_file = metadata_ownership(&fs::symlink_metadata(&file).unwrap());
+        let expected_link = metadata_ownership(&fs::symlink_metadata(&link).unwrap());
+
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let snapshot =
+            snapshot_repository(temp.path(), "Unix ownership".to_string(), None).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        let commit: CommitObject = repository
+            .read(snapshot.commit_id, ObjectKind::Commit)
+            .unwrap();
+        let files = flatten_tree(&repository, commit.root_tree).unwrap();
+        assert_eq!(files["owned/payload.bin"].object.schema, 6);
+        assert_eq!(files["owned/payload.bin"].object.ownership, expected_file);
+        assert_eq!(files["owned/payload.link"].object.ownership, expected_link);
+
+        fs::remove_dir_all(&directory).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-ownership-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        assert_eq!(
+            metadata_ownership(&fs::symlink_metadata(&output).unwrap()),
+            expected_root
+        );
+        assert_eq!(
+            metadata_ownership(&fs::symlink_metadata(output.join("owned")).unwrap()),
+            expected_directory
+        );
+        assert_eq!(
+            metadata_ownership(&fs::symlink_metadata(output.join("owned/payload.bin")).unwrap()),
+            expected_file
+        );
+        assert_eq!(
+            metadata_ownership(&fs::symlink_metadata(output.join("owned/payload.link")).unwrap()),
+            expected_link
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn hardlink_identity_survives_source_deletion_and_restore() {
@@ -6083,7 +6274,7 @@ mod tests {
             .read(repository.read_head().unwrap().unwrap(), ObjectKind::Commit)
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
-        assert_eq!(files["original.bin"].object.schema, 5);
+        assert_eq!(files["original.bin"].object.schema, 6);
         assert!(files["original.bin"].object.hardlink_id.is_some());
         assert_eq!(
             files["original.bin"].object.hardlink_id,
@@ -6259,7 +6450,7 @@ mod tests {
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
         let state = &files["disk-image.bin"];
-        assert_eq!(state.object.schema, 5);
+        assert_eq!(state.object.schema, 6);
         assert_eq!(
             state.object.allocated_extents.as_deref(),
             Some(source_extents.as_slice())
@@ -6329,7 +6520,7 @@ mod tests {
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
         let state = &files["empty-volume.bin"];
-        assert_eq!(state.object.schema, 5);
+        assert_eq!(state.object.schema, 6);
         assert_eq!(state.object.allocated_extents, Some(Vec::new()));
         assert!(state.object.chunks.is_empty());
 
@@ -6401,7 +6592,7 @@ mod tests {
             .read(snapshot.commit_id, ObjectKind::Commit)
             .unwrap();
         let files = flatten_tree(&repository, commit.root_tree).unwrap();
-        assert_eq!(files["metadata/payload.bin"].object.schema, 5);
+        assert_eq!(files["metadata/payload.bin"].object.schema, 6);
         assert_eq!(
             files["metadata/payload.bin"].object.extended_attributes,
             vec![ExtendedAttribute {
@@ -6510,6 +6701,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("extended attributes are not canonical"));
+    }
+
+    #[test]
+    fn previous_filesystem_metadata_schemas_decode_without_ownership() {
+        let file = FileObjectV5 {
+            schema: 5,
+            file_type: RepositoryFileType::Regular,
+            size: 0,
+            permissions: 0o640,
+            mtime_ns: 123,
+            content_hash: *blake3::hash(&[]).as_bytes(),
+            chunking_schema: 2,
+            hardlink_id: None,
+            allocated_extents: None,
+            extended_attributes: Vec::new(),
+            access_control: None,
+            chunks: Vec::new(),
+        };
+        let decoded_file = deserialize_file_object(&serialize_canonical(&file).unwrap()).unwrap();
+        assert_eq!(decoded_file.schema, 5);
+        assert_eq!(decoded_file.ownership, None);
+
+        let tree = TreeObjectV4 {
+            schema: 4,
+            permissions: 0o750,
+            mtime_ns: 456,
+            extended_attributes: Vec::new(),
+            access_control: None,
+            entries: Vec::new(),
+        };
+        let decoded_tree = deserialize_tree_object(&serialize_canonical(&tree).unwrap()).unwrap();
+        assert_eq!(decoded_tree.metadata.unwrap().ownership, None);
     }
 
     #[cfg(target_vendor = "apple")]
