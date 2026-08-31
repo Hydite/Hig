@@ -1,0 +1,15 @@
+{
+  "name": "@zorker/hig-win32-x64-msvc",
+  "version": "1.10.0",
+  "private": true,
+  "description": "HIG v1.10.0 native CLI for Windows x86_64 MSVC.",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": ["bin/hig.exe", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hydite/Hig.git"
+  },
+  "publishConfig": { "access": "public" },
+  "license": "MIT"
+}

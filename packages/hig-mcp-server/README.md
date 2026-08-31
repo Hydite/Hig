@@ -2,6 +2,19 @@
 
 This package wraps the `hig` CLI as a local MCP stdio server so IDE agents can call archive, cache, byte-history, and function-history operations through constrained tools instead of hand-writing shell commands.
 
+## npm Installation
+
+```bash
+npm install --global @zorker/hig@1.10.0
+hig --version
+hig-mcp-server --smoke
+```
+
+The main package installs one optional native package selected by npm for the
+current operating system and CPU. macOS arm64/x86_64, Linux x86_64 glibc, and
+Windows x86_64 MSVC are supported in v1.10.0. Set `HIG_BIN` to an explicit
+native CLI path when using a separately managed binary.
+
 ## CLI Build Artifact
 
 The production CLI binary is:
@@ -48,8 +61,8 @@ Use the bundled server command and point `HIG_MCP_ALLOWED_ROOTS` at the workspac
 {
   "mcpServers": {
     "hig": {
-      "command": "node",
-      "args": ["/absolute/path/to/hig-mcp-server/bin/hig-mcp-server.js"],
+      "command": "hig-mcp-server",
+      "args": [],
       "env": {
         "HIG_MCP_ALLOWED_ROOTS": "/absolute/path/to/workspace",
         "HIG_MCP_WORKDIR": "/absolute/path/to/workspace"

@@ -63,6 +63,17 @@ e0b639010aedea0d0fb153c48b63168835f8afd3a85953c5dd03d4bc05e07048
 
 ## Quick Start
 
+### npm
+
+Install the CLI and MCP server. npm selects the native package for macOS
+arm64/x86_64, Linux x86_64 glibc, or Windows x86_64 MSVC.
+
+```bash
+npm install --global @zorker/hig@1.10.0
+hig --version
+hig-mcp-server --smoke
+```
+
 ### Desktop
 
 1. Open the DMG and launch Hig.

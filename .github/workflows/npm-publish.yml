@@ -1,0 +1,108 @@
+name: Publish HIG npm Packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-v1.10.0
+  cancel-in-progress: false
+
+jobs:
+  native-package:
+    name: Publish native npm package (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64-gnu
+            binary: target/release/hig
+            npm_package: hig-linux-x64-gnu
+          - os: windows-2025
+            platform: windows-x86_64-msvc
+            binary: target/release/hig.exe
+            npm_package: hig-win32-x64-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Build native CLI
+        run: cargo build --release -p hig-cli
+      - name: Assemble npm packages
+        shell: bash
+        run: node scripts/package-npm-release.mjs --binary "${{ matrix.binary }}" --platform "${{ matrix.platform }}" --output-dir artifacts/npm
+      - name: Verify clean npm installation
+        shell: bash
+        run: node scripts/verify-npm-package.mjs --main artifacts/npm/zorker-hig-1.10.0.tgz --native "artifacts/npm/zorker-${{ matrix.npm_package }}-1.10.0.tgz" --platform-package "${{ matrix.npm_package }}"
+      - name: Publish native package
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/publish-npm-tarball.mjs --tarball "artifacts/npm/zorker-${{ matrix.npm_package }}-1.10.0.tgz" --package "@zorker/${{ matrix.npm_package }}" --version 1.10.0
+
+  macos-universal-package:
+    name: Publish native npm package (macOS universal)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Build universal CLI
+        run: |
+          cargo build --release -p hig-cli --target aarch64-apple-darwin
+          cargo build --release -p hig-cli --target x86_64-apple-darwin
+          mkdir -p target/release-universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/hig \
+            target/x86_64-apple-darwin/release/hig \
+            -output target/release-universal/hig
+          lipo target/release-universal/hig -verify_arch arm64 x86_64
+      - name: Assemble npm packages
+        run: node scripts/package-npm-release.mjs --binary target/release-universal/hig --platform macos-universal --output-dir artifacts/npm
+      - name: Verify clean npm installation
+        run: node scripts/verify-npm-package.mjs --main artifacts/npm/zorker-hig-1.10.0.tgz --native artifacts/npm/zorker-hig-darwin-universal-1.10.0.tgz --platform-package hig-darwin-universal
+      - name: Publish native package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/publish-npm-tarball.mjs --tarball artifacts/npm/zorker-hig-darwin-universal-1.10.0.tgz --package @zorker/hig-darwin-universal --version 1.10.0
+
+  main-package:
+    name: Publish @zorker/hig
+    needs: [native-package, macos-universal-package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Validate resolver and package contents
+        run: |
+          node scripts/npm-resolver-test.mjs
+          mkdir -p artifacts/npm
+          npm pack packages/hig-mcp-server --pack-destination artifacts/npm
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/publish-npm-tarball.mjs --tarball artifacts/npm/zorker-hig-1.10.0.tgz --package @zorker/hig --version 1.10.0

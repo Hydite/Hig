@@ -1,0 +1,16 @@
+{
+  "name": "@zorker/hig-linux-x64-gnu",
+  "version": "1.10.0",
+  "private": true,
+  "description": "HIG v1.10.0 native CLI for Linux x86_64 GNU.",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "files": ["bin/hig", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hydite/Hig.git"
+  },
+  "publishConfig": { "access": "public" },
+  "license": "MIT"
+}

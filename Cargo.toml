@@ -10,7 +10,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://example.invalid/hig"
+repository = "https://github.com/Hydite/Hig"
 
 [workspace.dependencies]
 anyhow = "1.0"

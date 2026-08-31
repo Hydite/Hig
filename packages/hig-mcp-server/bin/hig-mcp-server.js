@@ -4,13 +4,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveHigBinary } from "../lib/resolve-hig.js";
 
 const VERSION = "1.10.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const packageRoot = path.resolve(__dirname, "..");
-const bundledHig = path.join(packageRoot, "bin", process.platform === "win32" ? "hig.exe" : "hig");
 
 const MAX_OUTPUT_BYTES = Number(process.env.HIG_MCP_MAX_OUTPUT_BYTES || 1_000_000);
 const DEFAULT_TIMEOUT_MS = Number(process.env.HIG_MCP_TIMEOUT_MS || 20 * 60 * 1000);
@@ -810,7 +810,7 @@ function isInside(target, root) {
 }
 
 async function runHig(args, options = {}) {
-  const higBin = process.env.HIG_BIN || (fs.existsSync(bundledHig) ? bundledHig : "hig");
+  const higBin = resolveHigBinary({ packageRoot });
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
   return new Promise((resolve) => {
     const child = spawn(higBin, args, {
@@ -867,7 +867,7 @@ async function startRepositoryWatcher(args) {
   }
   const message = args.message || "IDE automatic snapshot";
   const author = args.author || null;
-  const higBin = process.env.HIG_BIN || (fs.existsSync(bundledHig) ? bundledHig : "hig");
+  const higBin = resolveHigBinary({ packageRoot });
   const command = [
     "repo", "watch", root,
     "--debounce-ms", String(debounceMs),

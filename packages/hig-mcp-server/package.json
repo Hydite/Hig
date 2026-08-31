@@ -1,12 +1,21 @@
 {
-  "name": "@hig/archive-mcp-server",
+  "name": "@zorker/hig",
   "version": "1.10.0",
-  "private": true,
-  "description": "MCP stdio adapter for the Hig CLI archive tool.",
+  "description": "HIG project-aware archive CLI and constrained MCP server.",
   "type": "module",
   "bin": {
+    "hig": "./bin/hig.js",
     "hig-mcp-server": "./bin/hig-mcp-server.js"
   },
+  "files": [
+    "bin/hig.js",
+    "bin/hig-mcp-server.js",
+    "lib/resolve-hig.js",
+    "examples/mcp-config.json",
+    "README.md",
+    "tools.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node ./bin/hig-mcp-server.js",
     "smoke": "node ./bin/hig-mcp-server.js --smoke",
@@ -14,6 +23,29 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@zorker/hig-darwin-universal": "1.10.0",
+    "@zorker/hig-linux-x64-gnu": "1.10.0",
+    "@zorker/hig-win32-x64-msvc": "1.10.0"
+  },
+  "keywords": [
+    "archive",
+    "compression",
+    "mcp",
+    "repository",
+    "ide"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hydite/Hig.git"
+  },
+  "homepage": "https://github.com/Hydite/Hig#readme",
+  "bugs": {
+    "url": "https://github.com/Hydite/Hig/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "license": "MIT"
 }

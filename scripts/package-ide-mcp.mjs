@@ -21,8 +21,9 @@ const stage = path.join(stageRoot, "hig-mcp-server");
 
 assertFile(binary);
 fs.mkdirSync(path.join(stage, "bin"), { recursive: true });
+fs.mkdirSync(path.join(stage, "lib"), { recursive: true });
 fs.mkdirSync(path.join(stage, "examples"), { recursive: true });
-for (const relative of ["README.md", "package.json", "tools.md", "bin/hig-mcp-server.js", "examples/mcp-config.json"]) {
+for (const relative of ["README.md", "LICENSE", "package.json", "tools.md", "bin/hig.js", "bin/hig-mcp-server.js", "lib/resolve-hig.js", "examples/mcp-config.json"]) {
   const source = path.join(root, "packages", "hig-mcp-server", relative);
   const destination = path.join(stage, relative);
   fs.mkdirSync(path.dirname(destination), { recursive: true });

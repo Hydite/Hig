@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "hig": {
-      "command": "node",
-      "args": ["/absolute/path/to/hig-mcp-server/bin/hig-mcp-server.js"],
+      "command": "hig-mcp-server",
+      "args": [],
       "env": {
         "HIG_MCP_ALLOWED_ROOTS": "/absolute/path/to/workspace",
         "HIG_MCP_WORKDIR": "/absolute/path/to/workspace"
