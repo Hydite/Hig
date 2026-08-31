@@ -460,6 +460,31 @@ struct ChunkReference {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileObjectV1 {
+    schema: u16,
+    file_type: RepositoryFileType,
+    size: u64,
+    permissions: u32,
+    mtime_ns: i128,
+    content_hash: [u8; 32],
+    chunking_schema: u16,
+    chunks: Vec<ChunkReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileObjectV2 {
+    schema: u16,
+    file_type: RepositoryFileType,
+    size: u64,
+    permissions: u32,
+    mtime_ns: i128,
+    content_hash: [u8; 32],
+    chunking_schema: u16,
+    hardlink_id: Option<[u8; 32]>,
+    chunks: Vec<ChunkReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FileObject {
     schema: u16,
     file_type: RepositoryFileType,
@@ -468,6 +493,7 @@ struct FileObject {
     mtime_ns: i128,
     content_hash: [u8; 32],
     chunking_schema: u16,
+    hardlink_id: Option<[u8; 32]>,
     chunks: Vec<ChunkReference>,
 }
 
@@ -647,6 +673,20 @@ struct FileFingerprint {
     size: u64,
     modified_ns: i128,
     permissions: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceFileIdentity {
+    volume: u64,
+    file: u64,
+    links: u64,
+}
+
+#[derive(Debug)]
+struct StableSourceRead {
+    content: Vec<u8>,
+    fingerprint: FileFingerprint,
+    hardlink_id: Option<[u8; 32]>,
 }
 
 pub struct RepositoryWatcher {
@@ -1023,9 +1063,9 @@ pub fn snapshot_repository(
     for source in source_paths.files {
         let relative = source.path.strip_prefix(&repository.root)?;
         let relative = normalize_relative_path(relative)?;
-        let (content, fingerprint) = stable_read_source(&source)?;
+        let stable = stable_read_source(&source)?;
         let mut chunks = Vec::new();
-        for bytes in repository_chunks(&content, repository.config.chunking.schema) {
+        for bytes in repository_chunks(&stable.content, repository.config.chunking.schema) {
             let (object_id, written, stored_bytes) =
                 repository.put_raw(ObjectKind::Chunk, bytes)?;
             if written {
@@ -1041,14 +1081,15 @@ pub fn snapshot_repository(
                 len: bytes.len() as u64,
             });
         }
-        let file = FileObject {
-            schema: 1,
+        let file = FileObjectV2 {
+            schema: 2,
             file_type: source.file_type,
-            size: content.len() as u64,
-            permissions: fingerprint.permissions,
-            mtime_ns: fingerprint.modified_ns,
-            content_hash: *blake3::hash(&content).as_bytes(),
+            size: stable.content.len() as u64,
+            permissions: stable.fingerprint.permissions,
+            mtime_ns: stable.fingerprint.modified_ns,
+            content_hash: *blake3::hash(&stable.content).as_bytes(),
             chunking_schema: repository.config.chunking.schema,
+            hardlink_id: stable.hardlink_id,
             chunks,
         };
         let (file_id, written, stored_bytes) = repository.put(ObjectKind::File, &file)?;
@@ -1059,7 +1100,7 @@ pub fn snapshot_repository(
         }
         insert_file(&mut root_node, &relative, file_id)?;
         files += 1;
-        input_bytes += content.len() as u64;
+        input_bytes += stable.content.len() as u64;
     }
 
     for directory in source_paths.directories {
@@ -1278,6 +1319,7 @@ pub fn restore_repository(
         let mut restored_files = 0_u64;
         let mut restored_bytes = 0_u64;
         let mut selected_directory = false;
+        let mut restored_hardlinks = BTreeMap::<[u8; 32], (PathBuf, FileObject)>::new();
         for directory in &directories {
             if directory.path.is_empty() {
                 continue;
@@ -1307,7 +1349,22 @@ pub fn restore_repository(
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
-            restore_file(&repository, state, &destination)?;
+            if let Some(hardlink_id) = state.object.hardlink_id {
+                if let Some((existing, existing_object)) = restored_hardlinks.get(&hardlink_id) {
+                    anyhow::ensure!(
+                        existing_object == &state.object,
+                        "hardlink group contains inconsistent file objects"
+                    );
+                    fs::hard_link(existing, &destination)?;
+                    verify_hardlink_pair(existing, &destination)?;
+                } else {
+                    restore_file(&repository, state, &destination)?;
+                    restored_hardlinks
+                        .insert(hardlink_id, (destination.clone(), state.object.clone()));
+                }
+            } else {
+                restore_file(&repository, state, &destination)?;
+            }
             restored_files += 1;
             restored_bytes += state.object.size;
         }
@@ -1628,6 +1685,10 @@ pub fn verify_repository(start: &Path) -> anyhow::Result<RepositoryVerifyReport>
         );
         verify_reachable(&repository, *object_id, &mut visited, &mut report)?;
     }
+    let mut validated_commits = BTreeSet::new();
+    for object_id in refs.values() {
+        validate_commit_hardlink_groups(&repository, *object_id, &mut validated_commits)?;
+    }
     Ok(report)
 }
 
@@ -1691,6 +1752,7 @@ fn replicate_or_repair_repository_revision(
     let mut source_verify = RepositoryVerifyReport::default();
     let mut reachable = BTreeSet::new();
     verify_reachable(&source, commit_id, &mut reachable, &mut source_verify)?;
+    validate_commit_hardlink_groups(&source, commit_id, &mut BTreeSet::new())?;
 
     let destination_state = repository_state_dir(destination_root);
     let destination_config_path = destination_state.join("config.json");
@@ -2509,6 +2571,66 @@ fn insert_directory(
     Ok(())
 }
 
+fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
+    anyhow::ensure!(raw.len() >= 2, "file object is truncated");
+    let object = match u16::from_le_bytes([raw[0], raw[1]]) {
+        1 => {
+            let file: FileObjectV1 = deserialize_canonical(raw)?;
+            anyhow::ensure!(file.schema == 1, "unsupported file object schema");
+            FileObject {
+                schema: file.schema,
+                file_type: file.file_type,
+                size: file.size,
+                permissions: file.permissions,
+                mtime_ns: file.mtime_ns,
+                content_hash: file.content_hash,
+                chunking_schema: file.chunking_schema,
+                hardlink_id: None,
+                chunks: file.chunks,
+            }
+        }
+        2 => {
+            let file: FileObjectV2 = deserialize_canonical(raw)?;
+            anyhow::ensure!(file.schema == 2, "unsupported file object schema");
+            FileObject {
+                schema: file.schema,
+                file_type: file.file_type,
+                size: file.size,
+                permissions: file.permissions,
+                mtime_ns: file.mtime_ns,
+                content_hash: file.content_hash,
+                chunking_schema: file.chunking_schema,
+                hardlink_id: file.hardlink_id,
+                chunks: file.chunks,
+            }
+        }
+        schema => anyhow::bail!("unsupported file object schema {schema}"),
+    };
+    anyhow::ensure!(
+        object.file_type == RepositoryFileType::Regular || object.hardlink_id.is_none(),
+        "symbolic-link object cannot declare a hardlink identity"
+    );
+    let chunk_bytes = object.chunks.iter().try_fold(0_u64, |total, chunk| {
+        total
+            .checked_add(chunk.len)
+            .ok_or_else(|| anyhow::anyhow!("file chunk length overflow"))
+    })?;
+    anyhow::ensure!(
+        chunk_bytes == object.size,
+        "file chunk lengths do not match size"
+    );
+    Ok(object)
+}
+
+fn read_file_object(
+    repository: &Repository,
+    file_id: RepositoryObjectId,
+) -> anyhow::Result<FileObject> {
+    let (kind, raw) = repository.read_raw(file_id)?;
+    anyhow::ensure!(kind == ObjectKind::File, "expected repository File object");
+    deserialize_file_object(&raw)
+}
+
 fn deserialize_tree_object(raw: &[u8]) -> anyhow::Result<TreeObject> {
     anyhow::ensure!(raw.len() >= 2, "tree object is truncated");
     match u16::from_le_bytes([raw[0], raw[1]]) {
@@ -2574,8 +2696,7 @@ fn flatten_tree_at(
         };
         match entry.kind {
             TreeEntryKind::File => {
-                let object: FileObject = repository.read(entry.object_id, ObjectKind::File)?;
-                anyhow::ensure!(object.schema == 1, "unsupported file object schema");
+                let object = read_file_object(repository, entry.object_id)?;
                 anyhow::ensure!(
                     files
                         .insert(
@@ -2591,6 +2712,36 @@ fn flatten_tree_at(
             }
             TreeEntryKind::Tree => flatten_tree_at(repository, entry.object_id, &path, files)?,
         }
+    }
+    Ok(())
+}
+
+fn validate_commit_hardlink_groups(
+    repository: &Repository,
+    commit_id: RepositoryObjectId,
+    validated_commits: &mut BTreeSet<RepositoryObjectId>,
+) -> anyhow::Result<()> {
+    if !validated_commits.insert(commit_id) {
+        return Ok(());
+    }
+    let commit: CommitObject = repository.read(commit_id, ObjectKind::Commit)?;
+    let files = flatten_tree(repository, commit.root_tree)?;
+    let mut groups = BTreeMap::<[u8; 32], &FileObject>::new();
+    for state in files.values() {
+        let Some(hardlink_id) = state.object.hardlink_id else {
+            continue;
+        };
+        if let Some(existing) = groups.get(&hardlink_id) {
+            anyhow::ensure!(
+                *existing == &state.object,
+                "hardlink group contains inconsistent file objects"
+            );
+        } else {
+            groups.insert(hardlink_id, &state.object);
+        }
+    }
+    if let Some(parent) = commit.parent {
+        validate_commit_hardlink_groups(repository, parent, validated_commits)?;
     }
     Ok(())
 }
@@ -2666,6 +2817,24 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
     file.sync_all()?;
     set_file_modified_time(&file, state.object.mtime_ns)?;
     set_permissions(path, state.object.permissions)?;
+    Ok(())
+}
+
+fn verify_hardlink_pair(existing: &Path, linked: &Path) -> anyhow::Result<()> {
+    let existing_file = File::open(existing)?;
+    let linked_file = File::open(linked)?;
+    let existing_identity = source_file_identity(&existing_file, &existing_file.metadata()?)?;
+    let linked_identity = source_file_identity(&linked_file, &linked_file.metadata()?)?;
+    match (existing_identity, linked_identity) {
+        (Some(existing), Some(linked)) => anyhow::ensure!(
+            existing.volume == linked.volume
+                && existing.file == linked.file
+                && existing.links >= 2
+                && linked.links >= 2,
+            "restored hardlink identity verification failed"
+        ),
+        _ => anyhow::bail!("hardlink identity verification is unavailable on this platform"),
+    }
     Ok(())
 }
 
@@ -2817,7 +2986,8 @@ fn build_indexed_changes(
             }
             (Some(left), Some(right))
                 if left.object.permissions != right.object.permissions
-                    || left.object.mtime_ns != right.object.mtime_ns =>
+                    || left.object.mtime_ns != right.object.mtime_ns
+                    || left.object.hardlink_id != right.object.hardlink_id =>
             {
                 (RepositoryChangeKind::Metadata, None, Vec::new())
             }
@@ -3521,7 +3691,7 @@ fn verify_reachable(
         ObjectKind::Chunk => report.chunks += 1,
         ObjectKind::File => {
             report.files += 1;
-            let file: FileObject = deserialize_canonical(&raw)?;
+            let file = deserialize_file_object(&raw)?;
             for chunk in file.chunks {
                 verify_reachable(repository, chunk.object_id, visited, report)?;
             }
@@ -3617,13 +3787,35 @@ fn publish_restored_tree(stage: &Path, output: &Path, overwrite: bool) -> anyhow
     }
 }
 
-fn stable_read(path: &Path) -> anyhow::Result<(Vec<u8>, FileFingerprint)> {
+fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
     for _ in 0..3 {
-        let before = file_fingerprint(&fs::metadata(path)?)?;
-        let bytes = fs::read(path)?;
-        let after = file_fingerprint(&fs::metadata(path)?)?;
-        if before == after && after.size == bytes.len() as u64 {
-            return Ok((bytes, after));
+        let mut file = File::open(path)?;
+        let before_metadata = file.metadata()?;
+        anyhow::ensure!(before_metadata.is_file(), "repository source changed type");
+        let before = file_fingerprint(&before_metadata)?;
+        let before_identity = source_file_identity(&file, &before_metadata)?;
+        let mut content = Vec::with_capacity(before.size.min(usize::MAX as u64) as usize);
+        (&mut file)
+            .take(before.size.saturating_add(1))
+            .read_to_end(&mut content)?;
+        let after_metadata = file.metadata()?;
+        let after = file_fingerprint(&after_metadata)?;
+        let after_identity = source_file_identity(&file, &after_metadata)?;
+        let current_file = File::open(path)?;
+        let current_metadata = current_file.metadata()?;
+        let current = file_fingerprint(&current_metadata)?;
+        let current_identity = source_file_identity(&current_file, &current_metadata)?;
+        if before == after
+            && after == current
+            && before_identity == after_identity
+            && after_identity == current_identity
+            && current.size == content.len() as u64
+        {
+            return Ok(StableSourceRead {
+                content,
+                fingerprint: current,
+                hardlink_id: current_identity.and_then(hardlink_id),
+            });
         }
     }
     anyhow::bail!(
@@ -3632,7 +3824,7 @@ fn stable_read(path: &Path) -> anyhow::Result<(Vec<u8>, FileFingerprint)> {
     )
 }
 
-fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<(Vec<u8>, FileFingerprint)> {
+fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<StableSourceRead> {
     match source.file_type {
         RepositoryFileType::Regular => stable_read(&source.path),
         RepositoryFileType::Symlink => {
@@ -3642,7 +3834,11 @@ fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<(Vec<u8>, FileF
                 let bytes = symlink_target_bytes(&target)?;
                 let after = file_fingerprint(&fs::symlink_metadata(&source.path)?)?;
                 if before == after {
-                    return Ok((bytes, after));
+                    return Ok(StableSourceRead {
+                        content: bytes,
+                        fingerprint: after,
+                        hardlink_id: None,
+                    });
                 }
             }
             anyhow::bail!(
@@ -3651,6 +3847,63 @@ fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<(Vec<u8>, FileF
             )
         }
     }
+}
+
+#[cfg(unix)]
+fn source_file_identity(
+    _file: &File,
+    metadata: &fs::Metadata,
+) -> anyhow::Result<Option<SourceFileIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(Some(SourceFileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+        links: metadata.nlink(),
+    }))
+}
+
+#[cfg(windows)]
+fn source_file_identity(
+    file: &File,
+    _metadata: &fs::Metadata,
+) -> anyhow::Result<Option<SourceFileIdentity>> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(Some(SourceFileIdentity {
+        volume: u64::from(information.dwVolumeSerialNumber),
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        links: u64::from(information.nNumberOfLinks),
+    }))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn source_file_identity(
+    _file: &File,
+    _metadata: &fs::Metadata,
+) -> anyhow::Result<Option<SourceFileIdentity>> {
+    Ok(None)
+}
+
+fn hardlink_id(identity: SourceFileIdentity) -> Option<[u8; 32]> {
+    if identity.links <= 1 {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hig-repository-hardlink-v1\0");
+    hasher.update(&identity.volume.to_le_bytes());
+    hasher.update(&identity.file.to_le_bytes());
+    Some(*hasher.finalize().as_bytes())
 }
 
 fn symlink_target_bytes(target: &Path) -> anyhow::Result<Vec<u8>> {
@@ -4241,9 +4494,29 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         init_repository(temp.path(), Vec::new()).unwrap();
         let repository = Repository::discover(temp.path()).unwrap();
+        let content = b"legacy file object";
+        let (chunk_id, _, _) = repository.put_raw(ObjectKind::Chunk, content).unwrap();
+        let legacy_file = FileObjectV1 {
+            schema: 1,
+            file_type: RepositoryFileType::Regular,
+            size: content.len() as u64,
+            permissions: 0o100644,
+            mtime_ns: 1_700_000_000_000_000_000,
+            content_hash: *blake3::hash(content).as_bytes(),
+            chunking_schema: 1,
+            chunks: vec![ChunkReference {
+                object_id: chunk_id,
+                len: content.len() as u64,
+            }],
+        };
+        let (file_id, _, _) = repository.put(ObjectKind::File, &legacy_file).unwrap();
         let legacy_tree = TreeObjectV1 {
             schema: 1,
-            entries: Vec::new(),
+            entries: vec![TreeEntry {
+                name: "legacy.txt".to_string(),
+                kind: TreeEntryKind::File,
+                object_id: file_id,
+            }],
         };
         let (tree_id, _, _) = repository.put(ObjectKind::Tree, &legacy_tree).unwrap();
         let legacy_commit = CommitObject {
@@ -4253,8 +4526,8 @@ mod tests {
             created_unix_ns: 1_700_000_000_000_000_000,
             message: "legacy tree".to_string(),
             author: None,
-            files: 0,
-            input_bytes: 0,
+            files: 1,
+            input_bytes: content.len() as u64,
             change_index: None,
             semantic_index: None,
             compression_tree_index: None,
@@ -4264,7 +4537,11 @@ mod tests {
 
         let decoded = read_tree_object(&repository, tree_id).unwrap();
         assert_eq!(decoded.metadata, None);
-        assert!(decoded.entries.is_empty());
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(
+            read_file_object(&repository, file_id).unwrap().hardlink_id,
+            None
+        );
         verify_repository(temp.path()).unwrap();
 
         let output = temp.path().parent().unwrap().join(format!(
@@ -4272,7 +4549,7 @@ mod tests {
             hex::encode(crate::random_bytes::<4>())
         ));
         restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
-        assert!(output.is_dir());
+        assert_eq!(fs::read(output.join("legacy.txt")).unwrap(), content);
         fs::remove_dir_all(output).unwrap();
     }
 
@@ -4412,6 +4689,161 @@ mod tests {
                 .modified_ns;
         assert_eq!(restored_mtime, expected_mtime);
         fs::remove_dir_all(output).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn hardlink_identity_survives_source_deletion_and_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original.bin");
+        let alias = temp.path().join("nested/alias.bin");
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        fs::write(&original, b"shared inode content").unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        snapshot_repository(temp.path(), "hardlink".to_string(), None).unwrap();
+
+        let repository = Repository::discover(temp.path()).unwrap();
+        let commit: CommitObject = repository
+            .read(repository.read_head().unwrap().unwrap(), ObjectKind::Commit)
+            .unwrap();
+        let files = flatten_tree(&repository, commit.root_tree).unwrap();
+        assert_eq!(files["original.bin"].object.schema, 2);
+        assert!(files["original.bin"].object.hardlink_id.is_some());
+        assert_eq!(
+            files["original.bin"].object.hardlink_id,
+            files["nested/alias.bin"].object.hardlink_id
+        );
+        assert_eq!(
+            files["original.bin"].object_id,
+            files["nested/alias.bin"].object_id
+        );
+
+        fs::remove_file(&original).unwrap();
+        fs::remove_dir_all(temp.path().join("nested")).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-hardlink-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        let restored_original = output.join("original.bin");
+        let restored_alias = output.join("nested/alias.bin");
+        verify_hardlink_pair(&restored_original, &restored_alias).unwrap();
+        fs::write(&restored_original, b"changed through one name").unwrap();
+        assert_eq!(
+            fs::read(&restored_alias).unwrap(),
+            b"changed through one name"
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replacing_one_hardlink_with_an_independent_copy_is_a_metadata_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original.bin");
+        let alias = temp.path().join("alias.bin");
+        fs::write(&original, b"same bytes").unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "linked".to_string(), None).unwrap();
+        let original_metadata = fs::metadata(&original).unwrap();
+
+        fs::remove_file(&alias).unwrap();
+        fs::copy(&original, &alias).unwrap();
+        set_file_modified_time(
+            &File::options().write(true).open(&alias).unwrap(),
+            metadata_modified_ns(&original_metadata).unwrap(),
+        )
+        .unwrap();
+        set_permissions(&alias, metadata_permissions(&original_metadata)).unwrap();
+        let second = snapshot_repository(temp.path(), "unlinked".to_string(), None).unwrap();
+        let diff = repository_diff(
+            temp.path(),
+            Some(&first.commit_id.to_hex()),
+            Some(&second.commit_id.to_hex()),
+        )
+        .unwrap();
+        assert_eq!(diff.metadata, 2);
+        assert_eq!(
+            diff.changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            ["alias.bin", "original.bin"]
+        );
+        assert!(
+            diff.changes
+                .iter()
+                .all(|change| change.kind == RepositoryChangeKind::Metadata)
+        );
+    }
+
+    #[test]
+    fn inconsistent_hardlink_group_fails_verify_and_atomic_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        let hardlink_id = [0x5a; 32];
+        let mut entries = Vec::new();
+        for (name, content) in [("a.bin", b"a".as_slice()), ("b.bin", b"b".as_slice())] {
+            let (chunk_id, _, _) = repository.put_raw(ObjectKind::Chunk, content).unwrap();
+            let file = FileObjectV2 {
+                schema: 2,
+                file_type: RepositoryFileType::Regular,
+                size: 1,
+                permissions: 0o100644,
+                mtime_ns: 1_700_000_000_000_000_000,
+                content_hash: *blake3::hash(content).as_bytes(),
+                chunking_schema: 2,
+                hardlink_id: Some(hardlink_id),
+                chunks: vec![ChunkReference {
+                    object_id: chunk_id,
+                    len: 1,
+                }],
+            };
+            let (file_id, _, _) = repository.put(ObjectKind::File, &file).unwrap();
+            entries.push(TreeEntry {
+                name: name.to_string(),
+                kind: TreeEntryKind::File,
+                object_id: file_id,
+            });
+        }
+        let root_metadata = directory_metadata(&fs::metadata(temp.path()).unwrap()).unwrap();
+        let tree = TreeObjectV2 {
+            schema: 2,
+            permissions: root_metadata.permissions,
+            mtime_ns: root_metadata.mtime_ns,
+            entries,
+        };
+        let (tree_id, _, _) = repository.put(ObjectKind::Tree, &tree).unwrap();
+        let commit = CommitObject {
+            schema: 1,
+            root_tree: tree_id,
+            parent: None,
+            created_unix_ns: now_unix_ns(),
+            message: "invalid hardlink group".to_string(),
+            author: None,
+            files: 2,
+            input_bytes: 2,
+            change_index: None,
+            semantic_index: None,
+            compression_tree_index: None,
+        };
+        let (commit_id, _, _) = repository.put(ObjectKind::Commit, &commit).unwrap();
+        repository.publish_head(commit_id).unwrap();
+
+        let verify_error = verify_repository(temp.path()).unwrap_err().to_string();
+        assert!(verify_error.contains("hardlink group contains inconsistent"));
+        let output = temp.path().parent().unwrap().join(format!(
+            "rejected-hardlink-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        let restore_error = restore_repository(temp.path(), "HEAD", &output, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(restore_error.contains("hardlink group contains inconsistent"));
+        assert!(!output.exists());
     }
 
     #[test]
