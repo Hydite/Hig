@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -484,6 +484,20 @@ struct FileObjectV2 {
     chunks: Vec<ChunkReference>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileObjectV3 {
+    schema: u16,
+    file_type: RepositoryFileType,
+    size: u64,
+    permissions: u32,
+    mtime_ns: i128,
+    content_hash: [u8; 32],
+    chunking_schema: u16,
+    hardlink_id: Option<[u8; 32]>,
+    allocated_extents: Vec<FileExtent>,
+    chunks: Vec<ChunkReference>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileObject {
     schema: u16,
@@ -494,7 +508,14 @@ struct FileObject {
     content_hash: [u8; 32],
     chunking_schema: u16,
     hardlink_id: Option<[u8; 32]>,
+    allocated_extents: Option<Vec<FileExtent>>,
     chunks: Vec<ChunkReference>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+struct FileExtent {
+    offset: u64,
+    len: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -684,9 +705,18 @@ struct SourceFileIdentity {
 
 #[derive(Debug)]
 struct StableSourceRead {
-    content: Vec<u8>,
+    logical_size: u64,
+    content_hash: [u8; 32],
+    data_extents: Vec<StableDataExtent>,
+    allocated_extents: Option<Vec<FileExtent>>,
     fingerprint: FileFingerprint,
     hardlink_id: Option<[u8; 32]>,
+}
+
+#[derive(Debug)]
+struct StableDataExtent {
+    offset: u64,
+    content: Vec<u8>,
 }
 
 pub struct RepositoryWatcher {
@@ -1065,34 +1095,57 @@ pub fn snapshot_repository(
         let relative = normalize_relative_path(relative)?;
         let stable = stable_read_source(&source)?;
         let mut chunks = Vec::new();
-        for bytes in repository_chunks(&stable.content, repository.config.chunking.schema) {
-            let (object_id, written, stored_bytes) =
-                repository.put_raw(ObjectKind::Chunk, bytes)?;
-            if written {
-                stats.objects_written += 1;
-                stats.object_bytes_written += stored_bytes;
-                stats.chunks_written += 1;
-                stats.new_objects.push(object_id);
-            } else {
-                stats.chunks_reused += 1;
+        for extent in &stable.data_extents {
+            for bytes in repository_chunks(&extent.content, repository.config.chunking.schema) {
+                let (object_id, written, stored_bytes) =
+                    repository.put_raw(ObjectKind::Chunk, bytes)?;
+                if written {
+                    stats.objects_written += 1;
+                    stats.object_bytes_written += stored_bytes;
+                    stats.chunks_written += 1;
+                    stats.new_objects.push(object_id);
+                } else {
+                    stats.chunks_reused += 1;
+                }
+                chunks.push(ChunkReference {
+                    object_id,
+                    len: bytes.len() as u64,
+                });
             }
-            chunks.push(ChunkReference {
-                object_id,
-                len: bytes.len() as u64,
-            });
         }
-        let file = FileObjectV2 {
-            schema: 2,
-            file_type: source.file_type,
-            size: stable.content.len() as u64,
-            permissions: stable.fingerprint.permissions,
-            mtime_ns: stable.fingerprint.modified_ns,
-            content_hash: *blake3::hash(&stable.content).as_bytes(),
-            chunking_schema: repository.config.chunking.schema,
-            hardlink_id: stable.hardlink_id,
-            chunks,
-        };
-        let (file_id, written, stored_bytes) = repository.put(ObjectKind::File, &file)?;
+        let (file_id, written, stored_bytes) =
+            if let Some(allocated_extents) = stable.allocated_extents {
+                repository.put(
+                    ObjectKind::File,
+                    &FileObjectV3 {
+                        schema: 3,
+                        file_type: source.file_type,
+                        size: stable.logical_size,
+                        permissions: stable.fingerprint.permissions,
+                        mtime_ns: stable.fingerprint.modified_ns,
+                        content_hash: stable.content_hash,
+                        chunking_schema: repository.config.chunking.schema,
+                        hardlink_id: stable.hardlink_id,
+                        allocated_extents,
+                        chunks,
+                    },
+                )?
+            } else {
+                repository.put(
+                    ObjectKind::File,
+                    &FileObjectV2 {
+                        schema: 2,
+                        file_type: source.file_type,
+                        size: stable.logical_size,
+                        permissions: stable.fingerprint.permissions,
+                        mtime_ns: stable.fingerprint.modified_ns,
+                        content_hash: stable.content_hash,
+                        chunking_schema: repository.config.chunking.schema,
+                        hardlink_id: stable.hardlink_id,
+                        chunks,
+                    },
+                )?
+            };
         if written {
             stats.objects_written += 1;
             stats.object_bytes_written += stored_bytes;
@@ -1100,7 +1153,7 @@ pub fn snapshot_repository(
         }
         insert_file(&mut root_node, &relative, file_id)?;
         files += 1;
-        input_bytes += stable.content.len() as u64;
+        input_bytes += stable.logical_size;
     }
 
     for directory in source_paths.directories {
@@ -2586,6 +2639,7 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 content_hash: file.content_hash,
                 chunking_schema: file.chunking_schema,
                 hardlink_id: None,
+                allocated_extents: None,
                 chunks: file.chunks,
             }
         }
@@ -2601,6 +2655,23 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
                 content_hash: file.content_hash,
                 chunking_schema: file.chunking_schema,
                 hardlink_id: file.hardlink_id,
+                allocated_extents: None,
+                chunks: file.chunks,
+            }
+        }
+        3 => {
+            let file: FileObjectV3 = deserialize_canonical(raw)?;
+            anyhow::ensure!(file.schema == 3, "unsupported file object schema");
+            FileObject {
+                schema: file.schema,
+                file_type: file.file_type,
+                size: file.size,
+                permissions: file.permissions,
+                mtime_ns: file.mtime_ns,
+                content_hash: file.content_hash,
+                chunking_schema: file.chunking_schema,
+                hardlink_id: file.hardlink_id,
+                allocated_extents: Some(file.allocated_extents),
                 chunks: file.chunks,
             }
         }
@@ -2610,16 +2681,89 @@ fn deserialize_file_object(raw: &[u8]) -> anyhow::Result<FileObject> {
         object.file_type == RepositoryFileType::Regular || object.hardlink_id.is_none(),
         "symbolic-link object cannot declare a hardlink identity"
     );
+    anyhow::ensure!(
+        object.file_type == RepositoryFileType::Regular || object.allocated_extents.is_none(),
+        "symbolic-link object cannot declare sparse extents"
+    );
     let chunk_bytes = object.chunks.iter().try_fold(0_u64, |total, chunk| {
         total
             .checked_add(chunk.len)
             .ok_or_else(|| anyhow::anyhow!("file chunk length overflow"))
     })?;
+    let expected_chunk_bytes = match &object.allocated_extents {
+        Some(extents) => validate_file_extents(object.size, extents)?,
+        None => object.size,
+    };
     anyhow::ensure!(
-        chunk_bytes == object.size,
-        "file chunk lengths do not match size"
+        chunk_bytes == expected_chunk_bytes,
+        "file chunk lengths do not match allocated extent bytes"
     );
+    validate_chunk_extent_mapping(
+        object.size,
+        object.allocated_extents.as_deref(),
+        &object.chunks,
+    )?;
     Ok(object)
+}
+
+fn validate_file_extents(size: u64, extents: &[FileExtent]) -> anyhow::Result<u64> {
+    let mut previous_end = 0_u64;
+    let mut allocated = 0_u64;
+    for extent in extents {
+        anyhow::ensure!(extent.len > 0, "sparse extent cannot be empty");
+        anyhow::ensure!(extent.offset >= previous_end, "sparse extents overlap");
+        let end = extent
+            .offset
+            .checked_add(extent.len)
+            .ok_or_else(|| anyhow::anyhow!("sparse extent overflows"))?;
+        anyhow::ensure!(end <= size, "sparse extent exceeds logical file size");
+        allocated = allocated
+            .checked_add(extent.len)
+            .ok_or_else(|| anyhow::anyhow!("sparse allocated length overflows"))?;
+        previous_end = end;
+    }
+    Ok(allocated)
+}
+
+fn validate_chunk_extent_mapping(
+    size: u64,
+    sparse_extents: Option<&[FileExtent]>,
+    chunks: &[ChunkReference],
+) -> anyhow::Result<()> {
+    let dense_extent = [FileExtent {
+        offset: 0,
+        len: size,
+    }];
+    let extents = match sparse_extents {
+        Some(extents) => extents,
+        None if size == 0 => &[],
+        None => &dense_extent,
+    };
+    let mut extent_index = 0_usize;
+    let mut consumed = 0_u64;
+    for chunk in chunks {
+        while extent_index < extents.len() && consumed == extents[extent_index].len {
+            extent_index += 1;
+            consumed = 0;
+        }
+        let extent = extents
+            .get(extent_index)
+            .ok_or_else(|| anyhow::anyhow!("file chunks exceed allocated extents"))?;
+        anyhow::ensure!(
+            chunk.len <= extent.len - consumed,
+            "file chunk crosses an allocated extent boundary"
+        );
+        consumed += chunk.len;
+    }
+    while extent_index < extents.len() && consumed == extents[extent_index].len {
+        extent_index += 1;
+        consumed = 0;
+    }
+    anyhow::ensure!(
+        extent_index == extents.len(),
+        "file chunks do not fill allocated extents"
+    );
+    Ok(())
 }
 
 fn read_file_object(
@@ -2793,30 +2937,93 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
         return Ok(());
     }
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    if state.object.allocated_extents.is_some() {
+        mark_file_sparse(&file)?;
+    }
+    file.set_len(state.object.size)?;
     let mut hasher = blake3::Hasher::new();
-    let mut written = 0_u64;
-    for chunk in &state.object.chunks {
-        let (kind, bytes) = repository.read_raw(chunk.object_id)?;
-        anyhow::ensure!(
-            kind == ObjectKind::Chunk,
-            "file references a non-chunk object"
-        );
-        anyhow::ensure!(bytes.len() as u64 == chunk.len, "chunk length mismatch");
+    let mut logical_position = 0_u64;
+    let mut stored_bytes = 0_u64;
+    for_each_file_data_chunk(repository, state, |offset, bytes| {
+        anyhow::ensure!(offset >= logical_position, "file chunks overlap");
+        hash_zeroes(&mut hasher, offset - logical_position);
+        file.seek(SeekFrom::Start(offset))?;
         file.write_all(&bytes)?;
         hasher.update(&bytes);
-        written += bytes.len() as u64;
-    }
+        logical_position = offset + bytes.len() as u64;
+        stored_bytes += bytes.len() as u64;
+        Ok(())
+    })?;
+    hash_zeroes(&mut hasher, state.object.size - logical_position);
+    let expected_stored = state
+        .object
+        .allocated_extents
+        .as_ref()
+        .map(|extents| validate_file_extents(state.object.size, extents))
+        .transpose()?
+        .unwrap_or(state.object.size);
     anyhow::ensure!(
-        written == state.object.size,
-        "restored file length mismatch"
+        stored_bytes == expected_stored,
+        "restored data length mismatch"
     );
     anyhow::ensure!(
         hasher.finalize().as_bytes() == &state.object.content_hash,
         "restored file checksum mismatch"
     );
     file.sync_all()?;
+    if let Some(extents) = &state.object.allocated_extents {
+        verify_restored_sparse_layout(&file, state.object.size, extents)?;
+    }
     set_file_modified_time(&file, state.object.mtime_ns)?;
     set_permissions(path, state.object.permissions)?;
+    Ok(())
+}
+
+fn for_each_file_data_chunk(
+    repository: &Repository,
+    state: &FileState,
+    mut callback: impl FnMut(u64, Vec<u8>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let dense_extent = [FileExtent {
+        offset: 0,
+        len: state.object.size,
+    }];
+    let extents = match &state.object.allocated_extents {
+        Some(extents) => extents.as_slice(),
+        None if state.object.size == 0 => &[],
+        None => &dense_extent,
+    };
+    let mut extent_index = 0_usize;
+    let mut offset_in_extent = 0_u64;
+    for chunk in &state.object.chunks {
+        while extent_index < extents.len() && offset_in_extent == extents[extent_index].len {
+            extent_index += 1;
+            offset_in_extent = 0;
+        }
+        let extent = extents
+            .get(extent_index)
+            .ok_or_else(|| anyhow::anyhow!("file chunks exceed allocated extents"))?;
+        anyhow::ensure!(
+            chunk.len <= extent.len - offset_in_extent,
+            "file chunk crosses an allocated extent boundary"
+        );
+        let (kind, bytes) = repository.read_raw(chunk.object_id)?;
+        anyhow::ensure!(
+            kind == ObjectKind::Chunk,
+            "file references a non-chunk object"
+        );
+        anyhow::ensure!(bytes.len() as u64 == chunk.len, "chunk length mismatch");
+        callback(extent.offset + offset_in_extent, bytes)?;
+        offset_in_extent += chunk.len;
+    }
+    while extent_index < extents.len() && offset_in_extent == extents[extent_index].len {
+        extent_index += 1;
+        offset_in_extent = 0;
+    }
+    anyhow::ensure!(
+        extent_index == extents.len(),
+        "file chunks do not fill allocated extents"
+    );
     Ok(())
 }
 
@@ -2838,21 +3045,80 @@ fn verify_hardlink_pair(existing: &Path, linked: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reconstruct_file_bytes(repository: &Repository, state: &FileState) -> anyhow::Result<Vec<u8>> {
-    let mut content = Vec::with_capacity(state.object.size as usize);
-    for chunk in &state.object.chunks {
-        let (kind, bytes) = repository.read_raw(chunk.object_id)?;
-        anyhow::ensure!(
-            kind == ObjectKind::Chunk,
-            "file references a non-chunk object"
-        );
-        anyhow::ensure!(bytes.len() as u64 == chunk.len, "chunk length mismatch");
-        content.extend_from_slice(&bytes);
+#[cfg(unix)]
+fn mark_file_sparse(_file: &File) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn mark_file_sparse(file: &File) -> anyhow::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut returned = 0_u32;
+    let result = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            null(),
+            0,
+            null_mut(),
+            0,
+            &mut returned,
+            null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
-    anyhow::ensure!(
-        content.len() as u64 == state.object.size,
-        "restored file length mismatch"
-    );
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn mark_file_sparse(_file: &File) -> anyhow::Result<()> {
+    anyhow::bail!("sparse file restore is not supported on this platform")
+}
+
+fn verify_restored_sparse_layout(
+    file: &File,
+    size: u64,
+    expected: &[FileExtent],
+) -> anyhow::Result<()> {
+    let actual = allocated_file_extents(file, size)?
+        .ok_or_else(|| anyhow::anyhow!("destination cannot verify sparse file layout"))?;
+    for extent in actual {
+        let actual_end = extent.offset + extent.len;
+        anyhow::ensure!(
+            expected.iter().any(|expected| {
+                let expected_end = expected.offset + expected.len;
+                extent.offset >= expected.offset && actual_end <= expected_end
+            }),
+            "restored file allocated data inside a declared sparse hole"
+        );
+    }
+    Ok(())
+}
+
+fn reconstruct_file_bytes(repository: &Repository, state: &FileState) -> anyhow::Result<Vec<u8>> {
+    let size: usize = state
+        .object
+        .size
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("file is too large to reconstruct in memory"))?;
+    let mut content = vec![0_u8; size];
+    for_each_file_data_chunk(repository, state, |offset, bytes| {
+        let start: usize = offset
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("file chunk offset exceeds address space"))?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("file chunk range overflows"))?;
+        anyhow::ensure!(end <= content.len(), "file chunk exceeds logical size");
+        content[start..end].copy_from_slice(&bytes);
+        Ok(())
+    })?;
     anyhow::ensure!(
         blake3::hash(&content).as_bytes() == &state.object.content_hash,
         "restored file checksum mismatch"
@@ -3620,30 +3886,24 @@ fn reconstruct_file_range(
     let end = start
         .checked_add(len)
         .ok_or_else(|| anyhow::anyhow!("range length overflow"))?;
-    let mut output = Vec::with_capacity(len as usize);
-    let mut chunk_start = 0_u64;
-    for chunk in &state.object.chunks {
-        let chunk_end = chunk_start + chunk.len;
+    anyhow::ensure!(end <= state.object.size, "range exceeds logical file size");
+    let output_len: usize = len
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("range is too large for this platform"))?;
+    let mut output = vec![0_u8; output_len];
+    for_each_file_data_chunk(repository, state, |chunk_start, bytes| {
+        let chunk_end = chunk_start + bytes.len() as u64;
         if chunk_end > start && chunk_start < end {
-            let (kind, bytes) = repository.read_raw(chunk.object_id)?;
-            anyhow::ensure!(
-                kind == ObjectKind::Chunk,
-                "file references non-chunk object"
-            );
-            anyhow::ensure!(bytes.len() as u64 == chunk.len, "chunk length mismatch");
-            let local_start = start.saturating_sub(chunk_start) as usize;
-            let local_end = (end.min(chunk_end) - chunk_start) as usize;
-            output.extend_from_slice(&bytes[local_start..local_end]);
+            let overlap_start = start.max(chunk_start);
+            let overlap_end = end.min(chunk_end);
+            let source_start = (overlap_start - chunk_start) as usize;
+            let source_end = (overlap_end - chunk_start) as usize;
+            let output_start = (overlap_start - start) as usize;
+            let output_end = (overlap_end - start) as usize;
+            output[output_start..output_end].copy_from_slice(&bytes[source_start..source_end]);
         }
-        chunk_start = chunk_end;
-        if chunk_start >= end {
-            break;
-        }
-    }
-    anyhow::ensure!(
-        output.len() as u64 == len,
-        "range reconstruction length mismatch"
-    );
+        Ok(())
+    })?;
     Ok(output)
 }
 
@@ -3794,25 +4054,34 @@ fn stable_read(path: &Path) -> anyhow::Result<StableSourceRead> {
         anyhow::ensure!(before_metadata.is_file(), "repository source changed type");
         let before = file_fingerprint(&before_metadata)?;
         let before_identity = source_file_identity(&file, &before_metadata)?;
-        let mut content = Vec::with_capacity(before.size.min(usize::MAX as u64) as usize);
-        (&mut file)
-            .take(before.size.saturating_add(1))
-            .read_to_end(&mut content)?;
+        let before_ranges = allocated_file_extents(&file, before.size)?;
+        let sparse_extents = before_ranges
+            .as_ref()
+            .filter(|extents| is_sparse_layout(before.size, extents))
+            .cloned();
+        let data_extents = read_source_data_extents(&mut file, before.size, &sparse_extents)?;
         let after_metadata = file.metadata()?;
         let after = file_fingerprint(&after_metadata)?;
         let after_identity = source_file_identity(&file, &after_metadata)?;
+        let after_ranges = allocated_file_extents(&file, after.size)?;
         let current_file = File::open(path)?;
         let current_metadata = current_file.metadata()?;
         let current = file_fingerprint(&current_metadata)?;
         let current_identity = source_file_identity(&current_file, &current_metadata)?;
+        let current_ranges = allocated_file_extents(&current_file, current.size)?;
         if before == after
             && after == current
             && before_identity == after_identity
             && after_identity == current_identity
-            && current.size == content.len() as u64
+            && before_ranges == after_ranges
+            && after_ranges == current_ranges
         {
+            let content_hash = hash_logical_data(current.size, &data_extents)?;
             return Ok(StableSourceRead {
-                content,
+                logical_size: current.size,
+                content_hash,
+                data_extents,
+                allocated_extents: sparse_extents,
                 fingerprint: current,
                 hardlink_id: current_identity.and_then(hardlink_id),
             });
@@ -3834,8 +4103,15 @@ fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<StableSourceRea
                 let bytes = symlink_target_bytes(&target)?;
                 let after = file_fingerprint(&fs::symlink_metadata(&source.path)?)?;
                 if before == after {
+                    let logical_size = bytes.len() as u64;
                     return Ok(StableSourceRead {
-                        content: bytes,
+                        logical_size,
+                        content_hash: *blake3::hash(&bytes).as_bytes(),
+                        data_extents: vec![StableDataExtent {
+                            offset: 0,
+                            content: bytes,
+                        }],
+                        allocated_extents: None,
                         fingerprint: after,
                         hardlink_id: None,
                     });
@@ -3847,6 +4123,243 @@ fn stable_read_source(source: &SourceFilePath) -> anyhow::Result<StableSourceRea
             )
         }
     }
+}
+
+fn read_source_data_extents(
+    file: &mut File,
+    logical_size: u64,
+    sparse_extents: &Option<Vec<FileExtent>>,
+) -> anyhow::Result<Vec<StableDataExtent>> {
+    let extents = sparse_extents.clone().unwrap_or_else(|| {
+        if logical_size == 0 {
+            Vec::new()
+        } else {
+            vec![FileExtent {
+                offset: 0,
+                len: logical_size,
+            }]
+        }
+    });
+    let mut data = Vec::with_capacity(extents.len());
+    for extent in extents {
+        file.seek(SeekFrom::Start(extent.offset))?;
+        let len: usize = extent
+            .len
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("file extent is too large for this platform"))?;
+        let mut content = vec![0_u8; len];
+        file.read_exact(&mut content)?;
+        data.push(StableDataExtent {
+            offset: extent.offset,
+            content,
+        });
+    }
+    Ok(data)
+}
+
+fn hash_logical_data(logical_size: u64, data: &[StableDataExtent]) -> anyhow::Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    let mut position = 0_u64;
+    for extent in data {
+        anyhow::ensure!(extent.offset >= position, "file data extents overlap");
+        hash_zeroes(&mut hasher, extent.offset - position);
+        hasher.update(&extent.content);
+        position = extent
+            .offset
+            .checked_add(extent.content.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("file data extent overflows"))?;
+        anyhow::ensure!(position <= logical_size, "file data exceeds logical size");
+    }
+    hash_zeroes(&mut hasher, logical_size - position);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn hash_zeroes(hasher: &mut blake3::Hasher, mut len: u64) {
+    const ZEROES: [u8; 64 * 1024] = [0; 64 * 1024];
+    while len > 0 {
+        let take = len.min(ZEROES.len() as u64) as usize;
+        hasher.update(&ZEROES[..take]);
+        len -= take as u64;
+    }
+}
+
+fn is_sparse_layout(size: u64, extents: &[FileExtent]) -> bool {
+    size > 0 && (extents.len() != 1 || extents[0].offset != 0 || extents[0].len != size)
+}
+
+#[cfg(unix)]
+fn allocated_file_extents(file: &File, size: u64) -> anyhow::Result<Option<Vec<FileExtent>>> {
+    use std::os::fd::AsRawFd;
+
+    if size == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let size_offset: libc::off_t = size
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("file is too large for sparse extent discovery"))?;
+    let mut extents = Vec::new();
+    let mut position: libc::off_t = 0;
+    while position < size_offset {
+        let data = unsafe { libc::lseek(file.as_raw_fd(), position, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            if sparse_query_unsupported(&error) {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        anyhow::ensure!(data >= position, "SEEK_DATA moved backwards");
+        anyhow::ensure!(data < size_offset, "SEEK_DATA exceeded logical file size");
+        let hole = unsafe { libc::lseek(file.as_raw_fd(), data, libc::SEEK_HOLE) };
+        let hole = if hole < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                size_offset
+            } else if sparse_query_unsupported(&error) {
+                return Ok(None);
+            } else {
+                return Err(error.into());
+            }
+        } else {
+            hole.min(size_offset)
+        };
+        anyhow::ensure!(hole > data, "SEEK_HOLE did not advance");
+        extents.push(FileExtent {
+            offset: data as u64,
+            len: (hole - data) as u64,
+        });
+        position = hole;
+    }
+    validate_file_extents(size, &extents)?;
+    Ok(Some(extents))
+}
+
+#[cfg(unix)]
+fn sparse_query_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::ENOTSUP)
+    )
+}
+
+#[cfg(windows)]
+fn allocated_file_extents(file: &File, size: u64) -> anyhow::Result<Option<Vec<FileExtent>>> {
+    use std::ffi::c_void;
+    use std::mem::{size_of, size_of_val};
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_MORE_DATA, ERROR_NOT_SUPPORTED,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{
+        FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES,
+    };
+
+    if size == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let mut extents = Vec::new();
+    let mut position = 0_u64;
+    while position < size {
+        let input = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: position.try_into()?,
+            Length: (size - position).try_into()?,
+        };
+        let mut output = [FILE_ALLOCATED_RANGE_BUFFER::default(); 256];
+        let mut returned = 0_u32;
+        let result = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                &input as *const _ as *const c_void,
+                size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
+                output.as_mut_ptr() as *mut c_void,
+                size_of_val(&output) as u32,
+                &mut returned,
+                null_mut(),
+            )
+        };
+        let error = (result == 0).then(std::io::Error::last_os_error);
+        if let Some(error) = &error {
+            let code = error.raw_os_error().unwrap_or_default() as u32;
+            if code == ERROR_INVALID_FUNCTION || code == ERROR_NOT_SUPPORTED {
+                return Ok(None);
+            }
+            if code != ERROR_MORE_DATA {
+                return Err(std::io::Error::from_raw_os_error(code as i32).into());
+            }
+        }
+        anyhow::ensure!(
+            returned as usize % size_of::<FILE_ALLOCATED_RANGE_BUFFER>() == 0,
+            "invalid allocated-range response length"
+        );
+        let count = returned as usize / size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
+        anyhow::ensure!(count <= output.len(), "allocated-range response overflow");
+        if count == 0 {
+            break;
+        }
+        for range in &output[..count] {
+            anyhow::ensure!(
+                range.FileOffset >= 0 && range.Length > 0,
+                "invalid allocated range"
+            );
+            let offset = range.FileOffset as u64;
+            let end = offset
+                .checked_add(range.Length as u64)
+                .ok_or_else(|| anyhow::anyhow!("allocated range overflows"))?
+                .min(size);
+            if end > offset {
+                extents.push(FileExtent {
+                    offset,
+                    len: end - offset,
+                });
+            }
+        }
+        let next = extents
+            .last()
+            .map(|extent| extent.offset + extent.len)
+            .unwrap_or(size);
+        anyhow::ensure!(next > position, "allocated-range query did not advance");
+        position = next;
+        if error.is_none() {
+            break;
+        }
+    }
+    let extents = coalesce_file_extents(extents)?;
+    validate_file_extents(size, &extents)?;
+    Ok(Some(extents))
+}
+
+#[cfg(windows)]
+fn coalesce_file_extents(extents: Vec<FileExtent>) -> anyhow::Result<Vec<FileExtent>> {
+    let mut canonical = Vec::<FileExtent>::new();
+    for extent in extents {
+        if let Some(previous) = canonical.last_mut() {
+            let previous_end = previous
+                .offset
+                .checked_add(previous.len)
+                .ok_or_else(|| anyhow::anyhow!("allocated range overflows"))?;
+            anyhow::ensure!(extent.offset >= previous_end, "allocated ranges overlap");
+            if extent.offset == previous_end {
+                previous.len = previous
+                    .len
+                    .checked_add(extent.len)
+                    .ok_or_else(|| anyhow::anyhow!("allocated range overflows"))?;
+                continue;
+            }
+        }
+        canonical.push(extent);
+    }
+    Ok(canonical)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn allocated_file_extents(_file: &File, _size: u64) -> anyhow::Result<Option<Vec<FileExtent>>> {
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -4844,6 +5357,161 @@ mod tests {
             .to_string();
         assert!(restore_error.contains("hardlink group contains inconsistent"));
         assert!(!output.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn sparse_extents_survive_source_deletion_and_exact_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("disk-image.bin");
+        let logical_size = 32 * 1024 * 1024 + 123;
+        let first_offset = 1024 * 1024 + 17;
+        let second_offset = 20 * 1024 * 1024 + 31;
+        let first_payload = vec![0xa5; 8192];
+        let second_payload = vec![0x3c; 16384];
+        let mut file = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        file.set_len(logical_size).unwrap();
+        file.seek(SeekFrom::Start(first_offset)).unwrap();
+        file.write_all(&first_payload).unwrap();
+        file.seek(SeekFrom::Start(second_offset)).unwrap();
+        file.write_all(&second_payload).unwrap();
+        file.sync_all().unwrap();
+        let source_extents = allocated_file_extents(&file, logical_size)
+            .unwrap()
+            .expect("test filesystem must expose sparse extents");
+        assert!(is_sparse_layout(logical_size, &source_extents));
+        drop(file);
+
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let snapshot = snapshot_repository(temp.path(), "sparse file".to_string(), None).unwrap();
+        assert_eq!(snapshot.input_bytes, logical_size);
+        let repository = Repository::discover(temp.path()).unwrap();
+        let commit: CommitObject = repository
+            .read(snapshot.commit_id, ObjectKind::Commit)
+            .unwrap();
+        let files = flatten_tree(&repository, commit.root_tree).unwrap();
+        let state = &files["disk-image.bin"];
+        assert_eq!(state.object.schema, 3);
+        assert_eq!(
+            state.object.allocated_extents.as_deref(),
+            Some(source_extents.as_slice())
+        );
+        assert!(
+            state
+                .object
+                .chunks
+                .iter()
+                .map(|chunk| chunk.len)
+                .sum::<u64>()
+                < logical_size / 8
+        );
+        let across_hole = reconstruct_file_range(
+            &repository,
+            state,
+            first_offset + first_payload.len() as u64,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(across_hole, vec![0; 4096]);
+
+        fs::remove_file(&source).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-sparse-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        let restored = output.join("disk-image.bin");
+        let mut restored_file = File::open(&restored).unwrap();
+        assert_eq!(restored_file.metadata().unwrap().len(), logical_size);
+        let restored_extents = allocated_file_extents(&restored_file, logical_size)
+            .unwrap()
+            .expect("restore filesystem must expose sparse extents");
+        assert!(is_sparse_layout(logical_size, &restored_extents));
+        let mut payload = vec![0; first_payload.len()];
+        restored_file.seek(SeekFrom::Start(first_offset)).unwrap();
+        restored_file.read_exact(&mut payload).unwrap();
+        assert_eq!(payload, first_payload);
+        let mut payload = vec![0; second_payload.len()];
+        restored_file.seek(SeekFrom::Start(second_offset)).unwrap();
+        restored_file.read_exact(&mut payload).unwrap();
+        assert_eq!(payload, second_payload);
+        let restored_bytes = fs::read(&restored).unwrap();
+        assert_eq!(
+            blake3::hash(&restored_bytes).as_bytes(),
+            &state.object.content_hash
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn fully_sparse_file_restores_without_payload_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("empty-volume.bin");
+        let logical_size = 8 * 1024 * 1024;
+        File::create(&source)
+            .unwrap()
+            .set_len(logical_size)
+            .unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let snapshot = snapshot_repository(temp.path(), "fully sparse".to_string(), None).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        let commit: CommitObject = repository
+            .read(snapshot.commit_id, ObjectKind::Commit)
+            .unwrap();
+        let files = flatten_tree(&repository, commit.root_tree).unwrap();
+        let state = &files["empty-volume.bin"];
+        assert_eq!(state.object.schema, 3);
+        assert_eq!(state.object.allocated_extents, Some(Vec::new()));
+        assert!(state.object.chunks.is_empty());
+
+        fs::remove_file(&source).unwrap();
+        let output = temp.path().parent().unwrap().join(format!(
+            "restored-fully-sparse-{}",
+            hex::encode(crate::random_bytes::<4>())
+        ));
+        restore_repository(temp.path(), "HEAD", &output, None, false).unwrap();
+        let restored = File::open(output.join("empty-volume.bin")).unwrap();
+        assert_eq!(restored.metadata().unwrap().len(), logical_size);
+        assert_eq!(
+            allocated_file_extents(&restored, logical_size).unwrap(),
+            Some(Vec::new())
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn malformed_sparse_extents_are_rejected_before_object_traversal() {
+        let malformed = FileObjectV3 {
+            schema: 3,
+            file_type: RepositoryFileType::Regular,
+            size: 4096,
+            permissions: 0,
+            mtime_ns: 0,
+            content_hash: [0; 32],
+            chunking_schema: 2,
+            hardlink_id: None,
+            allocated_extents: vec![
+                FileExtent {
+                    offset: 0,
+                    len: 2048,
+                },
+                FileExtent {
+                    offset: 1024,
+                    len: 2048,
+                },
+            ],
+            chunks: Vec::new(),
+        };
+        let error = deserialize_file_object(&serialize_canonical(&malformed).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sparse extents overlap"));
     }
 
     #[test]
