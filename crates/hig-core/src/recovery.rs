@@ -1299,6 +1299,7 @@ fn initialize_vault_root(root: &Path, mirror_roots: Vec<PathBuf>) -> anyhow::Res
     secure_create_dir(&root.join("repositories"))?;
     let config_path = vault_config_path(root);
     if config_path.exists() {
+        enforce_private_file(&config_path)?;
         let existing = load_vault_config(root)?;
         anyhow::ensure!(
             existing.schema == VAULT_SCHEMA,
@@ -1328,6 +1329,8 @@ fn initialize_vault_root(root: &Path, mirror_roots: Vec<PathBuf>) -> anyhow::Res
     }
     if !catalog_path(root).exists() {
         save_catalog(root, &RecoveryCatalog::default())?;
+    } else {
+        enforce_private_file(&catalog_path(root))?;
     }
     Ok(())
 }
@@ -1456,14 +1459,26 @@ fn catalog_path(root: &Path) -> PathBuf {
 }
 
 fn lock_vault(root: &Path) -> anyhow::Result<File> {
+    let lock_path = root.join("locks").join("write.lock");
+    if lock_path.exists() {
+        enforce_private_file(&lock_path)?;
+    }
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(root.join("locks").join("write.lock"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(&lock_path)?;
+    anyhow::ensure!(file.metadata()?.is_file(), "recovery lock is not a file");
+    enforce_private_file(&lock_path)?;
     file.lock_exclusive()?;
     Ok(file)
 }
@@ -1517,6 +1532,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
+        enforce_private_file(path)?;
         if let Some(parent) = path.parent() {
             sync_directory(parent)?;
         }
@@ -1530,11 +1546,46 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 
 fn secure_create_dir(path: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "recovery private path is not a physical directory: {}",
+        path.display()
+    );
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "recovery private directory is not owned by the current user: {}",
+            path.display()
+        );
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(windows)]
+    windows_owner_only::apply_and_verify(path)?;
+    Ok(())
+}
+
+fn enforce_private_file(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "recovery private path is not a physical file: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "recovery private file is not owned by the current user: {}",
+            path.display()
+        );
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    windows_owner_only::apply_and_verify(path)?;
     Ok(())
 }
 
@@ -1610,10 +1661,196 @@ fn now_unix_ns() -> i128 {
     }
 }
 
+#[cfg(windows)]
+mod windows_owner_only {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
+
+    const OWNER_ONLY_SDDL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
+
+    struct LocalDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl Drop for LocalDescriptor {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    pub(super) fn apply_and_verify(path: &Path) -> anyhow::Result<()> {
+        let mut sddl = OWNER_ONLY_SDDL.encode_utf16().collect::<Vec<_>>();
+        sddl.push(0);
+        let mut expected_descriptor = null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut expected_descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let expected_descriptor = LocalDescriptor(expected_descriptor);
+        let expected_dacl = descriptor_dacl(expected_descriptor.0)?;
+
+        let mut path_wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        path_wide.push(0);
+        let set_result = unsafe {
+            SetNamedSecurityInfoW(
+                path_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                expected_dacl,
+                null_mut(),
+            )
+        };
+        if set_result != 0 {
+            return Err(std::io::Error::from_raw_os_error(set_result as i32).into());
+        }
+
+        let mut actual_dacl = null_mut();
+        let mut actual_descriptor = null_mut();
+        let get_result = unsafe {
+            GetNamedSecurityInfoW(
+                path_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut actual_dacl,
+                null_mut(),
+                &mut actual_descriptor,
+            )
+        };
+        if get_result != 0 {
+            return Err(std::io::Error::from_raw_os_error(get_result as i32).into());
+        }
+        let actual_descriptor = LocalDescriptor(actual_descriptor);
+        anyhow::ensure!(!actual_dacl.is_null(), "recovery private DACL is missing");
+
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        anyhow::ensure!(
+            unsafe {
+                GetSecurityDescriptorControl(actual_descriptor.0, &mut control, &mut revision)
+            } != 0,
+            "failed to inspect recovery private DACL control"
+        );
+        anyhow::ensure!(
+            control & SE_DACL_PROTECTED != 0,
+            "recovery private DACL permits inherited access"
+        );
+        anyhow::ensure!(
+            acl_bytes(expected_dacl) == acl_bytes(actual_dacl),
+            "recovery private DACL failed exact verification"
+        );
+        Ok(())
+    }
+
+    fn descriptor_dacl(descriptor: PSECURITY_DESCRIPTOR) -> anyhow::Result<*mut ACL> {
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = null_mut();
+        anyhow::ensure!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            } != 0,
+            "failed to read recovery private DACL"
+        );
+        anyhow::ensure!(
+            present != 0 && !dacl.is_null(),
+            "recovery private DACL is missing"
+        );
+        Ok(dacl)
+    }
+
+    fn acl_bytes(acl: *const ACL) -> Vec<u8> {
+        let length = unsafe { (*acl).AclSize as usize };
+        unsafe { std::slice::from_raw_parts(acl.cast(), length) }.to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{init_repository, snapshot_repository};
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_initialization_repairs_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        fs::set_permissions(&vault, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(vault.join("locks"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            vault.join("repositories"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::set_permissions(vault_config_path(&vault), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(catalog_path(&vault), fs::Permissions::from_mode(0o644)).unwrap();
+
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        let lock = lock_vault(&vault).unwrap();
+        drop(lock);
+
+        for path in [&vault, &vault.join("locks"), &vault.join("repositories")] {
+            assert_eq!(
+                fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                path.display()
+            );
+        }
+        for path in [
+            vault_config_path(&vault),
+            catalog_path(&vault),
+            vault.join("locks/write.lock"),
+        ] {
+            assert_eq!(
+                fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_control_file_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        let external = temp.path().join("external.json");
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        fs::rename(vault_config_path(&vault), &external).unwrap();
+        symlink(&external, vault_config_path(&vault)).unwrap();
+
+        let error = init_recovery_vault(Some(&vault), Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("not a physical file"));
+    }
 
     #[test]
     fn capture_survives_complete_source_deletion_and_restores_exact_bytes() {
