@@ -11,7 +11,7 @@ const packageName = required(args, "package");
 const version = required(args, "version");
 const specification = `${packageName}@${version}`;
 const integrity = `sha512-${createHash("sha512").update(fs.readFileSync(tarball)).digest("base64")}`;
-const view = npmInvocation(["view", specification, "dist.integrity", "--json"]);
+const view = npmInvocation(["view", specification, "dist.integrity", "--json", "--prefer-online"]);
 const existing = await registryIntegrity(view, specification);
 
 if (existing !== null) {
@@ -42,7 +42,7 @@ async function registryIntegrity(invocation, packageSpec, attempts = 1, delayMs 
     const result = spawnSync(invocation.command, invocation.args, { encoding: "utf8" });
     if (result.status === 0) {
       const output = result.stdout.trim();
-      return output ? JSON.parse(output) : null;
+      return output ? normalizeIntegrity(JSON.parse(output)) : null;
     }
     const lastError = result.error?.message || result.stderr || result.stdout;
     if (!`${result.stderr}\n${result.stdout}`.includes("E404")) {
@@ -51,6 +51,15 @@ async function registryIntegrity(invocation, packageSpec, attempts = 1, delayMs 
     if (attempt + 1 < attempts) await delay(delayMs);
   }
   if (attempts === 1) return null;
+  return null;
+}
+
+function normalizeIntegrity(response) {
+  if (Array.isArray(response)) return normalizeIntegrity(response[0]);
+  if (typeof response === "string") return response;
+  if (response && typeof response["dist.integrity"] === "string") {
+    return response["dist.integrity"];
+  }
   return null;
 }
 
