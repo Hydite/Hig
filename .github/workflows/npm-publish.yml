@@ -111,7 +111,7 @@ jobs:
         run: |
           node scripts/npm-resolver-test.mjs
           mkdir -p artifacts/npm
-          npm pack packages/hig-mcp-server --pack-destination artifacts/npm
+          npm pack ./packages/hig-mcp-server --pack-destination artifacts/npm
       - name: Publish main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

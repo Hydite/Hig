@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { npmInvocation } from "./lib/npm-command.mjs";
+import { parseNpmPackReport } from "./lib/npm-pack-report.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
@@ -115,9 +116,7 @@ function npmPack(directory, destination) {
   if (result.status !== 0) {
     throw new Error(`npm pack failed: ${result.error?.message || result.stderr || result.stdout}`);
   }
-  const parsed = JSON.parse(result.stdout);
-  if (!Array.isArray(parsed) || parsed.length !== 1) throw new Error("npm pack returned an unexpected report");
-  return parsed[0];
+  return parseNpmPackReport(result.stdout);
 }
 
 function platformSpecification(value) {
