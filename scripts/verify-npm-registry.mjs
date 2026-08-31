@@ -22,7 +22,8 @@ for (const packageName of packages) {
     });
     if (result.status === 0) {
       try {
-        const metadata = JSON.parse(result.stdout);
+        const response = JSON.parse(result.stdout);
+        const metadata = Array.isArray(response) ? response[0] : response;
         if (metadata.version === version && typeof metadata["dist.integrity"] === "string") {
           process.stdout.write(`${specification} ${metadata["dist.integrity"]}\n`);
           failure = undefined;
