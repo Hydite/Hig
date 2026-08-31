@@ -12,41 +12,51 @@ const version = required(args, "version");
 const specification = `${packageName}@${version}`;
 const integrity = `sha512-${createHash("sha512").update(fs.readFileSync(tarball)).digest("base64")}`;
 const view = npmInvocation(["view", specification, "dist.integrity", "--json"]);
-const existing = spawnSync(view.command, view.args, {
-  encoding: "utf8"
-});
+const existing = await registryIntegrity(view, specification);
 
-if (existing.status === 0) {
-  const publishedIntegrity = JSON.parse(existing.stdout);
-  if (publishedIntegrity !== integrity) {
+if (existing !== null) {
+  if (existing !== integrity) {
     throw new Error(
-      `${specification} already exists with different integrity: ${publishedIntegrity}`
+      `${specification} already exists with different integrity: ${existing}`
     );
   }
   process.stdout.write(`${specification} already published with matching integrity; skipping\n`);
   process.exit(0);
 }
 
-const notFound = `${existing.stderr}\n${existing.stdout}`.includes("E404");
-if (!notFound) {
-  throw new Error(`unable to query ${specification}: ${existing.stderr || existing.stdout}`);
-}
-
 const publish = npmInvocation(["publish", tarball, "--access", "public", "--provenance"]);
 const published = spawnSync(publish.command, publish.args, { stdio: "inherit" });
 if (published.status !== 0) process.exit(published.status || 1);
 
-const verified = spawnSync(view.command, view.args, {
-  encoding: "utf8"
-});
-if (verified.status !== 0) {
-  throw new Error(`published ${specification} but registry verification failed`);
+const publishedIntegrity = await registryIntegrity(view, specification, 12, 5000);
+if (publishedIntegrity === null) {
+  throw new Error(`published ${specification} but registry verification timed out`);
 }
-const publishedIntegrity = JSON.parse(verified.stdout);
 if (publishedIntegrity !== integrity) {
   throw new Error(`registry integrity mismatch after publishing ${specification}`);
 }
 process.stdout.write(`${specification} published and verified: ${integrity}\n`);
+
+async function registryIntegrity(invocation, packageSpec, attempts = 1, delayMs = 0) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const result = spawnSync(invocation.command, invocation.args, { encoding: "utf8" });
+    if (result.status === 0) {
+      const output = result.stdout.trim();
+      return output ? JSON.parse(output) : null;
+    }
+    const lastError = result.error?.message || result.stderr || result.stdout;
+    if (!`${result.stderr}\n${result.stdout}`.includes("E404")) {
+      throw new Error(`unable to query ${packageSpec}: ${lastError}`);
+    }
+    if (attempt + 1 < attempts) await delay(delayMs);
+  }
+  if (attempts === 1) return null;
+  return null;
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
 function parseArgs(values) {
   const parsed = {};
