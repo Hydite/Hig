@@ -113,7 +113,11 @@ if "$HIG_BIN" recovery list --vault-root "$WORK/recovery-vault" --json \
   echo "legacy Recovery Vault was accepted without explicit authentication migration" >&2
   exit 1
 fi
-grep -q 'migrate-auth' "$WORK/recovery-unsealed-list.err"
+if ! grep -q 'migrate-auth' "$WORK/recovery-unsealed-list.err"; then
+  echo "legacy Recovery Vault rejection did not identify migrate-auth:" >&2
+  cat "$WORK/recovery-unsealed-list.err" >&2
+  exit 1
+fi
 
 "$HIG_BIN" recovery migrate-auth --vault-root "$WORK/recovery-vault" --json \
   > "$WORK/recovery-migrate-first.json"
