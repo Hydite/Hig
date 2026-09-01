@@ -57,6 +57,10 @@ jobs:
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
         run: node scripts/repository-soak-test.mjs --mode ci --duration-minutes 0.25 --report artifacts/repository-soak-ci.json
+      - name: Recovery Vault loss and interruption smoke
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release/hig
+        run: node scripts/recovery-vault-soak-test.mjs --mode ci --duration-minutes 0.25 --report artifacts/recovery-vault-soak-ci.json
       - name: Cold-path regression policy
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
@@ -69,6 +73,7 @@ jobs:
           name: completion-regression-evidence-${{ github.sha }}
           path: |
             artifacts/repository-soak-ci.json
+            artifacts/recovery-vault-soak-ci.json
             artifacts/cold-path-regression-ci.json
           if-no-files-found: error
 
@@ -102,7 +107,7 @@ jobs:
         shell: bash
         run: sudo apt-get update && sudo apt-get install -y acl
       - name: Native repository fidelity tests
-        run: cargo test -p hig-core repository::tests::
+        run: "cargo test -p hig-core repository::tests::"
       - name: Build native CLI
         run: cargo build --release -p hig-cli
       - name: Native repository snapshot diagnostic
@@ -156,7 +161,7 @@ jobs:
         with:
           node-version: 22
       - name: Native repository fidelity tests
-        run: cargo test -p hig-core repository::tests::
+        run: "cargo test -p hig-core repository::tests::"
       - name: Build both macOS architectures
         run: |
           cargo build --release -p hig-cli --target aarch64-apple-darwin

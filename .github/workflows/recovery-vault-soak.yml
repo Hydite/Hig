@@ -1,0 +1,61 @@
+name: HIG Native Recovery Vault Soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: Per-platform soak duration (minimum 120)
+        required: true
+        default: "120"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recovery-vault-soak-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-recovery-vault-soak:
+    name: Recovery Vault soak (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64-gnu
+            binary: target/release/hig
+          - os: macos-14
+            platform: macos-aarch64
+            binary: target/release/hig
+          - os: windows-2025
+            platform: windows-x86_64-msvc
+            binary: target/release/hig.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Build native release CLI
+        run: cargo build --release -p hig-cli
+      - name: Run native Recovery Vault soak
+        shell: bash
+        env:
+          HIG_BIN: ${{ matrix.binary }}
+        run: >-
+          node scripts/recovery-vault-soak-test.mjs
+          --mode release
+          --duration-minutes "${{ inputs.duration_minutes }}"
+          --report "artifacts/recovery-vault-soak-${{ matrix.platform }}.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recovery-vault-soak-${{ matrix.platform }}-${{ github.sha }}
+          path: artifacts/recovery-vault-soak-${{ matrix.platform }}.json
+          if-no-files-found: error
