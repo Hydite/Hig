@@ -76,6 +76,21 @@ generation count, and quota policy. Vault garbage collection traverses every
 protected ref and mirror-required recovery point while holding the writer lock.
 It is report-only by default.
 
+Vault-changing and restore operations use a two-record audit transaction. HIG
+durably creates an immutable, checksummed `prepared` event before mutation and
+then a separate immutable `committed` or `failed` event. Process termination
+therefore leaves a machine-readable incomplete operation rather than a false
+success. Events include operation identity, process actor, start/end time,
+catalog generations, repository/recovery-point identity, bounded operational
+details, and a bounded error. Audit events never contain source-file bytes or
+secrets. Scrub validates the complete journal and reports incomplete operations.
+
+The vault root, control directories, locks, mutable documents, and audit events
+are owner-only. Unix paths require the effective owner and are normalized to
+`0700` directories and `0600` files. Windows uses a protected DACL granting
+full control only to the object owner and `SYSTEM`, with read-back verification.
+Control-file symlinks and reparse-point lock substitution are rejected.
+
 ## Recovery Contract
 
 - Recovery point objective: the newest successfully published vault capture.

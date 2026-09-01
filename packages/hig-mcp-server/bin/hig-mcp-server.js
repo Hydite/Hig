@@ -490,6 +490,13 @@ const tools = [
     })
   },
   {
+    name: "hig_recovery_audit",
+    description: "Read and validate the Recovery Vault audit journal, including interrupted operations.",
+    inputSchema: objectSchema({
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    })
+  },
+  {
     name: "hig_recovery_pin",
     description: "Pin a recovery point so retention and quota GC cannot remove it.",
     inputSchema: objectSchema({
@@ -845,6 +852,8 @@ async function callTool(name, args) {
       return runHig(["recovery", "capture", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_list":
       return runHig(["recovery", "list", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_audit":
+      return runHig(["recovery", "audit", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_pin":
       return runHig(["recovery", "pin", stringArg(args.repositoryId, "repositoryId"), stringArg(args.recoveryPointId, "recoveryPointId"), ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_unpin":

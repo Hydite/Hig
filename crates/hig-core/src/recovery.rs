@@ -14,6 +14,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod audit;
+
+use audit::run_audited;
+pub use audit::{
+    RecoveryAuditActor, RecoveryAuditEvent, RecoveryAuditOperation, RecoveryAuditOutcome,
+    RecoveryAuditReport, recovery_audit_log,
+};
+#[cfg(test)]
+use audit::{atomic_write_new, begin_audit};
+
 const VAULT_SCHEMA: u16 = 1;
 const CATALOG_SCHEMA: u16 = 1;
 const DOCUMENT_SCHEMA: u16 = 1;
@@ -276,6 +286,8 @@ pub struct RecoveryScrubLocationReport {
     pub checked_recovery_points: u64,
     pub checked_objects: u64,
     pub checked_raw_bytes: u64,
+    pub checked_audit_events: u64,
+    pub incomplete_audit_operations: u64,
     pub errors: Vec<String>,
 }
 
@@ -341,18 +353,49 @@ pub fn init_recovery_vault(
     let root = resolve_vault_root(requested_root)?;
     let existed = vault_config_path(&root).exists();
     let normalized_mirrors = normalize_mirror_roots(&root, mirror_roots)?;
-    initialize_vault_root(&root, normalized_mirrors.clone())?;
-    for mirror in &normalized_mirrors {
-        initialize_vault_root(mirror, Vec::new())?;
-    }
-    Ok(RecoveryVaultInitReport {
-        vault_root: root.display().to_string(),
-        created: !existed,
-        mirror_roots: normalized_mirrors
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect(),
-    })
+    secure_create_dir(&root)?;
+    secure_create_dir(&root.join("events"))?;
+    secure_create_dir(&root.join("locks"))?;
+    let _lock = lock_vault(&root)?;
+    let generation_before = if catalog_path(&root).exists() {
+        enforce_private_file(&catalog_path(&root))?;
+        Some(load_catalog(&root)?.generation)
+    } else {
+        None
+    };
+    let details = BTreeMap::from([
+        ("existing".to_string(), existed.to_string()),
+        (
+            "mirror_count".to_string(),
+            normalized_mirrors.len().to_string(),
+        ),
+    ]);
+    run_audited(
+        &root,
+        RecoveryAuditOperation::VaultInitialize,
+        generation_before,
+        None,
+        None,
+        details,
+        || {
+            initialize_vault_root(&root, normalized_mirrors.clone())?;
+            for mirror in &normalized_mirrors {
+                initialize_mirror_vault_with_audit(mirror)?;
+            }
+            let generation_after = load_catalog(&root)?.generation;
+            Ok((
+                RecoveryVaultInitReport {
+                    vault_root: root.display().to_string(),
+                    created: !existed,
+                    mirror_roots: normalized_mirrors
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                },
+                Some(generation_after),
+            ))
+        },
+    )
 }
 
 pub fn recovery_vault_config(requested_root: Option<&Path>) -> anyhow::Result<RecoveryVaultConfig> {
@@ -368,16 +411,47 @@ pub fn update_recovery_retention(
     let root = resolve_vault_root(requested_root)?;
     let _lock = lock_vault(&root)?;
     let mut config = load_vault_config(&root)?;
-    for mirror in &config.mirror_roots {
-        initialize_vault_root(mirror, Vec::new())?;
-        let _mirror_lock = lock_vault(mirror)?;
-        let mut mirror_config = load_vault_config(mirror)?;
-        mirror_config.retention = retention.clone();
-        write_checked_json(&vault_config_path(mirror), &mirror_config)?;
-    }
-    config.retention = retention;
-    write_checked_json(&vault_config_path(&root), &config)?;
-    Ok(config)
+    let generation = load_catalog(&root)?.generation;
+    let details = BTreeMap::from([
+        (
+            "minimum_points".to_string(),
+            retention.minimum_points_per_repository.to_string(),
+        ),
+        (
+            "minimum_days".to_string(),
+            retention.minimum_retention_days.to_string(),
+        ),
+        (
+            "maximum_points".to_string(),
+            retention
+                .maximum_points_per_repository
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "maximum_bytes".to_string(),
+            retention
+                .maximum_vault_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+    ]);
+    run_audited(
+        &root,
+        RecoveryAuditOperation::RetentionUpdate,
+        Some(generation),
+        None,
+        None,
+        details,
+        || {
+            for mirror in &config.mirror_roots {
+                update_mirror_retention(mirror, &retention)?;
+            }
+            config.retention = retention;
+            write_checked_json(&vault_config_path(&root), &config)?;
+            Ok((config, Some(generation)))
+        },
+    )
 }
 
 pub fn register_recovery_repository(
@@ -392,40 +466,56 @@ pub fn register_recovery_repository(
     let mut catalog = load_catalog(&root)?;
     let key = hex::encode(config.repository_id);
     let source_label = source_root.display().to_string();
-    let now = now_unix_ns();
-    let created = !catalog.repositories.contains_key(&key);
-    let registration = catalog
-        .repositories
-        .entry(key)
-        .or_insert_with(|| RecoveryRegistration {
-            schema: VAULT_SCHEMA,
-            registration_id: crate::random_bytes(),
-            repository_id: config.repository_id,
-            created_unix_ns: now,
-            updated_unix_ns: now,
-            source_paths: Vec::new(),
-            recovery_points: BTreeMap::new(),
-            tombstones: Vec::new(),
-        });
-    anyhow::ensure!(
-        registration.repository_id == config.repository_id,
-        "recovery registration identity mismatch"
-    );
-    if !registration.source_paths.contains(&source_label) {
-        registration.source_paths.push(source_label.clone());
-        registration.source_paths.sort();
-    }
-    registration.updated_unix_ns = now;
-    let registration_id = registration.registration_id;
-    catalog.generation = catalog.generation.saturating_add(1);
-    save_catalog(&root, &catalog)?;
-    Ok(RecoveryRegistrationReport {
-        vault_root: root.display().to_string(),
-        repository_id: config.repository_id,
-        registration_id,
-        source_root: source_label,
-        created,
-    })
+    let generation_before = catalog.generation;
+    let details = BTreeMap::from([("source_root".to_string(), source_label.clone())]);
+    run_audited(
+        &root,
+        RecoveryAuditOperation::RepositoryRegister,
+        Some(generation_before),
+        Some(config.repository_id),
+        None,
+        details,
+        || {
+            let now = now_unix_ns();
+            let created = !catalog.repositories.contains_key(&key);
+            let registration =
+                catalog
+                    .repositories
+                    .entry(key)
+                    .or_insert_with(|| RecoveryRegistration {
+                        schema: VAULT_SCHEMA,
+                        registration_id: crate::random_bytes(),
+                        repository_id: config.repository_id,
+                        created_unix_ns: now,
+                        updated_unix_ns: now,
+                        source_paths: Vec::new(),
+                        recovery_points: BTreeMap::new(),
+                        tombstones: Vec::new(),
+                    });
+            anyhow::ensure!(
+                registration.repository_id == config.repository_id,
+                "recovery registration identity mismatch"
+            );
+            if !registration.source_paths.contains(&source_label) {
+                registration.source_paths.push(source_label.clone());
+                registration.source_paths.sort();
+            }
+            registration.updated_unix_ns = now;
+            let registration_id = registration.registration_id;
+            catalog.generation = catalog.generation.saturating_add(1);
+            save_catalog(&root, &catalog)?;
+            Ok((
+                RecoveryRegistrationReport {
+                    vault_root: root.display().to_string(),
+                    repository_id: config.repository_id,
+                    registration_id,
+                    source_root: source_label,
+                    created,
+                },
+                Some(catalog.generation),
+            ))
+        },
+    )
 }
 
 pub fn capture_recovery_point(
@@ -442,103 +532,121 @@ pub fn capture_recovery_point(
     let _lock = lock_vault(&root)?;
     let config = load_vault_config(&root)?;
     let mut catalog = load_catalog(&root)?;
-    let key = hex::encode(source_config.repository_id);
-    let now = now_unix_ns();
-    let source_label = source_root.display().to_string();
-    let registration =
-        catalog
-            .repositories
-            .entry(key.clone())
-            .or_insert_with(|| RecoveryRegistration {
-                schema: VAULT_SCHEMA,
-                registration_id: crate::random_bytes(),
-                repository_id: source_config.repository_id,
-                created_unix_ns: now,
-                updated_unix_ns: now,
-                source_paths: vec![source_label.clone()],
-                recovery_points: BTreeMap::new(),
-                tombstones: Vec::new(),
-            });
-    if !registration.source_paths.contains(&source_label) {
-        registration.source_paths.push(source_label);
-        registration.source_paths.sort();
-    }
-    let created = !registration.recovery_points.contains_key(&point_id);
-    let primary = replicate_repository_revision(
-        &source_root,
-        revision,
-        &vault_repository_root(&root, source_config.repository_id),
-        &point_id,
-    )?;
-    anyhow::ensure!(
-        primary.commit_id == commit_id,
-        "source revision changed during capture"
-    );
+    let generation_before = catalog.generation;
+    let details = BTreeMap::from([
+        ("revision".to_string(), revision.to_string()),
+        ("source_root".to_string(), source_root.display().to_string()),
+    ]);
+    run_audited(
+        &root,
+        RecoveryAuditOperation::Capture,
+        Some(generation_before),
+        Some(source_config.repository_id),
+        Some(point_id.clone()),
+        details,
+        || {
+            let key = hex::encode(source_config.repository_id);
+            let now = now_unix_ns();
+            let source_label = source_root.display().to_string();
+            let registration =
+                catalog
+                    .repositories
+                    .entry(key.clone())
+                    .or_insert_with(|| RecoveryRegistration {
+                        schema: VAULT_SCHEMA,
+                        registration_id: crate::random_bytes(),
+                        repository_id: source_config.repository_id,
+                        created_unix_ns: now,
+                        updated_unix_ns: now,
+                        source_paths: vec![source_label.clone()],
+                        recovery_points: BTreeMap::new(),
+                        tombstones: Vec::new(),
+                    });
+            if !registration.source_paths.contains(&source_label) {
+                registration.source_paths.push(source_label);
+                registration.source_paths.sort();
+            }
+            let created = !registration.recovery_points.contains_key(&point_id);
+            let primary = replicate_repository_revision(
+                &source_root,
+                revision,
+                &vault_repository_root(&root, source_config.repository_id),
+                &point_id,
+            )?;
+            anyhow::ensure!(
+                primary.commit_id == commit_id,
+                "source revision changed during capture"
+            );
 
-    let mut replicas = Vec::new();
-    for mirror in &config.mirror_roots {
-        let result = capture_mirror(
-            mirror,
-            &source_root,
-            revision,
-            &point_id,
-            registration,
-            &primary,
-        );
-        match result {
-            Ok(()) => replicas.push(RecoveryReplicaStatus {
-                vault_root: mirror.display().to_string(),
-                verified: true,
-                error: None,
-            }),
-            Err(error) => replicas.push(RecoveryReplicaStatus {
-                vault_root: mirror.display().to_string(),
-                verified: false,
-                error: Some(error.to_string()),
-            }),
-        }
-    }
-    let durability = if config.mirror_roots.is_empty() {
-        RecoveryDurability::Captured
-    } else if replicas.iter().all(|replica| replica.verified) {
-        RecoveryDurability::Protected
-    } else {
-        RecoveryDurability::Degraded
-    };
-    let captured_unix_ns = registration
-        .recovery_points
-        .get(&point_id)
-        .map(|point| point.captured_unix_ns)
-        .unwrap_or(now);
-    let pinned = registration
-        .recovery_points
-        .get(&point_id)
-        .is_some_and(|point| point.pinned);
-    let point = RecoveryPoint {
-        schema: VAULT_SCHEMA,
-        recovery_point_id: point_id.clone(),
-        commit_id,
-        ref_name: primary.ref_name,
-        captured_unix_ns,
-        last_verified_unix_ns: now,
-        reachable_objects: primary.reachable_objects,
-        stored_objects_written: primary.objects_written,
-        stored_bytes_written: primary.object_bytes_written,
-        durability,
-        replicas,
-        pinned,
-        state: RecoveryPointState::Available,
-    };
-    registration.recovery_points.insert(point_id, point.clone());
-    registration.updated_unix_ns = now;
-    catalog.generation = catalog.generation.saturating_add(1);
-    save_catalog(&root, &catalog)?;
-    Ok(RecoveryCaptureReport {
-        vault_root: root.display().to_string(),
-        repository_id: source_config.repository_id,
-        recovery_point: point,
-        created,
-    })
+            let mut replicas = Vec::new();
+            for mirror in &config.mirror_roots {
+                let result = capture_mirror(
+                    mirror,
+                    &source_root,
+                    revision,
+                    &point_id,
+                    registration,
+                    &primary,
+                );
+                match result {
+                    Ok(()) => replicas.push(RecoveryReplicaStatus {
+                        vault_root: mirror.display().to_string(),
+                        verified: true,
+                        error: None,
+                    }),
+                    Err(error) => replicas.push(RecoveryReplicaStatus {
+                        vault_root: mirror.display().to_string(),
+                        verified: false,
+                        error: Some(error.to_string()),
+                    }),
+                }
+            }
+            let durability = if config.mirror_roots.is_empty() {
+                RecoveryDurability::Captured
+            } else if replicas.iter().all(|replica| replica.verified) {
+                RecoveryDurability::Protected
+            } else {
+                RecoveryDurability::Degraded
+            };
+            let captured_unix_ns = registration
+                .recovery_points
+                .get(&point_id)
+                .map(|point| point.captured_unix_ns)
+                .unwrap_or(now);
+            let pinned = registration
+                .recovery_points
+                .get(&point_id)
+                .is_some_and(|point| point.pinned);
+            let point = RecoveryPoint {
+                schema: VAULT_SCHEMA,
+                recovery_point_id: point_id.clone(),
+                commit_id,
+                ref_name: primary.ref_name,
+                captured_unix_ns,
+                last_verified_unix_ns: now,
+                reachable_objects: primary.reachable_objects,
+                stored_objects_written: primary.objects_written,
+                stored_bytes_written: primary.object_bytes_written,
+                durability,
+                replicas,
+                pinned,
+                state: RecoveryPointState::Available,
+            };
+            registration.recovery_points.insert(point_id, point.clone());
+            registration.updated_unix_ns = now;
+            catalog.generation = catalog.generation.saturating_add(1);
+            save_catalog(&root, &catalog)?;
+            Ok((
+                RecoveryCaptureReport {
+                    vault_root: root.display().to_string(),
+                    repository_id: source_config.repository_id,
+                    recovery_point: point,
+                    created,
+                },
+                Some(catalog.generation),
+            ))
+        },
+    )
 }
 
 pub fn list_recovery_vault(
@@ -603,6 +711,7 @@ pub fn restore_recovery_point(
 ) -> anyhow::Result<RecoveryRestoreReport> {
     let root = resolve_vault_root(requested_root)?;
     let id = parse_repository_id(repository_id)?;
+    let _lock = lock_vault(&root)?;
     let catalog = load_catalog(&root)?;
     let registration = find_registration(&catalog, id)?;
     let point = registration
@@ -613,24 +722,48 @@ pub fn restore_recovery_point(
         point.state == RecoveryPointState::Available,
         "recovery point is pending deletion"
     );
-    verify_recovery_point(Some(&root), repository_id, recovery_point_id)?;
-    let restore = restore_repository(
-        &vault_repository_root(&root, id),
-        &point.ref_name,
-        output_dir,
-        selected_path,
-        overwrite,
-    )?;
-    anyhow::ensure!(
-        restore.commit_id == point.commit_id,
-        "restored commit mismatch"
-    );
-    Ok(RecoveryRestoreReport {
-        vault_root: root.display().to_string(),
-        repository_id: id,
-        recovery_point_id: recovery_point_id.to_string(),
-        restore,
-    })
+    let details = BTreeMap::from([
+        (
+            "output_dir".to_string(),
+            absolute_path(output_dir)?.display().to_string(),
+        ),
+        (
+            "selected_path".to_string(),
+            selected_path.unwrap_or(".").to_string(),
+        ),
+        ("overwrite".to_string(), overwrite.to_string()),
+    ]);
+    run_audited(
+        &root,
+        RecoveryAuditOperation::Restore,
+        Some(catalog.generation),
+        Some(id),
+        Some(recovery_point_id.to_string()),
+        details,
+        || {
+            verify_recovery_point(Some(&root), repository_id, recovery_point_id)?;
+            let restore = restore_repository(
+                &vault_repository_root(&root, id),
+                &point.ref_name,
+                output_dir,
+                selected_path,
+                overwrite,
+            )?;
+            anyhow::ensure!(
+                restore.commit_id == point.commit_id,
+                "restored commit mismatch"
+            );
+            Ok((
+                RecoveryRestoreReport {
+                    vault_root: root.display().to_string(),
+                    repository_id: id,
+                    recovery_point_id: recovery_point_id.to_string(),
+                    restore,
+                },
+                Some(catalog.generation),
+            ))
+        },
+    )
 }
 
 pub fn set_recovery_point_pin(
@@ -644,34 +777,49 @@ pub fn set_recovery_point_pin(
     let _lock = lock_vault(&root)?;
     let config = load_vault_config(&root)?;
     let mut catalog = load_catalog(&root)?;
-    let registration = catalog
-        .repositories
-        .get_mut(&hex::encode(id))
-        .ok_or_else(|| anyhow::anyhow!("recovery repository not found"))?;
-    let point = registration
-        .recovery_points
-        .get_mut(recovery_point_id)
-        .ok_or_else(|| anyhow::anyhow!("recovery point not found"))?;
-    anyhow::ensure!(
-        point.state == RecoveryPointState::Available,
-        "recovery point is pending deletion"
-    );
-    let changed = point.pinned != pinned;
-    point.pinned = pinned;
-    registration.updated_unix_ns = now_unix_ns();
-    let mirrored = registration.clone();
-    for mirror in &config.mirror_roots {
-        update_mirror_registration(mirror, &mirrored)?;
-    }
-    catalog.generation = catalog.generation.saturating_add(1);
-    save_catalog(&root, &catalog)?;
-    Ok(RecoveryPinReport {
-        vault_root: root.display().to_string(),
-        repository_id: id,
-        recovery_point_id: recovery_point_id.to_string(),
-        pinned,
-        changed,
-    })
+    let generation_before = catalog.generation;
+    let details = BTreeMap::from([("pinned".to_string(), pinned.to_string())]);
+    run_audited(
+        &root,
+        RecoveryAuditOperation::PinUpdate,
+        Some(generation_before),
+        Some(id),
+        Some(recovery_point_id.to_string()),
+        details,
+        || {
+            let registration = catalog
+                .repositories
+                .get_mut(&hex::encode(id))
+                .ok_or_else(|| anyhow::anyhow!("recovery repository not found"))?;
+            let point = registration
+                .recovery_points
+                .get_mut(recovery_point_id)
+                .ok_or_else(|| anyhow::anyhow!("recovery point not found"))?;
+            anyhow::ensure!(
+                point.state == RecoveryPointState::Available,
+                "recovery point is pending deletion"
+            );
+            let changed = point.pinned != pinned;
+            point.pinned = pinned;
+            registration.updated_unix_ns = now_unix_ns();
+            let mirrored = registration.clone();
+            for mirror in &config.mirror_roots {
+                update_mirror_registration(mirror, &mirrored)?;
+            }
+            catalog.generation = catalog.generation.saturating_add(1);
+            save_catalog(&root, &catalog)?;
+            Ok((
+                RecoveryPinReport {
+                    vault_root: root.display().to_string(),
+                    repository_id: id,
+                    recovery_point_id: recovery_point_id.to_string(),
+                    pinned,
+                    changed,
+                },
+                Some(catalog.generation),
+            ))
+        },
+    )
 }
 
 pub fn record_recovery_tombstone(
@@ -711,41 +859,70 @@ pub fn record_recovery_tombstone(
     let _lock = lock_vault(&root)?;
     let config = load_vault_config(&root)?;
     let mut catalog = load_catalog(&root)?;
-    let registration = catalog
-        .repositories
-        .get_mut(&hex::encode(id))
-        .ok_or_else(|| anyhow::anyhow!("recovery repository not found"))?;
-    if let Some(source_path) = source_path.as_deref() {
-        anyhow::ensure!(
-            registration
-                .source_paths
-                .iter()
-                .any(|path| path == source_path),
-            "tombstone source path is not registered"
-        );
+    let generation_before = catalog.generation;
+    let mut details = BTreeMap::from([(
+        "kind".to_string(),
+        match kind {
+            RecoveryTombstoneKind::File => "file",
+            RecoveryTombstoneKind::Workspace => "workspace",
+            RecoveryTombstoneKind::Registration => "registration",
+        }
+        .to_string(),
+    )]);
+    if let Some(path) = source_path.as_ref() {
+        details.insert("source_path".to_string(), path.clone());
     }
-    let tombstone = RecoveryTombstone {
-        schema: VAULT_SCHEMA,
-        tombstone_id: crate::random_bytes(),
-        kind,
-        observed_unix_ns: now_unix_ns(),
-        source_path,
-        relative_path,
-        reason,
-    };
-    registration.tombstones.push(tombstone.clone());
-    registration.updated_unix_ns = tombstone.observed_unix_ns;
-    let mirrored = registration.clone();
-    for mirror in &config.mirror_roots {
-        update_mirror_registration(mirror, &mirrored)?;
+    if let Some(path) = relative_path.as_ref() {
+        details.insert("relative_path".to_string(), path.clone());
     }
-    catalog.generation = catalog.generation.saturating_add(1);
-    save_catalog(&root, &catalog)?;
-    Ok(RecoveryTombstoneReport {
-        vault_root: root.display().to_string(),
-        repository_id: id,
-        tombstone,
-    })
+    run_audited(
+        &root,
+        RecoveryAuditOperation::TombstoneRecord,
+        Some(generation_before),
+        Some(id),
+        None,
+        details,
+        || {
+            let registration = catalog
+                .repositories
+                .get_mut(&hex::encode(id))
+                .ok_or_else(|| anyhow::anyhow!("recovery repository not found"))?;
+            if let Some(source_path) = source_path.as_deref() {
+                anyhow::ensure!(
+                    registration
+                        .source_paths
+                        .iter()
+                        .any(|path| path == source_path),
+                    "tombstone source path is not registered"
+                );
+            }
+            let tombstone = RecoveryTombstone {
+                schema: VAULT_SCHEMA,
+                tombstone_id: crate::random_bytes(),
+                kind,
+                observed_unix_ns: now_unix_ns(),
+                source_path,
+                relative_path,
+                reason,
+            };
+            registration.tombstones.push(tombstone.clone());
+            registration.updated_unix_ns = tombstone.observed_unix_ns;
+            let mirrored = registration.clone();
+            for mirror in &config.mirror_roots {
+                update_mirror_registration(mirror, &mirrored)?;
+            }
+            catalog.generation = catalog.generation.saturating_add(1);
+            save_catalog(&root, &catalog)?;
+            Ok((
+                RecoveryTombstoneReport {
+                    vault_root: root.display().to_string(),
+                    repository_id: id,
+                    tombstone,
+                },
+                Some(catalog.generation),
+            ))
+        },
+    )
 }
 
 pub fn gc_recovery_vault(
@@ -802,100 +979,115 @@ pub fn gc_recovery_vault(
         });
     }
 
-    for (repository_key, point_ids) in &selection.selected {
-        let registration = catalog
-            .repositories
-            .get_mut(repository_key)
-            .ok_or_else(|| anyhow::anyhow!("recovery repository disappeared during GC"))?;
-        for point_id in point_ids {
-            let point = registration
-                .recovery_points
-                .get_mut(point_id)
-                .ok_or_else(|| anyhow::anyhow!("recovery point disappeared during GC"))?;
-            anyhow::ensure!(!point.pinned, "pinned recovery point selected for GC");
-            point.state = RecoveryPointState::PendingDeletion;
-        }
-        registration.updated_unix_ns = now_unix_ns();
-    }
-    let pending_registrations = selection
-        .selected
-        .keys()
-        .filter_map(|key| catalog.repositories.get(key).cloned())
-        .collect::<Vec<_>>();
-    for mirror in &config.mirror_roots {
-        for registration in &pending_registrations {
-            update_mirror_registration(mirror, registration)?;
-        }
-    }
-    catalog.generation = catalog.generation.saturating_add(1);
-    save_catalog(&root, &catalog)?;
+    let generation_before = catalog.generation;
+    let details = BTreeMap::from([("candidate_count".to_string(), candidates.len().to_string())]);
+    run_audited(
+        &root,
+        RecoveryAuditOperation::GarbageCollection,
+        Some(generation_before),
+        None,
+        None,
+        details,
+        || {
+            for (repository_key, point_ids) in &selection.selected {
+                let registration = catalog
+                    .repositories
+                    .get_mut(repository_key)
+                    .ok_or_else(|| anyhow::anyhow!("recovery repository disappeared during GC"))?;
+                for point_id in point_ids {
+                    let point = registration
+                        .recovery_points
+                        .get_mut(point_id)
+                        .ok_or_else(|| anyhow::anyhow!("recovery point disappeared during GC"))?;
+                    anyhow::ensure!(!point.pinned, "pinned recovery point selected for GC");
+                    point.state = RecoveryPointState::PendingDeletion;
+                }
+                registration.updated_unix_ns = now_unix_ns();
+            }
+            let pending_registrations = selection
+                .selected
+                .keys()
+                .filter_map(|key| catalog.repositories.get(key).cloned())
+                .collect::<Vec<_>>();
+            for mirror in &config.mirror_roots {
+                for registration in &pending_registrations {
+                    update_mirror_registration(mirror, registration)?;
+                }
+            }
+            catalog.generation = catalog.generation.saturating_add(1);
+            save_catalog(&root, &catalog)?;
 
-    for mirror in &config.mirror_roots {
-        for (repository_key, point_ids) in &selection.selected {
-            let registration = catalog
-                .repositories
-                .get(repository_key)
-                .ok_or_else(|| anyhow::anyhow!("recovery repository missing"))?;
-            gc_repository_excluding_recovery_refs(
-                &vault_repository_root(mirror, registration.repository_id),
-                point_ids,
-                false,
-            )?;
-        }
-    }
-    let mut applied_reports = BTreeMap::new();
-    for (repository_key, point_ids) in &selection.selected {
-        let registration = catalog
-            .repositories
-            .get(repository_key)
-            .ok_or_else(|| anyhow::anyhow!("recovery repository missing"))?;
-        let report = gc_repository_excluding_recovery_refs(
-            &vault_repository_root(&root, registration.repository_id),
-            point_ids,
-            false,
-        )?;
-        applied_reports.insert(repository_key.clone(), report);
-    }
+            for mirror in &config.mirror_roots {
+                for (repository_key, point_ids) in &selection.selected {
+                    let registration = catalog
+                        .repositories
+                        .get(repository_key)
+                        .ok_or_else(|| anyhow::anyhow!("recovery repository missing"))?;
+                    gc_repository_excluding_recovery_refs(
+                        &vault_repository_root(mirror, registration.repository_id),
+                        point_ids,
+                        false,
+                    )?;
+                }
+            }
+            let mut applied_reports = BTreeMap::new();
+            for (repository_key, point_ids) in &selection.selected {
+                let registration = catalog
+                    .repositories
+                    .get(repository_key)
+                    .ok_or_else(|| anyhow::anyhow!("recovery repository missing"))?;
+                let report = gc_repository_excluding_recovery_refs(
+                    &vault_repository_root(&root, registration.repository_id),
+                    point_ids,
+                    false,
+                )?;
+                applied_reports.insert(repository_key.clone(), report);
+            }
 
-    for (repository_key, point_ids) in &selection.selected {
-        let registration = catalog
-            .repositories
-            .get_mut(repository_key)
-            .ok_or_else(|| anyhow::anyhow!("recovery repository missing"))?;
-        for point_id in point_ids {
-            registration.recovery_points.remove(point_id);
-        }
-        registration.updated_unix_ns = now_unix_ns();
-    }
-    let final_registrations = selection
-        .selected
-        .keys()
-        .filter_map(|key| catalog.repositories.get(key).cloned())
-        .collect::<Vec<_>>();
-    for mirror in &config.mirror_roots {
-        for registration in &final_registrations {
-            update_mirror_registration(mirror, registration)?;
-        }
-    }
-    catalog.generation = catalog.generation.saturating_add(1);
-    save_catalog(&root, &catalog)?;
-    let projected_stored_bytes = applied_reports
-        .values()
-        .map(|report| report.total_bytes.saturating_sub(report.removed_bytes))
-        .sum();
-    Ok(RecoveryVaultGcReport {
-        vault_root: root.display().to_string(),
-        dry_run: false,
-        total_recovery_points: total_points,
-        retained_recovery_points: total_points.saturating_sub(candidates.len() as u64),
-        candidate_recovery_points: candidates.len() as u64,
-        removed_recovery_points: candidates.len() as u64,
-        stored_bytes_before: selection.stored_bytes_before,
-        projected_stored_bytes,
-        policy_satisfied: selection.policy_satisfied,
-        candidates,
-        repositories: applied_reports,
-    })
+            for (repository_key, point_ids) in &selection.selected {
+                let registration = catalog
+                    .repositories
+                    .get_mut(repository_key)
+                    .ok_or_else(|| anyhow::anyhow!("recovery repository missing"))?;
+                for point_id in point_ids {
+                    registration.recovery_points.remove(point_id);
+                }
+                registration.updated_unix_ns = now_unix_ns();
+            }
+            let final_registrations = selection
+                .selected
+                .keys()
+                .filter_map(|key| catalog.repositories.get(key).cloned())
+                .collect::<Vec<_>>();
+            for mirror in &config.mirror_roots {
+                for registration in &final_registrations {
+                    update_mirror_registration(mirror, registration)?;
+                }
+            }
+            catalog.generation = catalog.generation.saturating_add(1);
+            save_catalog(&root, &catalog)?;
+            let projected_stored_bytes = applied_reports
+                .values()
+                .map(|report| report.total_bytes.saturating_sub(report.removed_bytes))
+                .sum();
+            Ok((
+                RecoveryVaultGcReport {
+                    vault_root: root.display().to_string(),
+                    dry_run: false,
+                    total_recovery_points: total_points,
+                    retained_recovery_points: total_points.saturating_sub(candidates.len() as u64),
+                    candidate_recovery_points: candidates.len() as u64,
+                    removed_recovery_points: candidates.len() as u64,
+                    stored_bytes_before: selection.stored_bytes_before,
+                    projected_stored_bytes,
+                    policy_satisfied: selection.policy_satisfied,
+                    candidates,
+                    repositories: applied_reports,
+                },
+                Some(catalog.generation),
+            ))
+        },
+    )
 }
 
 pub fn scrub_recovery_vault(requested_root: Option<&Path>) -> anyhow::Result<RecoveryScrubReport> {
@@ -961,52 +1153,68 @@ pub fn repair_recovery_point(
         mirror_point.commit_id == primary_point.commit_id,
         "mirror recovery point commit mismatch"
     );
-    verify_recovery_point(Some(&mirror), repository_id, recovery_point_id)?;
-    let repaired = repair_repository_revision(
-        &vault_repository_root(&mirror, id),
-        &mirror_point.ref_name,
-        &vault_repository_root(&root, id),
-        recovery_point_id,
-    )?;
-    verify_recovery_point(Some(&root), repository_id, recovery_point_id)?;
-    let registration = catalog
-        .repositories
-        .get_mut(&hex::encode(id))
-        .ok_or_else(|| anyhow::anyhow!("recovery repository not found"))?;
-    let point = registration
-        .recovery_points
-        .get_mut(recovery_point_id)
-        .ok_or_else(|| anyhow::anyhow!("recovery point not found"))?;
-    point.last_verified_unix_ns = now_unix_ns();
-    if let Some(replica) = point
-        .replicas
-        .iter_mut()
-        .find(|replica| replica.vault_root == mirror.display().to_string())
-    {
-        replica.verified = true;
-        replica.error = None;
-    }
-    point.durability =
-        if point.replicas.iter().all(|replica| replica.verified) && !point.replicas.is_empty() {
-            RecoveryDurability::Protected
-        } else if point.replicas.is_empty() {
-            RecoveryDurability::Captured
-        } else {
-            RecoveryDurability::Degraded
-        };
-    registration.updated_unix_ns = point.last_verified_unix_ns;
-    catalog.generation = catalog.generation.saturating_add(1);
-    save_catalog(&root, &catalog)?;
-    Ok(RecoveryRepairReport {
-        vault_root: root.display().to_string(),
-        mirror_root: mirror.display().to_string(),
-        repository_id: id,
-        recovery_point_id: recovery_point_id.to_string(),
-        objects_written: repaired.objects_written,
-        objects_repaired: repaired.objects_repaired,
-        object_bytes_written: repaired.object_bytes_written,
-        verified: true,
-    })
+    let generation_before = catalog.generation;
+    let details = BTreeMap::from([("mirror_root".to_string(), mirror.display().to_string())]);
+    run_audited(
+        &root,
+        RecoveryAuditOperation::Repair,
+        Some(generation_before),
+        Some(id),
+        Some(recovery_point_id.to_string()),
+        details,
+        || {
+            verify_recovery_point(Some(&mirror), repository_id, recovery_point_id)?;
+            let repaired = repair_repository_revision(
+                &vault_repository_root(&mirror, id),
+                &mirror_point.ref_name,
+                &vault_repository_root(&root, id),
+                recovery_point_id,
+            )?;
+            verify_recovery_point(Some(&root), repository_id, recovery_point_id)?;
+            let registration = catalog
+                .repositories
+                .get_mut(&hex::encode(id))
+                .ok_or_else(|| anyhow::anyhow!("recovery repository not found"))?;
+            let point = registration
+                .recovery_points
+                .get_mut(recovery_point_id)
+                .ok_or_else(|| anyhow::anyhow!("recovery point not found"))?;
+            point.last_verified_unix_ns = now_unix_ns();
+            if let Some(replica) = point
+                .replicas
+                .iter_mut()
+                .find(|replica| replica.vault_root == mirror.display().to_string())
+            {
+                replica.verified = true;
+                replica.error = None;
+            }
+            point.durability = if point.replicas.iter().all(|replica| replica.verified)
+                && !point.replicas.is_empty()
+            {
+                RecoveryDurability::Protected
+            } else if point.replicas.is_empty() {
+                RecoveryDurability::Captured
+            } else {
+                RecoveryDurability::Degraded
+            };
+            registration.updated_unix_ns = point.last_verified_unix_ns;
+            catalog.generation = catalog.generation.saturating_add(1);
+            save_catalog(&root, &catalog)?;
+            Ok((
+                RecoveryRepairReport {
+                    vault_root: root.display().to_string(),
+                    mirror_root: mirror.display().to_string(),
+                    repository_id: id,
+                    recovery_point_id: recovery_point_id.to_string(),
+                    objects_written: repaired.objects_written,
+                    objects_repaired: repaired.objects_repaired,
+                    object_bytes_written: repaired.object_bytes_written,
+                    verified: true,
+                },
+                Some(catalog.generation),
+            ))
+        },
+    )
 }
 
 fn scrub_vault_location(root: &Path, primary: bool) -> RecoveryScrubLocationReport {
@@ -1018,10 +1226,15 @@ fn scrub_vault_location(root: &Path, primary: bool) -> RecoveryScrubLocationRepo
         checked_recovery_points: 0,
         checked_objects: 0,
         checked_raw_bytes: 0,
+        checked_audit_events: 0,
+        incomplete_audit_operations: 0,
         errors: Vec::new(),
     };
     let result = (|| -> anyhow::Result<()> {
         load_vault_config(root)?;
+        let audit = recovery_audit_log(Some(root))?;
+        report.checked_audit_events = audit.events.len().try_into()?;
+        report.incomplete_audit_operations = audit.incomplete_operation_ids.len().try_into()?;
         let catalog = load_catalog(root)?;
         for registration in catalog.repositories.values() {
             report.checked_repositories += 1;
@@ -1240,63 +1453,77 @@ fn capture_mirror(
     primary: &RepositoryReplicationReport,
 ) -> anyhow::Result<()> {
     ensure_separate_roots(source_root, mirror)?;
-    initialize_vault_root(mirror, Vec::new())?;
+    ensure_mirror_vault_with_audit(mirror)?;
     let _lock = lock_vault(mirror)?;
-    let report = replicate_repository_revision(
-        source_root,
-        revision,
-        &vault_repository_root(mirror, registration.repository_id),
-        point_id,
-    )?;
-    anyhow::ensure!(
-        report.commit_id == primary.commit_id,
-        "mirror commit mismatch"
-    );
-    anyhow::ensure!(
-        report.reachable_objects == primary.reachable_objects,
-        "mirror reachable graph mismatch"
-    );
     let mut catalog = load_catalog(mirror)?;
-    let key = hex::encode(registration.repository_id);
-    let now = now_unix_ns();
-    let mut mirrored_registration = registration.clone();
-    let captured_unix_ns = mirrored_registration
-        .recovery_points
-        .get(point_id)
-        .map(|point| point.captured_unix_ns)
-        .unwrap_or(now);
-    let pinned = mirrored_registration
-        .recovery_points
-        .get(point_id)
-        .is_some_and(|point| point.pinned);
-    mirrored_registration.recovery_points.insert(
-        point_id.to_string(),
-        RecoveryPoint {
-            schema: VAULT_SCHEMA,
-            recovery_point_id: point_id.to_string(),
-            commit_id: report.commit_id,
-            ref_name: report.ref_name,
-            captured_unix_ns,
-            last_verified_unix_ns: now,
-            reachable_objects: report.reachable_objects,
-            stored_objects_written: report.objects_written,
-            stored_bytes_written: report.object_bytes_written,
-            durability: RecoveryDurability::Captured,
-            replicas: Vec::new(),
-            pinned,
-            state: RecoveryPointState::Available,
+    let generation_before = catalog.generation;
+    let details = BTreeMap::from([("source_root".to_string(), source_root.display().to_string())]);
+    run_audited(
+        mirror,
+        RecoveryAuditOperation::MirrorSynchronize,
+        Some(generation_before),
+        Some(registration.repository_id),
+        Some(point_id.to_string()),
+        details,
+        || {
+            let report = replicate_repository_revision(
+                source_root,
+                revision,
+                &vault_repository_root(mirror, registration.repository_id),
+                point_id,
+            )?;
+            anyhow::ensure!(
+                report.commit_id == primary.commit_id,
+                "mirror commit mismatch"
+            );
+            anyhow::ensure!(
+                report.reachable_objects == primary.reachable_objects,
+                "mirror reachable graph mismatch"
+            );
+            let key = hex::encode(registration.repository_id);
+            let now = now_unix_ns();
+            let mut mirrored_registration = registration.clone();
+            let captured_unix_ns = mirrored_registration
+                .recovery_points
+                .get(point_id)
+                .map(|point| point.captured_unix_ns)
+                .unwrap_or(now);
+            let pinned = mirrored_registration
+                .recovery_points
+                .get(point_id)
+                .is_some_and(|point| point.pinned);
+            mirrored_registration.recovery_points.insert(
+                point_id.to_string(),
+                RecoveryPoint {
+                    schema: VAULT_SCHEMA,
+                    recovery_point_id: point_id.to_string(),
+                    commit_id: report.commit_id,
+                    ref_name: report.ref_name,
+                    captured_unix_ns,
+                    last_verified_unix_ns: now,
+                    reachable_objects: report.reachable_objects,
+                    stored_objects_written: report.objects_written,
+                    stored_bytes_written: report.object_bytes_written,
+                    durability: RecoveryDurability::Captured,
+                    replicas: Vec::new(),
+                    pinned,
+                    state: RecoveryPointState::Available,
+                },
+            );
+            mirrored_registration.updated_unix_ns = now;
+            catalog.repositories.insert(key, mirrored_registration);
+            catalog.generation = catalog.generation.saturating_add(1);
+            save_catalog(mirror, &catalog)?;
+            Ok(((), Some(catalog.generation)))
         },
-    );
-    mirrored_registration.updated_unix_ns = now;
-    catalog.repositories.insert(key, mirrored_registration);
-    catalog.generation = catalog.generation.saturating_add(1);
-    save_catalog(mirror, &catalog)
+    )
 }
 
 fn initialize_vault_root(root: &Path, mirror_roots: Vec<PathBuf>) -> anyhow::Result<()> {
     secure_create_dir(root)?;
     secure_create_dir(&root.join("locks"))?;
     secure_create_dir(&root.join("repositories"))?;
+    secure_create_dir(&root.join("events"))?;
     let config_path = vault_config_path(root);
     if config_path.exists() {
         enforce_private_file(&config_path)?;
@@ -1380,7 +1607,9 @@ fn ensure_separate_roots(source: &Path, vault: &Path) -> anyhow::Result<()> {
 }
 
 fn load_vault_config(root: &Path) -> anyhow::Result<RecoveryVaultConfig> {
-    let config: RecoveryVaultConfig = read_checked_json(&vault_config_path(root))?;
+    let path = vault_config_path(root);
+    enforce_private_file(&path)?;
+    let config: RecoveryVaultConfig = read_checked_json(&path)?;
     anyhow::ensure!(
         config.schema == VAULT_SCHEMA,
         "unsupported recovery vault schema"
@@ -1393,15 +1622,83 @@ fn update_mirror_registration(
     mirror: &Path,
     registration: &RecoveryRegistration,
 ) -> anyhow::Result<()> {
-    initialize_vault_root(mirror, Vec::new())?;
+    ensure_mirror_vault_with_audit(mirror)?;
     let _lock = lock_vault(mirror)?;
     let mut catalog = load_catalog(mirror)?;
-    catalog.repositories.insert(
-        hex::encode(registration.repository_id),
-        registration.clone(),
-    );
-    catalog.generation = catalog.generation.saturating_add(1);
-    save_catalog(mirror, &catalog)
+    let generation_before = catalog.generation;
+    run_audited(
+        mirror,
+        RecoveryAuditOperation::MirrorSynchronize,
+        Some(generation_before),
+        Some(registration.repository_id),
+        None,
+        BTreeMap::from([("scope".to_string(), "registration".to_string())]),
+        || {
+            catalog.repositories.insert(
+                hex::encode(registration.repository_id),
+                registration.clone(),
+            );
+            catalog.generation = catalog.generation.saturating_add(1);
+            save_catalog(mirror, &catalog)?;
+            Ok(((), Some(catalog.generation)))
+        },
+    )
+}
+
+fn initialize_mirror_vault_with_audit(mirror: &Path) -> anyhow::Result<()> {
+    secure_create_dir(mirror)?;
+    secure_create_dir(&mirror.join("events"))?;
+    secure_create_dir(&mirror.join("locks"))?;
+    let _lock = lock_vault(mirror)?;
+    let generation_before = if catalog_path(mirror).exists() {
+        enforce_private_file(&catalog_path(mirror))?;
+        Some(load_catalog(mirror)?.generation)
+    } else {
+        None
+    };
+    run_audited(
+        mirror,
+        RecoveryAuditOperation::VaultInitialize,
+        generation_before,
+        None,
+        None,
+        BTreeMap::from([("replica_role".to_string(), "mirror".to_string())]),
+        || {
+            initialize_vault_root(mirror, Vec::new())?;
+            Ok(((), Some(load_catalog(mirror)?.generation)))
+        },
+    )
+}
+
+fn ensure_mirror_vault_with_audit(mirror: &Path) -> anyhow::Result<()> {
+    if vault_config_path(mirror).exists() {
+        initialize_vault_root(mirror, Vec::new())
+    } else {
+        initialize_mirror_vault_with_audit(mirror)
+    }
+}
+
+fn update_mirror_retention(
+    mirror: &Path,
+    retention: &RecoveryRetentionPolicy,
+) -> anyhow::Result<()> {
+    ensure_mirror_vault_with_audit(mirror)?;
+    let _lock = lock_vault(mirror)?;
+    let mut config = load_vault_config(mirror)?;
+    let generation = load_catalog(mirror)?.generation;
+    run_audited(
+        mirror,
+        RecoveryAuditOperation::RetentionUpdate,
+        Some(generation),
+        None,
+        None,
+        BTreeMap::from([("replica_role".to_string(), "mirror".to_string())]),
+        || {
+            config.retention = retention.clone();
+            write_checked_json(&vault_config_path(mirror), &config)?;
+            Ok(((), Some(generation)))
+        },
+    )
 }
 
 fn validate_relative_label(path: &str) -> anyhow::Result<()> {
@@ -1417,7 +1714,9 @@ fn validate_relative_label(path: &str) -> anyhow::Result<()> {
 }
 
 fn load_catalog(root: &Path) -> anyhow::Result<RecoveryCatalog> {
-    let catalog: RecoveryCatalog = read_checked_json(&catalog_path(root))?;
+    let path = catalog_path(root);
+    enforce_private_file(&path)?;
+    let catalog: RecoveryCatalog = read_checked_json(&path)?;
     anyhow::ensure!(
         catalog.schema == CATALOG_SCHEMA,
         "unsupported recovery catalog schema"
@@ -1498,13 +1797,18 @@ fn read_checked_json<T: DeserializeOwned + Serialize>(path: &Path) -> anyhow::Re
 }
 
 fn write_checked_json<T: Serialize>(path: &Path, payload: &T) -> anyhow::Result<()> {
+    let bytes = checked_json_bytes(payload)?;
+    atomic_write(path, &bytes)
+}
+
+fn checked_json_bytes<T: Serialize>(payload: &T) -> anyhow::Result<Vec<u8>> {
     let payload_bytes = serde_json::to_vec(payload)?;
     let document = CheckedDocument {
         schema: DOCUMENT_SCHEMA,
         payload_blake3: blake3::hash(&payload_bytes).to_hex().to_string(),
         payload,
     };
-    atomic_write(path, &serde_json::to_vec_pretty(&document)?)
+    Ok(serde_json::to_vec_pretty(&document)?)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -1850,6 +2154,140 @@ mod tests {
 
         let error = init_recovery_vault(Some(&vault), Vec::new()).unwrap_err();
         assert!(error.to_string().contains("not a physical file"));
+    }
+
+    #[test]
+    fn audit_log_records_committed_recovery_operations_with_generations() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let vault = temp.path().join("vault");
+        let restored = temp.path().join("restored");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), "audited").unwrap();
+        let initialized = init_repository(&source, Vec::new()).unwrap();
+        snapshot_repository(&source, "baseline".into(), None).unwrap();
+
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        register_recovery_repository(&source, Some(&vault)).unwrap();
+        let captured = capture_recovery_point(&source, "HEAD", Some(&vault)).unwrap();
+        restore_recovery_point(
+            Some(&vault),
+            &hex::encode(initialized.repository_id),
+            &captured.recovery_point.recovery_point_id,
+            &restored,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let audit = recovery_audit_log(Some(&vault)).unwrap();
+        assert!(audit.incomplete_operation_ids.is_empty());
+        for operation in [
+            RecoveryAuditOperation::VaultInitialize,
+            RecoveryAuditOperation::RepositoryRegister,
+            RecoveryAuditOperation::Capture,
+            RecoveryAuditOperation::Restore,
+        ] {
+            assert!(audit.events.iter().any(|event| {
+                event.operation == operation
+                    && event.outcome == RecoveryAuditOutcome::Committed
+                    && event.catalog_generation_after.is_some()
+            }));
+        }
+        assert_eq!(
+            fs::read_to_string(restored.join("file.txt")).unwrap(),
+            "audited"
+        );
+    }
+
+    #[test]
+    fn failed_mutation_has_a_terminal_audit_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+
+        let error = set_recovery_point_pin(
+            Some(&vault),
+            "00000000000000000000000000000000",
+            &"0".repeat(64),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not found"));
+
+        let audit = recovery_audit_log(Some(&vault)).unwrap();
+        assert!(audit.incomplete_operation_ids.is_empty());
+        assert!(audit.events.iter().any(|event| {
+            event.operation == RecoveryAuditOperation::PinUpdate
+                && event.outcome == RecoveryAuditOutcome::Failed
+                && event
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("not found"))
+        }));
+    }
+
+    #[test]
+    fn prepared_audit_event_survives_as_an_interruption_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        let generation = load_catalog(&vault).unwrap().generation;
+        let transaction = begin_audit(
+            &vault,
+            RecoveryAuditOperation::GarbageCollection,
+            Some(generation),
+            None,
+            None,
+            BTreeMap::from([("fault".to_string(), "process_termination".to_string())]),
+        )
+        .unwrap();
+        let operation_id = transaction.prepared.operation_id.clone();
+        drop(transaction);
+
+        let audit = recovery_audit_log(Some(&vault)).unwrap();
+        assert_eq!(audit.incomplete_operation_ids, vec![operation_id]);
+        assert_eq!(
+            audit
+                .events
+                .iter()
+                .filter(|event| event.operation == RecoveryAuditOperation::GarbageCollection)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn audit_checksum_corruption_fails_closed_and_scrub_reports_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        let event_path = fs::read_dir(vault.join("events"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut bytes = fs::read(&event_path).unwrap();
+        let position = bytes.iter().position(|byte| *byte == b'0').unwrap();
+        bytes[position] = b'1';
+        fs::write(event_path, bytes).unwrap();
+
+        assert!(recovery_audit_log(Some(&vault)).is_err());
+        let scrub = scrub_recovery_vault(Some(&vault)).unwrap();
+        assert!(!scrub.healthy);
+        assert!(!scrub.locations[0].errors.is_empty());
+    }
+
+    #[test]
+    fn immutable_audit_publication_never_replaces_an_existing_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("event.json");
+        fs::write(&path, b"existing").unwrap();
+
+        assert!(atomic_write_new(&path, b"replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"existing");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]

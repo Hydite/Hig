@@ -1,7 +1,7 @@
 use crate::cli::{RecoveryCommand, RecoveryPolicyCommand, RecoveryTombstoneKindArg};
 use hig_core::{
     RecoveryTombstoneKind, capture_recovery_point, gc_recovery_vault, init_recovery_vault,
-    list_recovery_vault, record_recovery_tombstone, recovery_vault_config,
+    list_recovery_vault, record_recovery_tombstone, recovery_audit_log, recovery_vault_config,
     register_recovery_repository, repair_recovery_point, restore_recovery_point,
     scrub_recovery_vault, set_recovery_point_pin, update_recovery_retention, verify_recovery_point,
 };
@@ -88,6 +88,22 @@ pub(crate) fn handle(command: RecoveryCommand) -> anyhow::Result<()> {
                         registration.recovery_points.len(),
                         registration.source_paths.join(",")
                     );
+                }
+            }
+        }
+        RecoveryCommand::Audit { vault_root, json } => {
+            let report = recovery_audit_log(vault_root.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "recovery: audit vault={} events={} incomplete={}",
+                    report.vault_root,
+                    report.events.len(),
+                    report.incomplete_operation_ids.len()
+                );
+                for operation_id in report.incomplete_operation_ids {
+                    println!("incomplete\t{operation_id}");
                 }
             }
         }
@@ -187,13 +203,15 @@ pub(crate) fn handle(command: RecoveryCommand) -> anyhow::Result<()> {
                 );
                 for location in &report.locations {
                     println!(
-                        "{}\tprimary={}\thealthy={}\trepositories={}\tpoints={}\tobjects={}\terrors={}",
+                        "{}\tprimary={}\thealthy={}\trepositories={}\tpoints={}\tobjects={}\taudit_events={}\tincomplete_audit={}\terrors={}",
                         location.vault_root,
                         location.primary,
                         location.healthy,
                         location.checked_repositories,
                         location.checked_recovery_points,
                         location.checked_objects,
+                        location.checked_audit_events,
+                        location.incomplete_audit_operations,
                         location.errors.join(" | ")
                     );
                 }

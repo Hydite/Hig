@@ -475,6 +475,12 @@ pub(crate) enum RecoveryCommand {
         #[arg(long)]
         json: bool,
     },
+    Audit {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     Pin {
         repository_id: String,
         recovery_point_id: String,
@@ -847,6 +853,25 @@ mod tests {
 
     #[test]
     fn recovery_scrub_and_repair_parse_in_the_recovery_namespace() {
+        let audit = Cli::try_parse_from([
+            "hig",
+            "recovery",
+            "audit",
+            "--vault-root",
+            "vault",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            audit.command,
+            Command::Recovery {
+                command: RecoveryCommand::Audit {
+                    vault_root: Some(root),
+                    json: true,
+                }
+            } if root == Path::new("vault")
+        ));
+
         let scrub = Cli::try_parse_from([
             "hig",
             "recovery",

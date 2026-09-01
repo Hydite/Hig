@@ -133,7 +133,7 @@ const requiredTools = [
   "hig_repo_storage_tree", "hig_repo_symbols", "hig_repo_symbol_history",
   "hig_repo_restore_symbol", "hig_repo_verify", "hig_repo_gc",
   "hig_recovery_init", "hig_recovery_register", "hig_recovery_capture",
-  "hig_recovery_list", "hig_recovery_pin", "hig_recovery_unpin",
+  "hig_recovery_list", "hig_recovery_audit", "hig_recovery_pin", "hig_recovery_unpin",
   "hig_recovery_tombstone", "hig_recovery_policy_show", "hig_recovery_policy_set",
   "hig_recovery_gc", "hig_recovery_scrub", "hig_recovery_repair",
   "hig_recovery_verify", "hig_recovery_restore", "hig_bench"
@@ -278,6 +278,9 @@ try {
   const recoveryPointId = captured.data.recovery_point.recovery_point_id;
   const recoveryList = await tool("hig_recovery_list", { vaultRoot: recoveryVault });
   assert.equal(recoveryList.data.repositories.length, 1);
+  const recoveryAudit = await tool("hig_recovery_audit", { vaultRoot: recoveryVault });
+  assert.equal(recoveryAudit.data.incomplete_operation_ids.length, 0);
+  assert.ok(recoveryAudit.data.events.some((event) => event.operation === "capture"));
   const policy = await tool("hig_recovery_policy_show", { vaultRoot: recoveryVault });
   assert.equal(policy.data.retention.schema, 1);
   const recoveryGc = await tool("hig_recovery_gc", { vaultRoot: recoveryVault });

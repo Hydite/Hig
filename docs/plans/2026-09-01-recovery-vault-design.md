@@ -55,13 +55,16 @@ recovery-vault/
       objects/aa/bb...
       refs/recovery/<recovery-point-id>
       locks/write.lock
-    events/<generation>.json
+  events/<operation-id>.<prepared|committed|failed>.json
 ```
 
 Catalog and registration files use explicit schema numbers. Object bytes retain
 the existing repository object format. Mutable JSON documents are written to a
 same-directory temporary file, flushed, atomically renamed, and followed by a
-directory sync. Recovery refs are the final publication record.
+directory sync. Recovery refs are the final publication record. Audit documents
+are immutable checked JSON files published without replacement. Each operation
+has exactly one durable `prepared` event and at most one terminal event; a
+missing terminal event is an explicit interruption record.
 
 ## Capture State Machine
 
@@ -151,6 +154,21 @@ construction, authenticated mutable metadata, key rotation, schema migration,
 external recoverable key custody, and source-and-primary-loss recovery tests.
 It requires a distinct schema/profile decision and cannot be introduced as an
 unreviewed wrapper around filenames, objects, or refs.
+
+On Unix, HIG verifies that private Vault paths are owned by the effective user,
+sets directories to `0700` and control/audit files to `0600`, and refuses
+control-file symlinks. On Windows, HIG installs and reads back a protected DACL
+for the object owner and `SYSTEM`. Existing Vaults are repaired to the same
+policy when opened. These permissions are containment, not a replacement for
+the required external encryption or an anti-ransomware boundary.
+
+Every accepted mutation and restore emits a two-record audit transaction. The
+prepared record is synchronized before work begins; committed and failed
+records are separate immutable files. A hard termination leaves the prepared
+record visible as incomplete. The `recovery audit` CLI and
+`hig_recovery_audit` MCP tool validate pairing, checksums, identifiers, actor,
+catalog generations, and bounded details. Scrub treats malformed audit data as
+corruption and reports valid incomplete operations separately.
 
 MCP defaults to configured workspace and vault roots. Destructive operations
 are report-only unless `apply` is explicit. Restore refuses overwrite by
