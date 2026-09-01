@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod audit;
 #[cfg(test)]
+mod concurrency_tests;
+#[cfg(test)]
 mod fault_tests;
 
 use audit::run_audited;
