@@ -19,6 +19,8 @@ mod audit;
 mod concurrency_tests;
 #[cfg(test)]
 mod fault_tests;
+#[cfg(test)]
+mod schema_tests;
 
 use audit::run_audited;
 pub use audit::{
@@ -1680,7 +1682,27 @@ fn load_vault_config(root: &Path) -> anyhow::Result<RecoveryVaultConfig> {
         "unsupported recovery vault schema"
     );
     config.retention.validate()?;
+    validate_mirror_roots(root, &config.mirror_roots)?;
     Ok(config)
+}
+
+fn validate_mirror_roots(root: &Path, mirrors: &[PathBuf]) -> anyhow::Result<()> {
+    let mut previous: Option<&Path> = None;
+    for mirror in mirrors {
+        anyhow::ensure!(mirror.is_absolute(), "recovery mirror root is not absolute");
+        anyhow::ensure!(
+            mirror != root && !mirror.starts_with(root) && !root.starts_with(mirror),
+            "recovery primary and mirror roots cannot contain each other"
+        );
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                previous < mirror.as_path(),
+                "recovery mirror roots are not canonical"
+            );
+        }
+        previous = Some(mirror);
+    }
+    Ok(())
 }
 
 fn update_mirror_registration(
@@ -1778,19 +1800,161 @@ fn validate_relative_label(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_persisted_absolute_path_label(path: &str) -> anyhow::Result<()> {
+    let bytes = path.as_bytes();
+    let unix_absolute = bytes.first() == Some(&b'/');
+    let windows_drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    let windows_unc_absolute = bytes.starts_with(b"\\\\") && bytes.len() > 2;
+    anyhow::ensure!(
+        !path.contains('\0') && (unix_absolute || windows_drive_absolute || windows_unc_absolute),
+        "persisted recovery path label is not absolute"
+    );
+    Ok(())
+}
+
 fn load_catalog(root: &Path) -> anyhow::Result<RecoveryCatalog> {
     let path = catalog_path(root);
     enforce_private_file(&path)?;
     let catalog: RecoveryCatalog = read_checked_json(&path)?;
-    anyhow::ensure!(
-        catalog.schema == CATALOG_SCHEMA,
-        "unsupported recovery catalog schema"
-    );
+    validate_catalog(&catalog)?;
     Ok(catalog)
 }
 
 fn save_catalog(root: &Path, catalog: &RecoveryCatalog) -> anyhow::Result<()> {
+    validate_catalog(catalog)?;
     write_checked_json(&catalog_path(root), catalog)
+}
+
+fn validate_catalog(catalog: &RecoveryCatalog) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        catalog.schema == CATALOG_SCHEMA,
+        "unsupported recovery catalog schema"
+    );
+    for (repository_key, registration) in &catalog.repositories {
+        validate_registration(repository_key, registration)?;
+    }
+    Ok(())
+}
+
+fn validate_registration(
+    repository_key: &str,
+    registration: &RecoveryRegistration,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        registration.schema == VAULT_SCHEMA,
+        "unsupported recovery registration schema"
+    );
+    anyhow::ensure!(
+        repository_key == hex::encode(registration.repository_id),
+        "recovery registration key does not match repository identity"
+    );
+    anyhow::ensure!(
+        registration.created_unix_ns <= registration.updated_unix_ns,
+        "recovery registration time regresses"
+    );
+    anyhow::ensure!(
+        !registration.source_paths.is_empty(),
+        "recovery registration has no source path history"
+    );
+    let mut previous_source: Option<&str> = None;
+    for source in &registration.source_paths {
+        validate_persisted_absolute_path_label(source).map_err(|error| {
+            anyhow::anyhow!("recovery source path history contains an invalid path: {error}")
+        })?;
+        if let Some(previous) = previous_source {
+            anyhow::ensure!(
+                previous < source.as_str(),
+                "recovery source path history is not canonical"
+            );
+        }
+        previous_source = Some(source);
+    }
+
+    for (point_id, point) in &registration.recovery_points {
+        validate_recovery_point(point_id, point)?;
+    }
+    let mut tombstone_ids = BTreeSet::new();
+    for tombstone in &registration.tombstones {
+        anyhow::ensure!(
+            tombstone.schema == VAULT_SCHEMA,
+            "unsupported recovery tombstone schema"
+        );
+        anyhow::ensure!(
+            tombstone_ids.insert(tombstone.tombstone_id),
+            "duplicate recovery tombstone identity"
+        );
+        anyhow::ensure!(
+            !tombstone.reason.trim().is_empty() && !tombstone.reason.contains('\0'),
+            "recovery tombstone reason is invalid"
+        );
+        if let Some(source) = tombstone.source_path.as_deref() {
+            validate_persisted_absolute_path_label(source).map_err(|error| {
+                anyhow::anyhow!("recovery tombstone source path is invalid: {error}")
+            })?;
+        }
+        match tombstone.kind {
+            RecoveryTombstoneKind::File => {
+                let relative = tombstone.relative_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("file recovery tombstone has no relative path")
+                })?;
+                validate_relative_label(relative)?;
+            }
+            RecoveryTombstoneKind::Workspace | RecoveryTombstoneKind::Registration => {
+                anyhow::ensure!(
+                    tombstone.relative_path.is_none(),
+                    "non-file recovery tombstone contains a relative path"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovery_point(point_id: &str, point: &RecoveryPoint) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        point.schema == VAULT_SCHEMA,
+        "unsupported recovery point schema"
+    );
+    anyhow::ensure!(
+        point_id == point.recovery_point_id && point_id == point.commit_id.to_hex(),
+        "recovery point identity does not match its commit"
+    );
+    anyhow::ensure!(
+        point.ref_name == format!("tags/recovery/{point_id}"),
+        "recovery point ref is not canonical"
+    );
+    anyhow::ensure!(
+        point.captured_unix_ns <= point.last_verified_unix_ns,
+        "recovery point verification time regresses"
+    );
+    let mut replica_roots = BTreeSet::new();
+    for replica in &point.replicas {
+        validate_persisted_absolute_path_label(&replica.vault_root)
+            .map_err(|error| anyhow::anyhow!("recovery replica root is invalid: {error}"))?;
+        anyhow::ensure!(
+            replica_roots.insert(replica.vault_root.as_str()),
+            "duplicate recovery replica root"
+        );
+        anyhow::ensure!(
+            replica.verified == replica.error.is_none(),
+            "recovery replica verification and error state disagree"
+        );
+    }
+    match point.durability {
+        RecoveryDurability::Captured => {}
+        RecoveryDurability::Protected => anyhow::ensure!(
+            !point.replicas.is_empty() && point.replicas.iter().all(|replica| replica.verified),
+            "protected recovery point has no complete verified replica set"
+        ),
+        RecoveryDurability::Degraded => anyhow::ensure!(
+            !point.replicas.is_empty() && point.replicas.iter().any(|replica| !replica.verified),
+            "degraded recovery point has no failed replica"
+        ),
+    }
+    Ok(())
 }
 
 fn find_registration(

@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "repository_id": [
+    188,
+    192,
+    56,
+    191,
+    236,
+    2,
+    58,
+    108,
+    147,
+    119,
+    243,
+    177,
+    254,
+    4,
+    54,
+    228
+  ],
+  "created_unix_ns": 1786646326754926000,
+  "excludes": [
+    ".build",
+    ".git",
+    ".hig",
+    ".hig-cache",
+    ".next",
+    ".venv",
+    "DerivedData",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+    "venv"
+  ],
+  "chunking": {
+    "schema": 2,
+    "algorithm": "fastcdc-v2020",
+    "target_bytes": 65536
+  }
+}

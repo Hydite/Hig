@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "payload_blake3": "d2a5e1f90afd47a9de29534d519f60397f279a34aa8ae39068c1dfca43ab3eae",
+  "payload": {
+    "schema": 1,
+    "created_unix_ns": 1788224359806630000,
+    "mirror_roots": [],
+    "retention": {
+      "schema": 1,
+      "minimum_points_per_repository": 10,
+      "minimum_retention_days": 30,
+      "maximum_points_per_repository": null,
+      "maximum_vault_bytes": null
+    },
+    "at_rest_policy": "external_encryption_required"
+  }
+}

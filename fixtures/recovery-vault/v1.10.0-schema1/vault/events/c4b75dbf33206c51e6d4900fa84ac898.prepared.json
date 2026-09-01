@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "payload_blake3": "c75c46a5e7b8c80cc5fd34151065881b4134bd0f4d7fa4638011f81e8b2f7241",
+  "payload": {
+    "schema": 1,
+    "operation_id": "c4b75dbf33206c51e6d4900fa84ac898",
+    "operation": "vault_initialize",
+    "outcome": "prepared",
+    "occurred_unix_ns": 1788224359789131000,
+    "started_unix_ns": 1788224359789131000,
+    "actor": {
+      "process_id": 26338,
+      "executable": "/opt/hig/bin/hig",
+      "principal": "unix-euid:501"
+    },
+    "catalog_generation_before": null,
+    "catalog_generation_after": null,
+    "repository_id": null,
+    "recovery_point_id": null,
+    "details": {
+      "existing": "false",
+      "mirror_count": "0"
+    },
+    "error": null
+  }
+}

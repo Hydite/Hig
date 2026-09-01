@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "payload_blake3": "f81cd43781224af8c97335775fa39705c856dab6bebd6126b900d2ad52f57ea2",
+  "payload": {
+    "schema": 1,
+    "operation_id": "1ad92249b6b88d2cb52093a904c0deb9",
+    "operation": "capture",
+    "outcome": "prepared",
+    "occurred_unix_ns": 1788224359851118000,
+    "started_unix_ns": 1788224359851118000,
+    "actor": {
+      "process_id": 26339,
+      "executable": "/opt/hig/bin/hig",
+      "principal": "unix-euid:501"
+    },
+    "catalog_generation_before": 0,
+    "catalog_generation_after": null,
+    "repository_id": [
+      188,
+      192,
+      56,
+      191,
+      236,
+      2,
+      58,
+      108,
+      147,
+      119,
+      243,
+      177,
+      254,
+      4,
+      54,
+      228
+    ],
+    "recovery_point_id": "06549be613ad5f43ae563dac8989f2394108dbf7d674d4b37a13aa501755cf89",
+    "details": {
+      "revision": "HEAD",
+      "source_root": "/private/tmp/hig-recovery-schema1-fixture/source"
+    },
+    "error": null
+  }
+}

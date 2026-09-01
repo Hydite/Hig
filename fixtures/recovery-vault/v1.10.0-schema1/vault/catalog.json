@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "payload_blake3": "6cb01bb4b13b0d25d3c21244d566d7c3809e1cc0cb222ea569f6ab2813204a57",
+  "payload": {
+    "schema": 1,
+    "generation": 1,
+    "repositories": {
+      "bcc038bfec023a6c9377f3b1fe0436e4": {
+        "schema": 1,
+        "registration_id": [
+          247,
+          166,
+          15,
+          171,
+          212,
+          20,
+          22,
+          238,
+          178,
+          217,
+          103,
+          203,
+          182,
+          8,
+          229,
+          50
+        ],
+        "repository_id": [
+          188,
+          192,
+          56,
+          191,
+          236,
+          2,
+          58,
+          108,
+          147,
+          119,
+          243,
+          177,
+          254,
+          4,
+          54,
+          228
+        ],
+        "created_unix_ns": 1788224359858674000,
+        "updated_unix_ns": 1788224359858674000,
+        "source_paths": [
+          "/private/tmp/hig-recovery-schema1-fixture/source"
+        ],
+        "recovery_points": {
+          "06549be613ad5f43ae563dac8989f2394108dbf7d674d4b37a13aa501755cf89": {
+            "schema": 1,
+            "recovery_point_id": "06549be613ad5f43ae563dac8989f2394108dbf7d674d4b37a13aa501755cf89",
+            "commit_id": "06549be613ad5f43ae563dac8989f2394108dbf7d674d4b37a13aa501755cf89",
+            "ref_name": "tags/recovery/06549be613ad5f43ae563dac8989f2394108dbf7d674d4b37a13aa501755cf89",
+            "captured_unix_ns": 1788224359858674000,
+            "last_verified_unix_ns": 1788224359858674000,
+            "reachable_objects": 18,
+            "stored_objects_written": 18,
+            "stored_bytes_written": 4341,
+            "durability": "captured",
+            "replicas": [],
+            "pinned": false,
+            "state": "available"
+          }
+        },
+        "tombstones": []
+      }
+    }
+  }
+}
