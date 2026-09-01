@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod audit;
+mod audit_chain;
 mod auth;
 #[cfg(test)]
 mod concurrency_tests;
@@ -506,6 +507,9 @@ pub fn init_recovery_vault(
     secure_create_dir(&root.join("events"))?;
     secure_create_dir(&root.join("locks"))?;
     let _lock = lock_vault(&root)?;
+    if !existed && !auth::is_authenticated(&root) {
+        auth::initialize_primary_identity(&root)?;
+    }
     let existing_config = if existed {
         Some(load_vault_config(&root)?)
     } else {
@@ -586,6 +590,7 @@ pub fn export_recovery_auth_custody(
     );
     let _lock = lock_vault(&root)?;
     load_vault_config(&root)?;
+    recovery_audit_log(Some(&root))?;
     let (identity, checkpoint_sequence) = auth::export_custody_bundle(&root, &output)?;
     Ok(RecoveryAuthCustodyReport {
         schema: RECOVERY_REPORT_SCHEMA,
@@ -611,6 +616,7 @@ pub fn import_recovery_auth_custody(
     let _lock = lock_vault(&root)?;
     let (identity, checkpoint_sequence) = auth::import_custody_bundle(&root, &input)?;
     load_vault_config(&root)?;
+    recovery_audit_log(Some(&root))?;
     Ok(RecoveryAuthCustodyReport {
         schema: RECOVERY_REPORT_SCHEMA,
         vault_root: root.display().to_string(),
@@ -640,10 +646,12 @@ pub fn migrate_recovery_auth(
             &checked_json_bytes(&config)?,
             &checked_json_bytes(&catalog)?,
         )?;
+        audit::migrate_authenticated_chain(&root)?;
         identity
     } else {
         let identity = auth::require_primary(&root)?;
         auth::verify_state(&root, catalog.generation)?;
+        audit::migrate_authenticated_chain(&root)?;
         identity
     };
 
@@ -676,10 +684,12 @@ pub fn migrate_recovery_auth(
                 &checked_json_bytes(&mirror_config)?,
                 &checked_json_bytes(&mirror_catalog)?,
             )?;
+            audit::migrate_authenticated_chain(mirror)?;
             migrated_mirrors.push(mirror.display().to_string());
         } else {
             auth::require_mirror_for(mirror, &identity)?;
             auth::verify_state(mirror, mirror_catalog.generation)?;
+            audit::migrate_authenticated_chain(mirror)?;
         }
         verified_repositories = verified_repositories.saturating_add(verification.0);
         verified_recovery_points = verified_recovery_points.saturating_add(verification.1);
@@ -2649,6 +2659,9 @@ fn initialize_mirror_vault_with_audit(
     secure_create_dir(&mirror.join("events"))?;
     secure_create_dir(&mirror.join("locks"))?;
     let _lock = lock_vault(mirror)?;
+    if !auth::is_authenticated(mirror) {
+        auth::initialize_mirror_identity(mirror, primary, false)?;
+    }
     let generation_before = if catalog_path(mirror).exists() {
         enforce_private_file(&catalog_path(mirror))?;
         Some(load_catalog(mirror)?.generation)
@@ -3732,6 +3745,91 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_audit_pending_recovers_every_publication_boundary() {
+        for failpoint in [
+            "audit_after_pending",
+            "audit_after_event_publication",
+            "audit_after_chain_entry",
+            "audit_after_internal_head",
+            "audit_after_external_head",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let vault = temp.path().join("vault");
+            init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+            let generation = load_catalog(&vault).unwrap().generation;
+            let error = with_recovery_failpoint(failpoint, || {
+                begin_audit(
+                    &vault,
+                    RecoveryAuditOperation::GarbageCollection,
+                    Some(generation),
+                    None,
+                    None,
+                    BTreeMap::new(),
+                )
+                .err()
+                .unwrap()
+            });
+            assert!(error.to_string().contains(failpoint));
+
+            let audit = recovery_audit_log(Some(&vault)).unwrap();
+            assert_eq!(audit.incomplete_operation_ids.len(), 1);
+            assert!(audit.events.iter().any(|event| {
+                event.operation == RecoveryAuditOperation::GarbageCollection
+                    && event.outcome == RecoveryAuditOutcome::Prepared
+            }));
+        }
+    }
+
+    #[test]
+    fn authenticated_audit_rejects_rewritten_event_with_recomputed_checksum() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        let audit = recovery_audit_log(Some(&vault)).unwrap();
+        let original = audit.events.last().unwrap();
+        let mut rewritten = original.clone();
+        rewritten.occurred_unix_ns = rewritten.occurred_unix_ns.saturating_add(1);
+        write_checked_json(
+            &vault
+                .join("events")
+                .join(audit::audit_event_filename(original)),
+            &rewritten,
+        )
+        .unwrap();
+
+        let error = recovery_audit_log(Some(&vault)).unwrap_err();
+        assert!(error.to_string().contains("event hash mismatch"));
+    }
+
+    #[test]
+    fn authenticated_audit_rejects_deleted_events_and_reordered_chain_entries() {
+        for attack in ["delete", "reorder"] {
+            let temp = tempfile::tempdir().unwrap();
+            let vault = temp.path().join("vault");
+            init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+            let audit = recovery_audit_log(Some(&vault)).unwrap();
+            assert!(audit.events.len() >= 2);
+            if attack == "delete" {
+                let event = &audit.events[0];
+                fs::remove_file(
+                    vault
+                        .join("events")
+                        .join(audit::audit_event_filename(event)),
+                )
+                .unwrap();
+            } else {
+                let first = vault.join("audit-chain/00000000000000000001.json");
+                let second = vault.join("audit-chain/00000000000000000002.json");
+                let first_bytes = fs::read(&first).unwrap();
+                let second_bytes = fs::read(&second).unwrap();
+                fs::write(&first, second_bytes).unwrap();
+                fs::write(&second, first_bytes).unwrap();
+            }
+            assert!(recovery_audit_log(Some(&vault)).is_err());
+        }
+    }
+
+    #[test]
     fn immutable_audit_publication_never_replaces_an_existing_event() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("event.json");
@@ -3805,6 +3903,7 @@ mod tests {
         for vault in [&primary, &mirror] {
             fs::remove_file(vault.join("identity.json")).unwrap();
             fs::remove_file(vault.join("state.json")).unwrap();
+            fs::remove_dir_all(vault.join("audit-chain")).unwrap();
         }
         fs::remove_dir_all(temp.path().join(".hig-recovery-auth")).unwrap();
 
@@ -3853,6 +3952,7 @@ mod tests {
         capture_recovery_point(&source, "HEAD", Some(&vault)).unwrap();
         fs::remove_file(vault.join("identity.json")).unwrap();
         fs::remove_file(vault.join("state.json")).unwrap();
+        fs::remove_dir_all(vault.join("audit-chain")).unwrap();
         fs::remove_dir_all(temp.path().join(".hig-recovery-auth")).unwrap();
         let objects = vault_repository_root(&vault, initialized.repository_id)
             .unwrap()

@@ -82,7 +82,10 @@ pub struct RecoveryAuditReport {
 pub fn recovery_audit_log(requested_root: Option<&Path>) -> anyhow::Result<RecoveryAuditReport> {
     let root = resolve_vault_root(requested_root)?;
     load_vault_config(&root)?;
-    recovery_audit_log_from_root(&root)
+    super::audit_chain::recover(&root)?;
+    let report = recovery_audit_log_from_root(&root)?;
+    super::audit_chain::verify(&root, &audit_event_files(&root, &report.events)?)?;
+    Ok(report)
 }
 
 pub(super) fn recovery_audit_log_from_root(root: &Path) -> anyhow::Result<RecoveryAuditReport> {
@@ -165,6 +168,35 @@ pub(super) fn recovery_audit_log_from_root(root: &Path) -> anyhow::Result<Recove
         events,
         incomplete_operation_ids,
     })
+}
+
+pub(super) fn migrate_authenticated_chain(root: &Path) -> anyhow::Result<bool> {
+    super::audit_chain::recover(root)?;
+    let report = recovery_audit_log_from_root(root)?;
+    let ordered = report
+        .events
+        .iter()
+        .map(|event| {
+            let filename = audit_event_filename(event);
+            let bytes = super::audit_chain::read_event_bytes(&root.join("events").join(&filename))?;
+            Ok((filename, bytes))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    super::audit_chain::migrate_existing(root, &ordered)
+}
+
+fn audit_event_files(
+    root: &Path,
+    events: &[RecoveryAuditEvent],
+) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+    events
+        .iter()
+        .map(|event| {
+            let filename = audit_event_filename(event);
+            let bytes = super::audit_chain::read_event_bytes(&root.join("events").join(&filename))?;
+            Ok((filename, bytes))
+        })
+        .collect()
 }
 
 pub(super) struct RecoveryAuditTransaction<'a> {
@@ -300,7 +332,7 @@ fn audit_principal() -> Option<String> {
     None
 }
 
-fn audit_event_filename(event: &RecoveryAuditEvent) -> String {
+pub(super) fn audit_event_filename(event: &RecoveryAuditEvent) -> String {
     format!("{}.{}.json", event.operation_id, event.outcome.as_str())
 }
 
@@ -473,7 +505,17 @@ pub(super) fn atomic_write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> 
 
 fn write_checked_json_new<T: Serialize>(path: &Path, payload: &T) -> anyhow::Result<()> {
     let bytes = checked_json_bytes(payload)?;
-    atomic_write_new(path, &bytes)
+    let events_root = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("recovery audit event has no parent"))?;
+    let root = events_root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("recovery audit event has no Vault root"))?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("recovery audit filename is not UTF-8"))?;
+    super::audit_chain::append_event(root, filename, &bytes)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

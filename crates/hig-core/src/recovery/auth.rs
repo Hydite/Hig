@@ -104,6 +104,7 @@ struct RecoveryAuthBundle {
     key_id: String,
     key_hex: String,
     checkpoint: VaultStateSeal,
+    audit_head_hex: Option<String>,
     bundle_mac: String,
 }
 
@@ -116,6 +117,7 @@ struct UnsignedRecoveryAuthBundle<'a> {
     key_id: &'a str,
     key_hex: &'a str,
     checkpoint: &'a VaultStateSeal,
+    audit_head_hex: Option<&'a str>,
 }
 
 #[derive(Default)]
@@ -220,6 +222,44 @@ pub(super) fn load_identity(root: &Path) -> anyhow::Result<VaultIdentity> {
 
 pub(super) fn is_authenticated(root: &Path) -> bool {
     identity_path(root).exists()
+}
+
+pub(super) fn sign_current(
+    root: &Path,
+    domain: &[u8],
+    bytes: &[u8],
+) -> anyhow::Result<(VaultIdentity, String)> {
+    let identity = load_identity(root)?;
+    let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
+    Ok((identity, keyed_bytes_hash(&key, domain, bytes)))
+}
+
+pub(super) fn verify_keyed_signature(
+    root: &Path,
+    lineage_id: &str,
+    key_id: &str,
+    domain: &[u8],
+    bytes: &[u8],
+    signature: &str,
+) -> anyhow::Result<()> {
+    let key = load_key(root, lineage_id, key_id)?;
+    anyhow::ensure!(
+        keyed_bytes_hash(&key, domain, bytes) == signature,
+        "Recovery authenticated signature verification failed"
+    );
+    Ok(())
+}
+
+pub(super) fn external_audit_head_path(root: &Path, vault_id: &str) -> anyhow::Result<PathBuf> {
+    Ok(auth_root(root)?
+        .join("audit")
+        .join(format!("{vault_id}.head.json")))
+}
+
+pub(super) fn external_audit_pending_path(root: &Path, vault_id: &str) -> anyhow::Result<PathBuf> {
+    Ok(auth_root(root)?
+        .join("audit")
+        .join(format!("{vault_id}.pending.json")))
 }
 
 pub(super) fn require_primary(root: &Path) -> anyhow::Result<VaultIdentity> {
@@ -434,6 +474,8 @@ pub(super) fn export_custody_bundle(
         key_id: identity.key_id.clone(),
         key_hex: hex::encode(key),
         checkpoint,
+        audit_head_hex: read_optional_file(&external_audit_head_path(root, &identity.vault_id)?)?
+            .map(hex::encode),
         bundle_mac: String::new(),
     };
     bundle.bundle_mac = bundle_mac(&bundle, &key)?;
@@ -460,6 +502,22 @@ pub(super) fn import_custody_bundle(
         read_state(&state_path(root))? == bundle.checkpoint,
         "Recovery custody bundle checkpoint does not match local Vault state"
     );
+    let audit_head = bundle
+        .audit_head_hex
+        .as_deref()
+        .map(hex::decode)
+        .transpose()?;
+    let internal_audit_head = root.join("audit-chain").join("head.json");
+    match audit_head.as_deref() {
+        Some(bytes) => anyhow::ensure!(
+            read_bounded(&internal_audit_head)? == bytes,
+            "Recovery custody audit head does not match local Vault state"
+        ),
+        None => anyhow::ensure!(
+            !internal_audit_head.exists(),
+            "Recovery custody bundle is missing the local audit head"
+        ),
+    }
 
     let key_path = key_path(root, &bundle.lineage_id, &bundle.key_id)?;
     if key_path.exists() {
@@ -489,6 +547,9 @@ pub(super) fn import_custody_bundle(
         &external_path,
         &serde_json::to_vec_pretty(&bundle.checkpoint)?,
     )?;
+    if let Some(bytes) = audit_head {
+        atomic_write(&external_audit_head_path(root, &identity.vault_id)?, &bytes)?;
+    }
     Ok((identity, bundle.checkpoint.sequence))
 }
 
@@ -968,6 +1029,7 @@ fn bundle_mac(bundle: &RecoveryAuthBundle, key: &[u8; 32]) -> anyhow::Result<Str
             key_id: &bundle.key_id,
             key_hex: &bundle.key_hex,
             checkpoint: &bundle.checkpoint,
+            audit_head_hex: bundle.audit_head_hex.as_deref(),
         },
     )
 }
@@ -1002,6 +1064,13 @@ fn keyed_json_hash(
     let mut input = domain.to_vec();
     input.extend(serde_json::to_vec(value)?);
     Ok(blake3::keyed_hash(key, &input).to_hex().to_string())
+}
+
+fn keyed_bytes_hash(key: &[u8; 32], domain: &[u8], bytes: &[u8]) -> String {
+    let mut input = Vec::with_capacity(domain.len().saturating_add(bytes.len()));
+    input.extend_from_slice(domain);
+    input.extend_from_slice(bytes);
+    blake3::keyed_hash(key, &input).to_hex().to_string()
 }
 
 fn write_new_key(
@@ -1147,6 +1216,14 @@ fn read_state(path: &Path) -> anyhow::Result<VaultStateSeal> {
     Ok(serde_json::from_slice(&read_bounded(path)?)?)
 }
 
+fn read_optional_file(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    if path.exists() {
+        Ok(Some(read_bounded(path)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn read_bounded(path: &Path) -> anyhow::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -1204,8 +1281,8 @@ mod tests {
     use super::*;
     use crate::recovery::{
         RecoveryRetentionPolicy, capture_recovery_point, checked_json_bytes, init_recovery_vault,
-        load_catalog, load_vault_config, promote_recovery_vault, recovery_vault_config,
-        with_recovery_failpoint, write_checked_json,
+        load_catalog, load_vault_config, promote_recovery_vault, recovery_audit_log,
+        recovery_vault_config, with_recovery_failpoint, write_checked_json,
     };
     use crate::{init_repository, snapshot_repository};
 
@@ -1354,6 +1431,7 @@ mod tests {
         assert_eq!(imported_identity, exported_identity);
         assert_eq!(imported_sequence, exported_sequence);
         load_vault_config(&vault).unwrap();
+        recovery_audit_log(Some(&vault)).unwrap();
     }
 
     #[test]
