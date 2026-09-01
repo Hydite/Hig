@@ -3625,7 +3625,7 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
     );
     file.sync_all().context("failed to sync restored file")?;
     if let Some(extents) = &state.object.allocated_extents {
-        verify_restored_sparse_layout(&file, state.object.size, extents)
+        verify_restored_sparse_layout(path, state.object.size, extents)
             .context("restored sparse layout failed verification")?;
     }
     restore_ownership(path, state.object.ownership).context("failed to restore file ownership")?;
@@ -3754,11 +3754,12 @@ fn mark_file_sparse(_file: &File) -> anyhow::Result<()> {
 }
 
 fn verify_restored_sparse_layout(
-    file: &File,
+    path: &Path,
     size: u64,
     expected: &[FileExtent],
 ) -> anyhow::Result<()> {
-    let actual = allocated_file_extents(file, size)?
+    let file = File::open(path)?;
+    let actual = allocated_file_extents(&file, size)?
         .ok_or_else(|| anyhow::anyhow!("destination cannot verify sparse file layout"))?;
     for extent in actual {
         let actual_end = extent.offset + extent.len;
