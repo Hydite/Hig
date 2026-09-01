@@ -396,6 +396,21 @@ pub struct RecoveryRepairReport {
     pub verified: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryPromotionReport {
+    pub schema: u16,
+    pub vault_root: String,
+    pub generation_before: u64,
+    pub generation_after: u64,
+    pub changed: bool,
+    pub repositories: u64,
+    pub recovery_points: u64,
+    pub mirror_roots: Vec<String>,
+    pub objects_written: u64,
+    pub object_bytes_written: u64,
+    pub durability: RecoveryDurability,
+}
+
 pub fn default_recovery_vault_root() -> anyhow::Result<PathBuf> {
     if let Some(value) = std::env::var_os("HIG_RECOVERY_VAULT")
         && !value.is_empty()
@@ -1389,6 +1404,251 @@ pub fn repair_recovery_point(
             ))
         },
     )
+}
+
+pub fn promote_recovery_vault(
+    requested_root: Option<&Path>,
+    requested_mirrors: Vec<PathBuf>,
+) -> anyhow::Result<RecoveryPromotionReport> {
+    let root = resolve_vault_root(requested_root)?;
+    let mirrors = normalize_mirror_roots(&root, requested_mirrors)?;
+    let _lock = lock_vault(&root)?;
+    let config = load_vault_config(&root)?;
+    let mut catalog = load_catalog(&root)?;
+    anyhow::ensure!(
+        !catalog.repositories.is_empty(),
+        "cannot promote an empty Recovery Vault"
+    );
+    let recovery_points = catalog
+        .repositories
+        .values()
+        .map(|registration| registration.recovery_points.len() as u64)
+        .sum::<u64>();
+    anyhow::ensure!(
+        recovery_points > 0,
+        "cannot promote a Recovery Vault without recovery points"
+    );
+    anyhow::ensure!(
+        catalog
+            .repositories
+            .values()
+            .all(|registration| registration
+                .recovery_points
+                .values()
+                .all(|point| point.state == RecoveryPointState::Available)),
+        "cannot promote while a recovery point is pending deletion"
+    );
+    let local_scrub = scrub_vault_location(&root, true);
+    anyhow::ensure!(
+        local_scrub.healthy,
+        "cannot promote an unhealthy Recovery Vault: {}",
+        local_scrub.errors.join(" | ")
+    );
+
+    let generation_before = catalog.generation;
+    let details = BTreeMap::from([
+        ("scope".to_string(), "verified_mirror_failover".to_string()),
+        ("mirror_count".to_string(), mirrors.len().to_string()),
+    ]);
+    run_audited(
+        &root,
+        RecoveryAuditOperation::VaultPromote,
+        Some(generation_before),
+        None,
+        None,
+        details,
+        || {
+            let mut objects_written = 0_u64;
+            let mut object_bytes_written = 0_u64;
+            for mirror in &mirrors {
+                let (objects, bytes) =
+                    synchronize_promoted_mirror(&root, &config, &catalog, mirror)?;
+                objects_written = objects_written.saturating_add(objects);
+                object_bytes_written = object_bytes_written.saturating_add(bytes);
+            }
+            recovery_failpoint("promotion_after_mirror_replication")?;
+
+            let now = now_unix_ns();
+            let desired_replicas = mirrors
+                .iter()
+                .map(|mirror| RecoveryReplicaStatus {
+                    vault_root: mirror.display().to_string(),
+                    verified: true,
+                    error: None,
+                })
+                .collect::<Vec<_>>();
+            let durability = if mirrors.is_empty() {
+                RecoveryDurability::Captured
+            } else {
+                RecoveryDurability::Protected
+            };
+            let catalog_changed = catalog.repositories.values().any(|registration| {
+                registration.recovery_points.values().any(|point| {
+                    point.durability != durability || point.replicas != desired_replicas
+                })
+            });
+            let changed = config.mirror_roots != mirrors || catalog_changed;
+            if changed {
+                let promoted_config = RecoveryVaultConfig {
+                    schema: VAULT_SCHEMA,
+                    created_unix_ns: config.created_unix_ns,
+                    mirror_roots: mirrors.clone(),
+                    retention: config.retention.clone(),
+                    at_rest_policy: config.at_rest_policy,
+                };
+                // Publishing mirror policy first is conservative: an interruption
+                // cannot make an unreplicated point appear protected.
+                write_checked_json(&vault_config_path(&root), &promoted_config)?;
+                recovery_failpoint("promotion_after_config_publish")?;
+                for registration in catalog.repositories.values_mut() {
+                    for point in registration.recovery_points.values_mut() {
+                        point.replicas = desired_replicas.clone();
+                        point.durability = durability;
+                        point.last_verified_unix_ns = now;
+                    }
+                    registration.updated_unix_ns = now;
+                }
+                catalog.generation = catalog.generation.saturating_add(1);
+                save_catalog(&root, &catalog)?;
+                recovery_failpoint("promotion_after_catalog_publish")?;
+            }
+            Ok((
+                RecoveryPromotionReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
+                    vault_root: root.display().to_string(),
+                    generation_before,
+                    generation_after: catalog.generation,
+                    changed,
+                    repositories: catalog.repositories.len().try_into()?,
+                    recovery_points,
+                    mirror_roots: mirrors
+                        .iter()
+                        .map(|mirror| mirror.display().to_string())
+                        .collect(),
+                    objects_written,
+                    object_bytes_written,
+                    durability,
+                },
+                Some(catalog.generation),
+            ))
+        },
+    )
+}
+
+fn synchronize_promoted_mirror(
+    source_root: &Path,
+    source_config: &RecoveryVaultConfig,
+    source_catalog: &RecoveryCatalog,
+    mirror: &Path,
+) -> anyhow::Result<(u64, u64)> {
+    ensure_mirror_vault_with_audit(mirror)?;
+    let _lock = lock_vault(mirror)?;
+    let mut mirror_config = load_vault_config(mirror)?;
+    anyhow::ensure!(
+        mirror_config.mirror_roots.is_empty(),
+        "promotion target is already configured as a primary Recovery Vault"
+    );
+    let mut mirror_catalog = load_catalog(mirror)?;
+    for (key, source_registration) in &source_catalog.repositories {
+        if let Some(existing) = mirror_catalog.repositories.get(key) {
+            validate_promotion_registration(existing, source_registration)?;
+        }
+    }
+    let generation_before = mirror_catalog.generation;
+    let details = BTreeMap::from([
+        (
+            "scope".to_string(),
+            "promoted_vault_replication".to_string(),
+        ),
+        (
+            "source_vault".to_string(),
+            source_root.display().to_string(),
+        ),
+    ]);
+    run_audited(
+        mirror,
+        RecoveryAuditOperation::MirrorSynchronize,
+        Some(generation_before),
+        None,
+        None,
+        details,
+        || {
+            let now = now_unix_ns();
+            let mut objects_written = 0_u64;
+            let mut object_bytes_written = 0_u64;
+            for (key, source_registration) in &source_catalog.repositories {
+                for (point_id, point) in &source_registration.recovery_points {
+                    let replicated = replicate_repository_revision(
+                        &vault_repository_root(source_root, source_registration.repository_id),
+                        &point.ref_name,
+                        &vault_repository_root(mirror, source_registration.repository_id),
+                        point_id,
+                    )?;
+                    anyhow::ensure!(
+                        replicated.commit_id == point.commit_id
+                            && replicated.reachable_objects == point.reachable_objects,
+                        "promoted mirror recovery graph mismatch"
+                    );
+                    objects_written = objects_written.saturating_add(replicated.objects_written);
+                    object_bytes_written =
+                        object_bytes_written.saturating_add(replicated.object_bytes_written);
+                }
+                let mut mirrored = source_registration.clone();
+                for point in mirrored.recovery_points.values_mut() {
+                    point.durability = RecoveryDurability::Captured;
+                    point.replicas.clear();
+                    point.last_verified_unix_ns = now;
+                }
+                mirrored.updated_unix_ns = now;
+                mirror_catalog.repositories.insert(key.clone(), mirrored);
+            }
+            mirror_config.retention = source_config.retention.clone();
+            mirror_config.at_rest_policy = source_config.at_rest_policy;
+            write_checked_json(&vault_config_path(mirror), &mirror_config)?;
+            mirror_catalog.generation = mirror_catalog.generation.saturating_add(1);
+            save_catalog(mirror, &mirror_catalog)?;
+            Ok((
+                (objects_written, object_bytes_written),
+                Some(mirror_catalog.generation),
+            ))
+        },
+    )
+}
+
+fn validate_promotion_registration(
+    existing: &RecoveryRegistration,
+    source: &RecoveryRegistration,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        existing.registration_id == source.registration_id
+            && existing.repository_id == source.repository_id,
+        "promotion target registration identity conflicts with the source Vault"
+    );
+    anyhow::ensure!(
+        existing
+            .source_paths
+            .iter()
+            .all(|path| source.source_paths.contains(path)),
+        "promotion target contains divergent source-path history"
+    );
+    anyhow::ensure!(
+        existing
+            .recovery_points
+            .iter()
+            .all(|(point_id, point)| source
+                .recovery_points
+                .get(point_id)
+                .is_some_and(|source_point| source_point.commit_id == point.commit_id)),
+        "promotion target contains a divergent recovery point"
+    );
+    anyhow::ensure!(
+        existing
+            .tombstones
+            .iter()
+            .all(|tombstone| source.tombstones.contains(tombstone)),
+        "promotion target contains divergent deletion history"
+    );
+    Ok(())
 }
 
 fn scrub_vault_location(root: &Path, primary: bool) -> RecoveryScrubLocationReport {
@@ -2713,6 +2973,68 @@ mod tests {
         assert_eq!(
             fs::read_to_string(output.join("file.txt")).unwrap(),
             "durable"
+        );
+    }
+
+    #[test]
+    fn verified_mirror_promotes_after_source_and_primary_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let primary = temp.path().join("primary");
+        let survivor = temp.path().join("survivor");
+        let replacement = temp.path().join("replacement");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("critical.bin"), b"exact-after-total-loss\0\xff").unwrap();
+        let initialized = init_repository(&source, Vec::new()).unwrap();
+        snapshot_repository(&source, "protected baseline".into(), None).unwrap();
+        init_recovery_vault(Some(&primary), vec![survivor.clone()]).unwrap();
+        let captured = capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
+        assert_eq!(
+            captured.recovery_point.durability,
+            RecoveryDurability::Protected
+        );
+
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&primary).unwrap();
+        let promoted = promote_recovery_vault(Some(&survivor), vec![replacement.clone()]).unwrap();
+        assert_eq!(promoted.schema, RECOVERY_REPORT_SCHEMA);
+        assert!(promoted.changed);
+        assert_eq!(promoted.repositories, 1);
+        assert_eq!(promoted.recovery_points, 1);
+        assert!(promoted.objects_written > 0);
+        assert_eq!(promoted.durability, RecoveryDurability::Protected);
+        assert!(scrub_recovery_vault(Some(&survivor)).unwrap().healthy);
+
+        let retried = promote_recovery_vault(Some(&survivor), vec![replacement.clone()]).unwrap();
+        assert!(!retried.changed);
+        assert_eq!(retried.generation_before, retried.generation_after);
+        assert_eq!(retried.objects_written, 0);
+        let status = recovery_vault_status(Some(&survivor)).unwrap();
+        assert_eq!(status.configured_mirrors, 1);
+        assert_eq!(status.protected_points, 1);
+        assert_eq!(status.durability_lag_points, 0);
+        let audit = recovery_audit_log(Some(&survivor)).unwrap();
+        assert!(
+            audit
+                .events
+                .iter()
+                .any(|event| event.operation == RecoveryAuditOperation::VaultPromote)
+        );
+
+        fs::remove_dir_all(&survivor).unwrap();
+        let output = temp.path().join("restored-from-promoted-mirror");
+        restore_recovery_point(
+            Some(&replacement),
+            &hex::encode(initialized.repository_id),
+            &captured.recovery_point.recovery_point_id,
+            &output,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(output.join("critical.bin")).unwrap(),
+            b"exact-after-total-loss\0\xff"
         );
     }
 

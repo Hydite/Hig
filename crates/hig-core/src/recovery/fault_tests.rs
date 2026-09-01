@@ -200,6 +200,61 @@ fn mirror_capture_fault_is_reported_as_degraded_and_retry_recovers_protection() 
 }
 
 #[test]
+fn promotion_faults_never_publish_unreplicated_protection_and_are_retryable() {
+    for failpoint in [
+        "promotion_after_mirror_replication",
+        "promotion_after_config_publish",
+        "promotion_after_catalog_publish",
+    ] {
+        let (temp, source, primary, survivor, repository_id) = recovery_source_fixture(true);
+        let survivor = survivor.unwrap();
+        let replacement = temp.path().join("replacement");
+        let captured = capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&primary).unwrap();
+
+        let error = with_recovery_failpoint(failpoint, || {
+            promote_recovery_vault(Some(&survivor), vec![replacement.clone()]).unwrap_err()
+        });
+        assert!(error.to_string().contains(failpoint));
+        assert_failed_audit(&survivor, RecoveryAuditOperation::VaultPromote, failpoint);
+        verify_recovery_point(
+            Some(&replacement),
+            &repository_id,
+            &captured.recovery_point.recovery_point_id,
+        )
+        .unwrap();
+
+        let interrupted = recovery_vault_status(Some(&survivor)).unwrap();
+        if failpoint == "promotion_after_mirror_replication" {
+            assert_eq!(interrupted.configured_mirrors, 0);
+            assert_eq!(interrupted.captured_points, 1);
+        } else if failpoint == "promotion_after_config_publish" {
+            assert_eq!(interrupted.configured_mirrors, 1);
+            assert_eq!(interrupted.captured_points, 1);
+        } else {
+            assert_eq!(interrupted.configured_mirrors, 1);
+            assert_eq!(interrupted.protected_points, 1);
+        }
+
+        let retried = promote_recovery_vault(Some(&survivor), vec![replacement.clone()]).unwrap();
+        assert_eq!(retried.objects_written, 0);
+        let final_status = recovery_vault_status(Some(&survivor)).unwrap();
+        assert_eq!(final_status.protected_points, 1);
+        assert_eq!(final_status.durability_lag_points, 0);
+        assert!(scrub_recovery_vault(Some(&survivor)).unwrap().healthy);
+
+        fs::remove_dir_all(&survivor).unwrap();
+        assert_exact_fault_fixture_restore(
+            &replacement,
+            &repository_id,
+            &captured.recovery_point.recovery_point_id,
+            &temp.path().join("promoted-restore"),
+        );
+    }
+}
+
+#[test]
 fn restore_faults_preserve_atomic_publication_and_exact_retry() {
     for failpoint in [
         "restore_after_prepared",

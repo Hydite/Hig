@@ -16,6 +16,7 @@ const MAX_AUDIT_EVENTS: usize = 1_000_000;
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryAuditOperation {
     VaultInitialize,
+    VaultPromote,
     RetentionUpdate,
     RepositoryRegister,
     Capture,

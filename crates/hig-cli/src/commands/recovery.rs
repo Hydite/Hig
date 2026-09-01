@@ -1,9 +1,9 @@
 use crate::cli::{RecoveryCommand, RecoveryPolicyCommand, RecoveryTombstoneKindArg};
 use hig_core::{
     RecoveryTombstoneKind, capture_recovery_point, gc_recovery_vault, init_recovery_vault,
-    list_recovery_vault, record_recovery_tombstone, recovery_audit_log, recovery_vault_config,
-    recovery_vault_status, register_recovery_repository, repair_recovery_point,
-    restore_recovery_point, scrub_recovery_vault, set_recovery_point_pin,
+    list_recovery_vault, promote_recovery_vault, record_recovery_tombstone, recovery_audit_log,
+    recovery_vault_config, recovery_vault_status, register_recovery_repository,
+    repair_recovery_point, restore_recovery_point, scrub_recovery_vault, set_recovery_point_pin,
     update_recovery_retention, verify_recovery_point,
 };
 
@@ -115,6 +115,30 @@ pub(crate) fn handle(command: RecoveryCommand) -> anyhow::Result<()> {
                         .unwrap_or_else(|| "none".to_string()),
                     report.configured_mirrors,
                     report.incomplete_audit_operations
+                );
+            }
+        }
+        RecoveryCommand::Promote {
+            vault_root,
+            mirrors,
+            json,
+        } => {
+            let report = promote_recovery_vault(vault_root.as_deref(), mirrors)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "recovery: promoted vault={} generation={}->{} changed={} repositories={} points={} mirrors={} written={} bytes={} durability={:?}",
+                    report.vault_root,
+                    report.generation_before,
+                    report.generation_after,
+                    report.changed,
+                    report.repositories,
+                    report.recovery_points,
+                    report.mirror_roots.len(),
+                    report.objects_written,
+                    report.object_bytes_written,
+                    report.durability
                 );
             }
         }

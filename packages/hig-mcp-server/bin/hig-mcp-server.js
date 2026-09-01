@@ -497,6 +497,14 @@ const tools = [
     })
   },
   {
+    name: "hig_recovery_promote",
+    description: "Promote a verified surviving Recovery Vault after primary loss and optionally replicate every recovery point to new independent mirrors.",
+    inputSchema: objectSchema({
+      vaultRoot: pathProp("Verified surviving Recovery Vault root."),
+      mirrors: { type: "array", items: { type: "string" }, description: "New independent mirror roots." }
+    })
+  },
+  {
     name: "hig_recovery_audit",
     description: "Read and validate the Recovery Vault audit journal, including interrupted operations.",
     inputSchema: objectSchema({
@@ -861,6 +869,13 @@ async function callTool(name, args) {
       return runHig(["recovery", "list", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_status":
       return runHig(["recovery", "status", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_promote":
+      return runHig([
+        "recovery", "promote",
+        ...recoveryVaultArgs(args, false),
+        ...repeatPathOption("--mirror", args.mirrors, true),
+        "--json"
+      ], { parseJson: true });
     case "hig_recovery_audit":
       return runHig(["recovery", "audit", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_pin":

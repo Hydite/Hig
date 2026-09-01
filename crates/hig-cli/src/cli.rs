@@ -481,6 +481,14 @@ pub(crate) enum RecoveryCommand {
         #[arg(long)]
         json: bool,
     },
+    Promote {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long = "mirror")]
+        mirrors: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     Audit {
         #[arg(long)]
         vault_root: Option<PathBuf>,
@@ -876,6 +884,29 @@ mod tests {
                     json: true,
                 }
             } if root == Path::new("vault")
+        ));
+
+        let promote = Cli::try_parse_from([
+            "hig",
+            "recovery",
+            "promote",
+            "--vault-root",
+            "survivor",
+            "--mirror",
+            "replacement",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            promote.command,
+            Command::Recovery {
+                command: RecoveryCommand::Promote {
+                    vault_root: Some(root),
+                    mirrors,
+                    json: true,
+                }
+            } if root == Path::new("survivor")
+                && mirrors == vec![PathBuf::from("replacement")]
         ));
 
         let audit = Cli::try_parse_from([
