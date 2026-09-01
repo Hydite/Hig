@@ -48,7 +48,7 @@ Formal v1.8.2 compare summary:
 | CLI-wall gate | pass |
 | size-quality gate | pass |
 
-The formal benchmark markdown is `artifacts/hig-v1.8.2-benchmark.md`.
+The formal benchmark markdown is `artifacts/docs/hig-v1.8.2-benchmark.md`.
 
 ## Corpus Results
 

@@ -13,7 +13,7 @@
 ### Task 1: Establish Linux build baseline
 
 **Files:**
-- Create: `artifacts/hig-v1.10.0-linux-x86_64-gnu-release-qa.md`
+- Create: `artifacts/docs/hig-v1.10.0-linux-x86_64-gnu-release-qa.md`
 
 **Step 1:** Inspect the build host architecture, OS, libc, disk capacity, Node, Rust, compiler, and linker.
 
@@ -50,7 +50,7 @@
 ### Task 4: Validate the distributable package
 
 **Files:**
-- Create: `artifacts/hig-v1.10.0-linux-x86_64-gnu-release-qa.md`
+- Create: `artifacts/docs/hig-v1.10.0-linux-x86_64-gnu-release-qa.md`
 
 **Step 1:** Extract the tarball into an empty directory on the Linux host.
 

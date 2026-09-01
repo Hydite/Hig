@@ -63,7 +63,7 @@ The packages and checksum manifests in `artifacts/` are the retained outputs
 of the same successful native CI run.
 
 The current enterprise-volume cold-path evidence is recorded in
-`artifacts/hig-v1.10.0-post-migration-cold-benchmark.md`. It reports stage
+`artifacts/docs/hig-v1.10.0-post-migration-cold-benchmark.md`. It reports stage
 timings and exact restore checks without making a cross-version speed claim.
 
 ## Known Scope

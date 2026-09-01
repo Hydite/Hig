@@ -63,8 +63,8 @@ claim of completion is prohibited while any checkbox is open.
 - Architecture and failure contract: `docs/adr/0007-recovery-vault.md`
 - Schema and migration contract: `docs/compatibility/recovery-vault-schema.md`
 - Source-absent operator drill: `docs/operations/recovery-vault-runbook.md`
-- Security review: `artifacts/hig-v1.10.0-recovery-vault-security-review-cc05763f.md`
-- Qualified 1 GiB benchmark: `artifacts/hig-v1.10.0-recovery-vault-qualified-cc05763f.md`
-- Native two-hour soak: `artifacts/hig-v1.10.0-recovery-vault-soak-cc05763f.md`
+- Security review: `artifacts/docs/hig-v1.10.0-recovery-vault-security-review-cc05763f.md`
+- Qualified 1 GiB benchmark: `artifacts/docs/hig-v1.10.0-recovery-vault-qualified-cc05763f.md`
+- Native two-hour soak: `artifacts/docs/hig-v1.10.0-recovery-vault-soak-cc05763f.md`
 - Complete Quality Gates: <https://github.com/Hydite/Hig/actions/runs/33498059314>
 - Extended CodeQL: <https://github.com/Hydite/Hig/actions/runs/33498060294>

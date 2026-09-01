@@ -33,7 +33,7 @@ excluded from this release.
 | Linux package SHA-256 | `artifacts/hig-v1.10.0-ide-mcp-linux-x86_64-gnu.tar.gz.sha256` |
 | Windows x86_64 MSVC CLI/MCP | `artifacts/hig-v1.10.0-ide-mcp-windows-x86_64-msvc.tar.gz` |
 | Windows package SHA-256 | `artifacts/hig-v1.10.0-ide-mcp-windows-x86_64-msvc.tar.gz.sha256` |
-| Linux release QA | `artifacts/hig-v1.10.0-linux-x86_64-gnu-release-qa.md` |
+| Linux release QA | `artifacts/docs/hig-v1.10.0-linux-x86_64-gnu-release-qa.md` |
 
 The macOS app is signed with the locally available Apple Development identity. It is **not notarized** because Developer ID notarization credentials are not configured for this build.
 

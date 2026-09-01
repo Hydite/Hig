@@ -110,4 +110,4 @@ Unit coverage includes false-start suppression, sustained degradation,
 same-direction recovery, stage-baseline isolation, high-throughput relative
 slowdown protection, cooldown behavior, dynamic permit blocking, exact scan
 bytes, and exact archive-write bytes. Real-project evidence is recorded in
-`artifacts/hig-v1.9.7-adaptive-io-benchmark.md`.
+`artifacts/docs/hig-v1.9.7-adaptive-io-benchmark.md`.

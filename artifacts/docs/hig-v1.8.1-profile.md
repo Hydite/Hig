@@ -48,7 +48,7 @@ Result:
 - Hig is about 20.1% smaller than zip on this source dataset.
 - Hig median is about 21x faster than zip in isolated warm daemon sampling.
 
-Formal `bench --compare` output is in `artifacts/hig-v1.8.1-benchmark.md`. The latest formal run marked the selected `/tmp` volume as `ENVIRONMENT_NOT_QUALIFIED` because native 256MiB copy baseline was below the qualification threshold, so those absolute timing rows should not be used as the release gate.
+Formal `bench --compare` output is in `artifacts/docs/hig-v1.8.1-benchmark.md`. The latest formal run marked the selected `/tmp` volume as `ENVIRONMENT_NOT_QUALIFIED` because native 256MiB copy baseline was below the qualification threshold, so those absolute timing rows should not be used as the release gate.
 
 ## 500 Small Files
 

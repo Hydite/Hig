@@ -936,7 +936,7 @@ pub(crate) fn run_compare(options: CompareOptions) -> anyhow::Result<()> {
         cache_status.as_ref(),
     );
     let markdown = render_markdown(&input_dir, &rows, &probe, &acceptance, &summary);
-    fs::create_dir_all("artifacts")?;
+    fs::create_dir_all("artifacts/docs")?;
     let (benchmark_path, summary_path, profile_path) = artifact_paths(options.bench_suite);
     fs::write(&benchmark_path, markdown)?;
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
@@ -1085,15 +1085,15 @@ fn build_benchmark_summary(
 fn artifact_paths(suite: BenchSuite) -> (PathBuf, PathBuf, PathBuf) {
     if suite == BenchSuite::Lobehub {
         (
-            PathBuf::from("artifacts/hig-v1.9.7-lobehub-benchmark.md"),
+            PathBuf::from("artifacts/docs/hig-v1.9.7-lobehub-benchmark.md"),
             PathBuf::from("artifacts/hig-v1.9.7-lobehub-summary.json"),
-            PathBuf::from("artifacts/hig-v1.9.7-lobehub-profile.md"),
+            PathBuf::from("artifacts/docs/hig-v1.9.7-lobehub-profile.md"),
         )
     } else {
         (
-            PathBuf::from("artifacts/hig-v1.9.7-benchmark.md"),
+            PathBuf::from("artifacts/docs/hig-v1.9.7-benchmark.md"),
             PathBuf::from("artifacts/hig-v1.9.7-summary.json"),
-            PathBuf::from("artifacts/hig-v1.9.7-profile.md"),
+            PathBuf::from("artifacts/docs/hig-v1.9.7-profile.md"),
         )
     }
 }
@@ -2333,18 +2333,24 @@ fn run_lobehub_watch_compare(
         "burst_gate": burst_gate,
         "quality_gate": quality_gate
     });
-    fs::create_dir_all("artifacts")?;
+    fs::create_dir_all("artifacts/docs")?;
     fs::write(
         "artifacts/hig-v1.9.7-lobehub-watch-summary.json",
         serde_json::to_vec_pretty(&summary)?,
     )?;
     let markdown = render_lobehub_watch_markdown(&summary);
-    fs::write("artifacts/hig-v1.9.7-lobehub-watch-benchmark.md", &markdown)?;
-    fs::write("artifacts/hig-v1.9.7-lobehub-watch-profile.md", markdown)?;
+    fs::write(
+        "artifacts/docs/hig-v1.9.7-lobehub-watch-benchmark.md",
+        &markdown,
+    )?;
+    fs::write(
+        "artifacts/docs/hig-v1.9.7-lobehub-watch-profile.md",
+        markdown,
+    )?;
     if options.report_mode == ReportMode::Json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
-        println!("benchmark: wrote artifacts/hig-v1.9.7-lobehub-watch-benchmark.md");
+        println!("benchmark: wrote artifacts/docs/hig-v1.9.7-lobehub-watch-benchmark.md");
     }
     Ok(())
 }
@@ -3870,6 +3876,23 @@ fn command_exists(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benchmark_artifacts_separate_documents_from_machine_reports() {
+        let (benchmark, summary, profile) = artifact_paths(BenchSuite::Lobehub);
+        assert_eq!(
+            benchmark,
+            PathBuf::from("artifacts/docs/hig-v1.9.7-lobehub-benchmark.md")
+        );
+        assert_eq!(
+            summary,
+            PathBuf::from("artifacts/hig-v1.9.7-lobehub-summary.json")
+        );
+        assert_eq!(
+            profile,
+            PathBuf::from("artifacts/docs/hig-v1.9.7-lobehub-profile.md")
+        );
+    }
 
     #[test]
     fn warm_project_sample_serializes_key_telemetry() {

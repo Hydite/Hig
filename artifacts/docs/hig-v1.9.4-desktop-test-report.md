@@ -59,6 +59,6 @@ The app bundle was signed with the locally available Apple Development identity 
 - `artifacts/hig-v1.9.4-desktop-macos-universal.dmg`
 - `artifacts/hig-v1.9.4-desktop-macos-universal.dmg.sha256`
 - `artifacts/hig-v1.9.4-ui-screenshots/`
-- `artifacts/hig-v1.9.4-desktop-test-report.md`
+- `artifacts/docs/hig-v1.9.4-desktop-test-report.md`
 - `artifacts/hig-v1.9.4-source.tar.gz`
 - `artifacts/hig-v1.9.4-source.tar.gz.sha256`
