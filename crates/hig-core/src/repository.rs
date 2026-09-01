@@ -5931,11 +5931,16 @@ mod windows_access_control {
     }
 
     fn decode_sddl(wide: &[u16]) -> anyhow::Result<String> {
-        let (terminator, body) = wide
-            .split_last()
-            .ok_or_else(|| anyhow::anyhow!("Windows SDDL text is empty"))?;
-        anyhow::ensure!(*terminator == 0, "Windows SDDL text is not terminated");
-        anyhow::ensure!(!body.contains(&0), "Windows SDDL contains internal NUL");
+        let terminator = wide
+            .iter()
+            .position(|character| *character == 0)
+            .ok_or_else(|| anyhow::anyhow!("Windows SDDL text is not terminated"))?;
+        let (body, padding) = wide.split_at(terminator);
+        anyhow::ensure!(!body.is_empty(), "Windows SDDL text is empty");
+        anyhow::ensure!(
+            padding.iter().all(|character| *character == 0),
+            "Windows SDDL contains data after its terminator"
+        );
         Ok(String::from_utf16(body)?)
     }
 
@@ -6050,11 +6055,11 @@ mod windows_access_control {
         fn sddl_decoder_removes_only_the_required_terminator() {
             let encoded = "O:SYG:SYD:(A;;FA;;;SY)"
                 .encode_utf16()
-                .chain(Some(0))
+                .chain([0, 0])
                 .collect::<Vec<_>>();
             assert_eq!(decode_sddl(&encoded).unwrap(), "O:SYG:SYD:(A;;FA;;;SY)");
-            assert!(decode_sddl(&encoded[..encoded.len() - 1]).is_err());
-            assert!(decode_sddl(&[b'O' as u16, 0, b':' as u16, 0]).is_err());
+            assert!(decode_sddl(&encoded[..encoded.len() - 2]).is_err());
+            assert!(decode_sddl(&[b'O' as u16, 0, b':' as u16]).is_err());
         }
     }
 }
