@@ -281,6 +281,27 @@ pub struct RecoveryVaultListReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryVaultStatusReport {
+    pub schema: u16,
+    pub vault_root: String,
+    pub generation: u64,
+    pub created_unix_ns: i128,
+    pub at_rest_policy: RecoveryAtRestPolicy,
+    pub configured_mirrors: u64,
+    pub repositories: u64,
+    pub recovery_points: u64,
+    pub available_points: u64,
+    pub pending_deletion_points: u64,
+    pub captured_points: u64,
+    pub protected_points: u64,
+    pub degraded_points: u64,
+    pub durability_lag_points: u64,
+    pub latest_capture_unix_ns: Option<i128>,
+    pub rpo_lag_millis: Option<u64>,
+    pub incomplete_audit_operations: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryVerifyReport {
     pub schema: u16,
     pub vault_root: String,
@@ -732,6 +753,68 @@ pub fn list_recovery_vault(
         vault_root: root.display().to_string(),
         generation: catalog.generation,
         repositories: catalog.repositories.into_values().collect(),
+    })
+}
+
+pub fn recovery_vault_status(
+    requested_root: Option<&Path>,
+) -> anyhow::Result<RecoveryVaultStatusReport> {
+    let root = resolve_vault_root(requested_root)?;
+    let config = load_vault_config(&root)?;
+    let catalog = load_catalog(&root)?;
+    let audit = recovery_audit_log(Some(&root))?;
+    let mut recovery_points = 0_u64;
+    let mut available_points = 0_u64;
+    let mut pending_deletion_points = 0_u64;
+    let mut captured_points = 0_u64;
+    let mut protected_points = 0_u64;
+    let mut degraded_points = 0_u64;
+    let mut latest_capture_unix_ns = None::<i128>;
+    for point in catalog
+        .repositories
+        .values()
+        .flat_map(|registration| registration.recovery_points.values())
+    {
+        recovery_points = recovery_points.saturating_add(1);
+        match point.state {
+            RecoveryPointState::Available => available_points = available_points.saturating_add(1),
+            RecoveryPointState::PendingDeletion => {
+                pending_deletion_points = pending_deletion_points.saturating_add(1)
+            }
+        }
+        match point.durability {
+            RecoveryDurability::Captured => captured_points = captured_points.saturating_add(1),
+            RecoveryDurability::Protected => protected_points = protected_points.saturating_add(1),
+            RecoveryDurability::Degraded => degraded_points = degraded_points.saturating_add(1),
+        }
+        latest_capture_unix_ns = Some(
+            latest_capture_unix_ns.map_or(point.captured_unix_ns, |latest| {
+                latest.max(point.captured_unix_ns)
+            }),
+        );
+    }
+    let rpo_lag_millis = latest_capture_unix_ns.map(|captured| {
+        let elapsed = now_unix_ns().saturating_sub(captured).max(0) / 1_000_000;
+        u64::try_from(elapsed).unwrap_or(u64::MAX)
+    });
+    Ok(RecoveryVaultStatusReport {
+        schema: RECOVERY_REPORT_SCHEMA,
+        vault_root: root.display().to_string(),
+        generation: catalog.generation,
+        created_unix_ns: config.created_unix_ns,
+        at_rest_policy: config.at_rest_policy,
+        configured_mirrors: config.mirror_roots.len().try_into()?,
+        repositories: catalog.repositories.len().try_into()?,
+        recovery_points,
+        available_points,
+        pending_deletion_points,
+        captured_points,
+        protected_points,
+        degraded_points,
+        durability_lag_points: captured_points.saturating_add(degraded_points),
+        latest_capture_unix_ns,
+        rpo_lag_millis,
+        incomplete_audit_operations: audit.incomplete_operation_ids.len().try_into()?,
     })
 }
 
@@ -2560,6 +2643,16 @@ mod tests {
         let capture = capture_recovery_point(&source, "HEAD", Some(&vault)).unwrap();
         let repository_id = hex::encode(initialized.repository_id);
         fs::remove_dir_all(&source).unwrap();
+
+        let status = recovery_vault_status(Some(&vault)).unwrap();
+        assert_eq!(status.schema, RECOVERY_REPORT_SCHEMA);
+        assert_eq!(status.repositories, 1);
+        assert_eq!(status.recovery_points, 1);
+        assert_eq!(status.available_points, 1);
+        assert_eq!(status.captured_points, 1);
+        assert_eq!(status.durability_lag_points, 1);
+        assert!(status.rpo_lag_millis.is_some());
+        assert_eq!(status.incomplete_audit_operations, 0);
 
         let verified = verify_recovery_point(
             Some(&vault),

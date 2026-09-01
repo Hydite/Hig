@@ -133,7 +133,7 @@ const requiredTools = [
   "hig_repo_storage_tree", "hig_repo_symbols", "hig_repo_symbol_history",
   "hig_repo_restore_symbol", "hig_repo_verify", "hig_repo_gc",
   "hig_recovery_init", "hig_recovery_register", "hig_recovery_capture",
-  "hig_recovery_list", "hig_recovery_audit", "hig_recovery_pin", "hig_recovery_unpin",
+  "hig_recovery_list", "hig_recovery_status", "hig_recovery_audit", "hig_recovery_pin", "hig_recovery_unpin",
   "hig_recovery_tombstone", "hig_recovery_policy_show", "hig_recovery_policy_set",
   "hig_recovery_gc", "hig_recovery_scrub", "hig_recovery_repair",
   "hig_recovery_verify", "hig_recovery_restore", "hig_bench"
@@ -221,6 +221,9 @@ try {
   assert.equal(watchStatus.data.last_snapshot.created, true);
   assert.equal(watchStatus.data.last_snapshot.recovery.schema, 1);
   assert.equal(watchStatus.data.last_snapshot.recovery.recovery_point.durability, "captured");
+  assert.equal(watchStatus.data.recovery_durability, "captured");
+  assert.equal(watchStatus.data.recovery_durability_lag, true);
+  assert(Number.isInteger(watchStatus.data.recovery_rpo_lag_ms));
   const watchStopped = await tool("hig_repo_watch_stop", { dir: workspace });
   assert.equal(watchStopped.data.active, false);
   await tool("hig_repo_verify", { dir: workspace });
@@ -284,6 +287,11 @@ try {
   const recoveryList = await tool("hig_recovery_list", { vaultRoot: recoveryVault });
   assert.equal(recoveryList.data.schema, 1);
   assert.equal(recoveryList.data.repositories.length, 1);
+  const recoveryStatus = await tool("hig_recovery_status", { vaultRoot: recoveryVault });
+  assert.equal(recoveryStatus.data.schema, 1);
+  assert.equal(recoveryStatus.data.repositories, 1);
+  assert(recoveryStatus.data.recovery_points >= 1);
+  assert(recoveryStatus.data.rpo_lag_millis >= 0);
   const recoveryAudit = await tool("hig_recovery_audit", { vaultRoot: recoveryVault });
   assert.equal(recoveryAudit.data.schema, 1);
   assert.equal(recoveryAudit.data.incomplete_operation_ids.length, 0);

@@ -475,6 +475,12 @@ pub(crate) enum RecoveryCommand {
         #[arg(long)]
         json: bool,
     },
+    Status {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     Audit {
         #[arg(long)]
         vault_root: Option<PathBuf>,
@@ -853,6 +859,25 @@ mod tests {
 
     #[test]
     fn recovery_scrub_and_repair_parse_in_the_recovery_namespace() {
+        let status = Cli::try_parse_from([
+            "hig",
+            "recovery",
+            "status",
+            "--vault-root",
+            "vault",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            status.command,
+            Command::Recovery {
+                command: RecoveryCommand::Status {
+                    vault_root: Some(root),
+                    json: true,
+                }
+            } if root == Path::new("vault")
+        ));
+
         let audit = Cli::try_parse_from([
             "hig",
             "recovery",

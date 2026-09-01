@@ -2,8 +2,9 @@ use crate::cli::{RecoveryCommand, RecoveryPolicyCommand, RecoveryTombstoneKindAr
 use hig_core::{
     RecoveryTombstoneKind, capture_recovery_point, gc_recovery_vault, init_recovery_vault,
     list_recovery_vault, record_recovery_tombstone, recovery_audit_log, recovery_vault_config,
-    register_recovery_repository, repair_recovery_point, restore_recovery_point,
-    scrub_recovery_vault, set_recovery_point_pin, update_recovery_retention, verify_recovery_point,
+    recovery_vault_status, register_recovery_repository, repair_recovery_point,
+    restore_recovery_point, scrub_recovery_vault, set_recovery_point_pin,
+    update_recovery_retention, verify_recovery_point,
 };
 
 pub(crate) fn handle(command: RecoveryCommand) -> anyhow::Result<()> {
@@ -89,6 +90,32 @@ pub(crate) fn handle(command: RecoveryCommand) -> anyhow::Result<()> {
                         registration.source_paths.join(",")
                     );
                 }
+            }
+        }
+        RecoveryCommand::Status { vault_root, json } => {
+            let report = recovery_vault_status(vault_root.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "recovery: status vault={} generation={} repositories={} points={} available={} pending={} captured={} protected={} degraded={} durability_lag={} rpo_lag_ms={} mirrors={} incomplete_audit={}",
+                    report.vault_root,
+                    report.generation,
+                    report.repositories,
+                    report.recovery_points,
+                    report.available_points,
+                    report.pending_deletion_points,
+                    report.captured_points,
+                    report.protected_points,
+                    report.degraded_points,
+                    report.durability_lag_points,
+                    report
+                        .rpo_lag_millis
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    report.configured_mirrors,
+                    report.incomplete_audit_operations
+                );
             }
         }
         RecoveryCommand::Audit { vault_root, json } => {

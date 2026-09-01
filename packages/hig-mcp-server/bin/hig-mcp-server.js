@@ -490,6 +490,13 @@ const tools = [
     })
   },
   {
+    name: "hig_recovery_status",
+    description: "Report Recovery Vault generation, RPO lag, durability lag, mirror count, and incomplete audit operations without a full object scrub.",
+    inputSchema: objectSchema({
+      vaultRoot: pathProp("Existing Recovery Vault root.")
+    })
+  },
+  {
     name: "hig_recovery_audit",
     description: "Read and validate the Recovery Vault audit journal, including interrupted operations.",
     inputSchema: objectSchema({
@@ -852,6 +859,8 @@ async function callTool(name, args) {
       return runHig(["recovery", "capture", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_list":
       return runHig(["recovery", "list", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_status":
+      return runHig(["recovery", "status", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_audit":
       return runHig(["recovery", "audit", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_pin":
@@ -1121,6 +1130,8 @@ async function startRepositoryWatcher(args) {
     recoveryVault,
     snapshots: 0,
     lastSnapshot: null,
+    lastRecoveryAt: null,
+    lastRecoveryDurability: null,
     stdout: Buffer.alloc(0),
     stdoutLine: "",
     stderr: Buffer.alloc(0),
@@ -1157,6 +1168,10 @@ function consumeWatcherOutput(watcher, chunk) {
     try {
       watcher.lastSnapshot = JSON.parse(line);
       watcher.snapshots += 1;
+      if (watcher.lastSnapshot?.recovery) {
+        watcher.lastRecoveryAt = new Date().toISOString();
+        watcher.lastRecoveryDurability = watcher.lastSnapshot.recovery.recovery_point?.durability || null;
+      }
     } catch {
       watcher.stderr = appendBounded(
         watcher.stderr,
@@ -1186,6 +1201,9 @@ async function stopRepositoryWatcher(root) {
 }
 
 function watcherResult(watcher, overrides = {}) {
+  const recoveryRpoLagMs = watcher.recoveryVault
+    ? Math.max(0, Date.now() - Date.parse(watcher.lastRecoveryAt || watcher.startedAt))
+    : null;
   return {
     code: overrides.code ?? 0,
     signal: watcher.signal,
@@ -1201,6 +1219,12 @@ function watcherResult(watcher, overrides = {}) {
       message: watcher.message,
       author: watcher.author,
       recovery_vault: watcher.recoveryVault,
+      recovery_last_success_at: watcher.lastRecoveryAt,
+      recovery_rpo_lag_ms: recoveryRpoLagMs,
+      recovery_durability: watcher.lastRecoveryDurability,
+      recovery_durability_lag: watcher.recoveryVault
+        ? watcher.lastRecoveryDurability !== "protected"
+        : null,
       snapshots: watcher.snapshots,
       last_snapshot: watcher.lastSnapshot,
       exit_code: watcher.exitCode,

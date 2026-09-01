@@ -49,11 +49,11 @@ pub use recovery::{
     RecoveryRestoreReport, RecoveryRetentionPolicy, RecoveryScrubLocationReport,
     RecoveryScrubReport, RecoveryTombstone, RecoveryTombstoneKind, RecoveryTombstoneReport,
     RecoveryVaultConfig, RecoveryVaultGcReport, RecoveryVaultInitReport, RecoveryVaultListReport,
-    RecoveryVerifyReport, capture_recovery_point, default_recovery_vault_root, gc_recovery_vault,
-    init_recovery_vault, list_recovery_vault, record_recovery_tombstone, recovery_audit_log,
-    recovery_vault_config, register_recovery_repository, repair_recovery_point,
-    restore_recovery_point, scrub_recovery_vault, set_recovery_point_pin,
-    update_recovery_retention, verify_recovery_point,
+    RecoveryVaultStatusReport, RecoveryVerifyReport, capture_recovery_point,
+    default_recovery_vault_root, gc_recovery_vault, init_recovery_vault, list_recovery_vault,
+    record_recovery_tombstone, recovery_audit_log, recovery_vault_config, recovery_vault_status,
+    register_recovery_repository, repair_recovery_point, restore_recovery_point,
+    scrub_recovery_vault, set_recovery_point_pin, update_recovery_retention, verify_recovery_point,
 };
 pub use repository::{
     DEFAULT_REPOSITORY_EXCLUDES, RepositoryBranchReport, RepositoryByteRange,
