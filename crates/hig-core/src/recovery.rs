@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod audit;
+#[cfg(test)]
+mod fault_tests;
 
 use audit::run_audited;
 pub use audit::{
@@ -27,6 +29,53 @@ use audit::{atomic_write_new, begin_audit};
 const VAULT_SCHEMA: u16 = 1;
 const CATALOG_SCHEMA: u16 = 1;
 const DOCUMENT_SCHEMA: u16 = 1;
+
+#[cfg(not(test))]
+#[inline]
+fn recovery_failpoint(_name: &'static str) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_FAILPOINT: std::cell::RefCell<Option<&'static str>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn recovery_failpoint(name: &'static str) -> anyhow::Result<()> {
+    let triggered = RECOVERY_FAILPOINT.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        if armed.as_ref().is_some_and(|candidate| *candidate == name) {
+            armed.take();
+            true
+        } else {
+            false
+        }
+    });
+    anyhow::ensure!(!triggered, "injected recovery fault: {name}");
+    Ok(())
+}
+
+#[cfg(test)]
+fn with_recovery_failpoint<T>(name: &'static str, operation: impl FnOnce() -> T) -> T {
+    RECOVERY_FAILPOINT.with(|armed| {
+        assert!(
+            armed.borrow().is_none(),
+            "nested recovery failpoints are unsupported"
+        );
+        armed.replace(Some(name));
+    });
+    let result = operation();
+    RECOVERY_FAILPOINT.with(|armed| {
+        assert!(
+            armed.borrow().is_none(),
+            "recovery failpoint was not reached: {name}"
+        );
+    });
+    result
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryVaultConfig {
@@ -545,6 +594,7 @@ pub fn capture_recovery_point(
         Some(point_id.clone()),
         details,
         || {
+            recovery_failpoint("capture_after_prepared")?;
             let key = hex::encode(source_config.repository_id);
             let now = now_unix_ns();
             let source_label = source_root.display().to_string();
@@ -577,6 +627,7 @@ pub fn capture_recovery_point(
                 primary.commit_id == commit_id,
                 "source revision changed during capture"
             );
+            recovery_failpoint("capture_after_primary_replication")?;
 
             let mut replicas = Vec::new();
             for mirror in &config.mirror_roots {
@@ -635,7 +686,9 @@ pub fn capture_recovery_point(
             registration.recovery_points.insert(point_id, point.clone());
             registration.updated_unix_ns = now;
             catalog.generation = catalog.generation.saturating_add(1);
+            recovery_failpoint("capture_before_catalog_publish")?;
             save_catalog(&root, &catalog)?;
+            recovery_failpoint("capture_after_catalog_publish")?;
             Ok((
                 RecoveryCaptureReport {
                     vault_root: root.display().to_string(),
@@ -741,7 +794,9 @@ pub fn restore_recovery_point(
         Some(recovery_point_id.to_string()),
         details,
         || {
+            recovery_failpoint("restore_after_prepared")?;
             verify_recovery_point(Some(&root), repository_id, recovery_point_id)?;
+            recovery_failpoint("restore_after_verification")?;
             let restore = restore_repository(
                 &vault_repository_root(&root, id),
                 &point.ref_name,
@@ -753,6 +808,7 @@ pub fn restore_recovery_point(
                 restore.commit_id == point.commit_id,
                 "restored commit mismatch"
             );
+            recovery_failpoint("restore_after_publication")?;
             Ok((
                 RecoveryRestoreReport {
                     vault_root: root.display().to_string(),
@@ -989,6 +1045,7 @@ pub fn gc_recovery_vault(
         None,
         details,
         || {
+            recovery_failpoint("gc_after_prepared")?;
             for (repository_key, point_ids) in &selection.selected {
                 let registration = catalog
                     .repositories
@@ -1016,6 +1073,7 @@ pub fn gc_recovery_vault(
             }
             catalog.generation = catalog.generation.saturating_add(1);
             save_catalog(&root, &catalog)?;
+            recovery_failpoint("gc_after_pending_catalog")?;
 
             for mirror in &config.mirror_roots {
                 for (repository_key, point_ids) in &selection.selected {
@@ -1030,6 +1088,7 @@ pub fn gc_recovery_vault(
                     )?;
                 }
             }
+            recovery_failpoint("gc_after_mirror_deletion")?;
             let mut applied_reports = BTreeMap::new();
             for (repository_key, point_ids) in &selection.selected {
                 let registration = catalog
@@ -1043,6 +1102,7 @@ pub fn gc_recovery_vault(
                 )?;
                 applied_reports.insert(repository_key.clone(), report);
             }
+            recovery_failpoint("gc_after_primary_deletion")?;
 
             for (repository_key, point_ids) in &selection.selected {
                 let registration = catalog
@@ -1065,7 +1125,9 @@ pub fn gc_recovery_vault(
                 }
             }
             catalog.generation = catalog.generation.saturating_add(1);
+            recovery_failpoint("gc_before_final_catalog")?;
             save_catalog(&root, &catalog)?;
+            recovery_failpoint("gc_after_final_catalog")?;
             let projected_stored_bytes = applied_reports
                 .values()
                 .map(|report| report.total_bytes.saturating_sub(report.removed_bytes))
@@ -1480,6 +1542,7 @@ fn capture_mirror(
                 report.reachable_objects == primary.reachable_objects,
                 "mirror reachable graph mismatch"
             );
+            recovery_failpoint("capture_mirror_after_replication")?;
             let key = hex::encode(registration.repository_id);
             let now = now_unix_ns();
             let mut mirrored_registration = registration.clone();
