@@ -1350,6 +1350,14 @@ pub fn snapshot_repository(
                         directory.path.display()
                     )
                 })?;
+        #[cfg(test)]
+        anyhow::ensure!(
+            current == directory.metadata,
+            "directory changed while creating repository snapshot: {}; expected {:#?}, actual {current:#?}",
+            directory.path.display(),
+            directory.metadata
+        );
+        #[cfg(not(test))]
         anyhow::ensure!(
             current == directory.metadata,
             "directory changed while creating repository snapshot: {}",
@@ -3615,24 +3623,31 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
         hasher.finalize().as_bytes() == &state.object.content_hash,
         "restored file checksum mismatch"
     );
-    file.sync_all()?;
+    file.sync_all().context("failed to sync restored file")?;
     if let Some(extents) = &state.object.allocated_extents {
-        verify_restored_sparse_layout(&file, state.object.size, extents)?;
+        verify_restored_sparse_layout(&file, state.object.size, extents)
+            .context("restored sparse layout failed verification")?;
     }
-    restore_ownership(path, state.object.ownership)?;
-    restore_alternate_data_streams(repository, path, &state.object.alternate_data_streams)?;
-    restore_extended_attributes(path, &state.object.extended_attributes)?;
-    set_permissions(path, state.object.permissions)?;
+    restore_ownership(path, state.object.ownership).context("failed to restore file ownership")?;
+    restore_alternate_data_streams(repository, path, &state.object.alternate_data_streams)
+        .context("failed to restore file alternate data streams")?;
+    restore_extended_attributes(path, &state.object.extended_attributes)
+        .context("failed to restore file extended attributes")?;
+    set_file_modified_time(&file, state.object.mtime_ns)
+        .context("failed to restore file modified time")?;
+    drop(file);
+    set_permissions(path, state.object.permissions)
+        .context("failed to restore file permissions")?;
     restore_access_control(
         path,
         AccessControlNodeKind::Regular,
         state.object.access_control.as_ref(),
-    )?;
+    )
+    .context("failed to restore file access control")?;
     anyhow::ensure!(
         metadata_permissions(&fs::metadata(path)?) == state.object.permissions,
         "restored file permissions changed while applying ACL"
     );
-    set_file_modified_time(&file, state.object.mtime_ns)?;
     Ok(())
 }
 
@@ -5973,7 +5988,19 @@ mod windows_access_control {
             descriptor_size > 0,
             "parsed Windows security descriptor is empty"
         );
-        let result = apply_descriptor(path, descriptor);
+        let dacl_result = apply_descriptor(path, descriptor, false);
+        let result = match dacl_result {
+            Ok(()) => match read(path) {
+                Ok(actual) if actual == *expected => Ok(()),
+                Ok(_) => apply_descriptor(path, descriptor, true),
+                Err(error) => Err(error),
+            },
+            Err(dacl_error) => apply_descriptor(path, descriptor, true).map_err(|full_error| {
+                anyhow::anyhow!(
+                    "failed to restore Windows DACL ({dacl_error}); full security descriptor restore also failed ({full_error})"
+                )
+            }),
+        };
         let descriptor_free = unsafe { LocalFree(descriptor) };
         anyhow::ensure!(
             descriptor_free.is_null(),
@@ -5997,8 +6024,10 @@ mod windows_access_control {
     fn apply_descriptor(
         path: &Path,
         descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+        include_owner_group: bool,
     ) -> anyhow::Result<()> {
-        let file = open_security_handle(path, READ_CONTROL | WRITE_DAC | WRITE_OWNER)?;
+        let access = READ_CONTROL | WRITE_DAC | if include_owner_group { WRITE_OWNER } else { 0 };
+        let file = open_security_handle(path, access)?;
         let mut owner = null_mut();
         let mut group = null_mut();
         let mut dacl = null_mut();
@@ -6024,7 +6053,11 @@ mod windows_access_control {
             unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } != 0,
             "stored Windows security descriptor control is invalid"
         );
-        let mut information = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
+        let mut information = if include_owner_group {
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION
+        } else {
+            0
+        };
         if dacl_present != 0 {
             information |= DACL_SECURITY_INFORMATION;
             information |= if control & SE_DACL_PROTECTED != 0 {
@@ -6600,6 +6633,17 @@ fn now_unix_ns() -> i128 {
 mod tests {
     use super::*;
 
+    fn test_regular_file_permissions() -> u32 {
+        #[cfg(unix)]
+        {
+            0o100644
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+
     #[test]
     fn snapshot_diff_and_exact_restore_survive_one_byte_change() {
         let temp = tempfile::tempdir().unwrap();
@@ -6762,7 +6806,7 @@ mod tests {
             schema: 1,
             file_type: RepositoryFileType::Regular,
             size: content.len() as u64,
-            permissions: 0o100644,
+            permissions: test_regular_file_permissions(),
             mtime_ns: 1_700_000_000_000_000_000,
             content_hash: *blake3::hash(content).as_bytes(),
             chunking_schema: 1,
@@ -7113,7 +7157,7 @@ mod tests {
                 schema: 2,
                 file_type: RepositoryFileType::Regular,
                 size: 1,
-                permissions: 0o100644,
+                permissions: test_regular_file_permissions(),
                 mtime_ns: 1_700_000_000_000_000_000,
                 content_hash: *blake3::hash(content).as_bytes(),
                 chunking_schema: 2,
