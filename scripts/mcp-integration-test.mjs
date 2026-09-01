@@ -15,12 +15,14 @@ const higBin = process.env.HIG_BIN || defaultBinary;
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "hig-mcp-integration-"));
 const workspace = path.join(work, "workspace");
 const outside = fs.mkdtempSync(path.join(os.tmpdir(), "hig-mcp-outside-"));
+const escapeLink = path.join(work, "escape-link");
 const cache = path.join(work, "cache");
 
 fs.mkdirSync(path.join(workspace, "src"), { recursive: true });
 fs.writeFileSync(path.join(workspace, "README.md"), "synthetic MCP integration fixture\n");
 fs.writeFileSync(path.join(workspace, "src", "lib.rs"), "pub fn mcp_fixture() -> u8 { 1 }\n");
 fs.writeFileSync(path.join(outside, "outside.txt"), "must remain outside the MCP root\n");
+fs.symlinkSync(outside, escapeLink, process.platform === "win32" ? "junction" : "dir");
 const expectedInputBytes = fs.statSync(path.join(workspace, "README.md")).size
   + fs.statSync(path.join(workspace, "src", "lib.rs")).size;
 
@@ -200,6 +202,13 @@ try {
   await tool("hig_repo_verify", { dir: workspace });
 
   const recoveryVault = path.join(work, "recovery-vault");
+  const missingVaultRoot = await tool("hig_recovery_list", {}, false);
+  assert.match(missingVaultRoot.error, /vaultRoot is required/i);
+  const escapedVault = await tool("hig_recovery_init", {
+    vaultRoot: path.join(escapeLink, "escaped-vault")
+  }, false);
+  assert.match(escapedVault.error, /outside allowed roots/i);
+  assert.equal(fs.existsSync(path.join(outside, "escaped-vault")), false);
   const recoveryInitialized = await tool("hig_recovery_init", { vaultRoot: recoveryVault });
   assert.equal(recoveryInitialized.data.schema, 1);
 
@@ -300,6 +309,12 @@ try {
   assert.equal(recoveryPromoted.data.schema, 1);
   assert.equal(recoveryPromoted.data.durability, "protected");
   assert.equal(recoveryPromoted.data.mirror_roots.length, 1);
+  const escapedPromotion = await tool("hig_recovery_promote", {
+    vaultRoot: recoveryVault,
+    mirrors: [path.join(escapeLink, "escaped-promotion")]
+  }, false);
+  assert.match(escapedPromotion.error, /outside allowed roots/i);
+  assert.equal(fs.existsSync(path.join(outside, "escaped-promotion")), false);
   const protectedStatus = await tool("hig_recovery_status", { vaultRoot: recoveryVault });
   assert.equal(protectedStatus.data.protected_points, protectedStatus.data.recovery_points);
   assert.equal(protectedStatus.data.durability_lag_points, 0);
@@ -313,6 +328,11 @@ try {
   assert.equal(recoveryGc.data.schema, 1);
   assert.equal(recoveryGc.data.dry_run, true);
   assert.equal(recoveryGc.data.removed_recovery_points, 0);
+  const forgedRecoveryGc = await tool("hig_recovery_gc", {
+    vaultRoot: recoveryVault,
+    apply: "false"
+  }, false);
+  assert.match(forgedRecoveryGc.error, /apply must be a boolean/i);
   const pinned = await tool("hig_recovery_pin", {
     repositoryId,
     recoveryPointId,
@@ -347,6 +367,47 @@ try {
   });
   assert.equal(tombstone.data.schema, 1);
   assert.equal(tombstone.data.tombstone.kind, "file");
+  const traversalOutput = path.join(work, "traversal-output");
+  const traversal = await tool("hig_recovery_restore", {
+    repositoryId,
+    recoveryPointId,
+    outputDir: traversalOutput,
+    path: "../../outside.txt",
+    vaultRoot: recoveryVault
+  }, false);
+  assert.match(traversal.stderr, /path|relative|unsafe/i);
+  assert.equal(fs.existsSync(traversalOutput), false);
+
+  const existingOutput = path.join(work, "existing-recovery-output");
+  fs.mkdirSync(existingOutput);
+  fs.writeFileSync(path.join(existingOutput, "sentinel.txt"), "preserve\n");
+  const overwriteDenied = await tool("hig_recovery_restore", {
+    repositoryId,
+    recoveryPointId,
+    outputDir: existingOutput,
+    overwrite: false,
+    vaultRoot: recoveryVault
+  }, false);
+  assert.match(overwriteDenied.stderr, /exist|overwrite/i);
+  assert.equal(fs.readFileSync(path.join(existingOutput, "sentinel.txt"), "utf8"), "preserve\n");
+  const forgedOverwrite = await tool("hig_recovery_restore", {
+    repositoryId,
+    recoveryPointId,
+    outputDir: existingOutput,
+    overwrite: "false",
+    vaultRoot: recoveryVault
+  }, false);
+  assert.match(forgedOverwrite.error, /overwrite must be a boolean/i);
+  assert.equal(fs.readFileSync(path.join(existingOutput, "sentinel.txt"), "utf8"), "preserve\n");
+
+  const escapedRestore = await tool("hig_recovery_restore", {
+    repositoryId,
+    recoveryPointId,
+    outputDir: path.join(escapeLink, "escaped-restore"),
+    vaultRoot: recoveryVault
+  }, false);
+  assert.match(escapedRestore.error, /outside allowed roots/i);
+  assert.equal(fs.existsSync(path.join(outside, "escaped-restore")), false);
   const recoveryOutput = path.join(work, "recovery-output");
   const recoveryRestored = await tool("hig_recovery_restore", {
     repositoryId,

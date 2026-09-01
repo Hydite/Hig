@@ -649,12 +649,16 @@ process.stdin.resume();
 
 function computeAllowedRoots() {
   const raw = process.env.HIG_MCP_ALLOWED_ROOTS;
+  let roots;
   if (raw && raw.trim()) {
-    return raw.split(path.delimiter).flatMap((part) => part.split(",")).filter(Boolean).map((root) => path.resolve(root));
+    roots = raw.split(path.delimiter).flatMap((part) => part.split(",")).filter(Boolean);
+  } else {
+    roots = [...new Set([process.cwd(), process.env.PWD].filter(Boolean))];
   }
-  const roots = new Set([process.cwd()]);
-  if (process.env.PWD) roots.add(process.env.PWD);
-  return [...roots].map((root) => path.resolve(root));
+  return roots.map((root) => {
+    const logical = path.resolve(root);
+    return { logical, physical: resolvePhysicalPath(logical) };
+  });
 }
 
 function objectSchema(properties, required = []) {
@@ -743,7 +747,7 @@ async function callTool(name, args) {
     case "hig_project_status":
       return runHig(["project", "status", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_project_rebuild":
-      return runHig(["project", "rebuild", resolveInputPath(args.dir || "."), ...(args.wait ? ["--wait"] : [])]);
+      return runHig(["project", "rebuild", resolveInputPath(args.dir || "."), ...booleanOption("--wait", args.wait, "wait")]);
     case "hig_project_policy_show":
       return runHig(["project", "policy", "show", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_project_policy_set":
@@ -775,7 +779,7 @@ async function callTool(name, args) {
     case "hig_pack":
       return runHig(buildPackArgs(args), { parseJson: true });
     case "hig_unpack":
-      return runHig(["unpack", resolveInputPath(args.archiveFile), "--output-dir", resolveOutputPath(args.outputDir), ...optionValue("--password", args.password), ...(args.overwrite ? ["--overwrite"] : [])]);
+      return runHig(["unpack", resolveInputPath(args.archiveFile), "--output-dir", resolveOutputPath(args.outputDir), ...optionValue("--password", args.password), ...booleanOption("--overwrite", args.overwrite, "overwrite")]);
     case "hig_inspect":
       return runHig(["inspect", resolveInputPath(args.archiveFile), ...optionValue("--password", args.password), ...(args.json === false ? [] : ["--json"])], { parseJson: args.json !== false });
     case "hig_migrate":
@@ -787,7 +791,7 @@ async function callTool(name, args) {
         ...optionValue("--password", args.password),
         ...optionValue("--target-password", args.targetPassword),
         ...optionValue("--encryption", args.encryption),
-        ...(args.overwrite ? ["--overwrite"] : []),
+        ...booleanOption("--overwrite", args.overwrite, "overwrite"),
         "--json"
       ], { parseJson: true });
     case "hig_cache_status":
@@ -797,7 +801,7 @@ async function callTool(name, args) {
     case "hig_cache_compact":
       return runHig(["cache", "compact", ...optionPath("--cache-dir", args.cacheDir), ...(args.dryRun === false ? [] : ["--dry-run"])]);
     case "hig_task_list":
-      return runHig(["task", "list", ...optionPath("--cache-dir", args.cacheDir), ...(args.includeCompleted ? ["--include-completed"] : [])]);
+      return runHig(["task", "list", ...optionPath("--cache-dir", args.cacheDir), ...booleanOption("--include-completed", args.includeCompleted, "includeCompleted")]);
     case "hig_task_status":
       return runHig(["task", "status", stringArg(args.taskId, "taskId"), ...optionPath("--cache-dir", args.cacheDir)]);
     case "hig_task_cancel":
@@ -839,9 +843,9 @@ async function callTool(name, args) {
     case "hig_repo_path_history":
       return runHig(["repo", "history", resolveInputPath(args.dir || "."), "--path", stringArg(args.path, "path"), ...optionValue("--limit", args.limit), "--json"], { parseJson: true });
     case "hig_repo_restore":
-      return runHig(["repo", "restore", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), "--output-dir", resolveOutputPath(args.outputDir), ...optionValue("--path", args.path), ...(args.overwrite ? ["--overwrite"] : []), "--json"], { parseJson: true });
+      return runHig(["repo", "restore", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), "--output-dir", resolveOutputPath(args.outputDir), ...optionValue("--path", args.path), ...booleanOption("--overwrite", args.overwrite, "overwrite"), "--json"], { parseJson: true });
     case "hig_repo_restore_range":
-      return runHig(["repo", "restore-range", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), "--path", stringArg(args.path, "path"), "--start", integerArg(args.start, "start", 0), ...optionValue("--len", args.len), "--output", resolveOutputPath(args.output), ...(args.overwrite ? ["--overwrite"] : []), "--json"], { parseJson: true });
+      return runHig(["repo", "restore-range", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), "--path", stringArg(args.path, "path"), "--start", integerArg(args.start, "start", 0), ...optionValue("--len", args.len), "--output", resolveOutputPath(args.output), ...booleanOption("--overwrite", args.overwrite, "overwrite"), "--json"], { parseJson: true });
     case "hig_repo_storage_tree":
       return runHig(["repo", "storage-tree", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), "--json"], { parseJson: true });
     case "hig_repo_symbols":
@@ -849,11 +853,11 @@ async function callTool(name, args) {
     case "hig_repo_symbol_history":
       return runHig(["repo", "symbol-history", resolveInputPath(args.dir || "."), "--symbol", stringArg(args.symbol, "symbol"), ...optionValue("--limit", args.limit), "--json"], { parseJson: true });
     case "hig_repo_restore_symbol":
-      return runHig(["repo", "restore-symbol", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), "--symbol", stringArg(args.symbol, "symbol"), "--output", resolveOutputPath(args.output), ...(args.overwrite ? ["--overwrite"] : []), "--json"], { parseJson: true });
+      return runHig(["repo", "restore-symbol", resolveInputPath(args.dir || "."), ...optionValue("--revision", args.revision), "--symbol", stringArg(args.symbol, "symbol"), "--output", resolveOutputPath(args.output), ...booleanOption("--overwrite", args.overwrite, "overwrite"), "--json"], { parseJson: true });
     case "hig_repo_verify":
       return runHig(["repo", "verify", resolveInputPath(args.dir || "."), "--json"], { parseJson: true });
     case "hig_repo_gc":
-      return runHig(["repo", "gc", resolveInputPath(args.dir || "."), ...(args.apply ? ["--apply"] : []), "--json"], { parseJson: true });
+      return runHig(["repo", "gc", resolveInputPath(args.dir || "."), ...booleanOption("--apply", args.apply, "apply"), "--json"], { parseJson: true });
     case "hig_recovery_init":
       return runHig([
         "recovery", "init",
@@ -901,13 +905,13 @@ async function callTool(name, args) {
         ...optionValue("--minimum-retention-days", args.minimumRetentionDays),
         ...optionValue("--maximum-points", args.maximumPoints),
         ...optionValue("--maximum-vault-bytes", args.maximumVaultBytes),
-        ...(args.clearMaximumPoints ? ["--clear-maximum-points"] : []),
-        ...(args.clearMaximumVaultBytes ? ["--clear-maximum-vault-bytes"] : []),
+        ...booleanOption("--clear-maximum-points", args.clearMaximumPoints, "clearMaximumPoints"),
+        ...booleanOption("--clear-maximum-vault-bytes", args.clearMaximumVaultBytes, "clearMaximumVaultBytes"),
         ...recoveryVaultArgs(args, false),
         "--json"
       ], { parseJson: true });
     case "hig_recovery_gc":
-      return runHig(["recovery", "gc", ...recoveryVaultArgs(args, false), ...(args.apply ? ["--apply"] : []), "--json"], { parseJson: true });
+      return runHig(["recovery", "gc", ...recoveryVaultArgs(args, false), ...booleanOption("--apply", args.apply, "apply"), "--json"], { parseJson: true });
     case "hig_recovery_scrub":
       return runHig(["recovery", "scrub", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_repair":
@@ -928,7 +932,7 @@ async function callTool(name, args) {
         stringArg(args.recoveryPointId, "recoveryPointId"),
         "--output-dir", resolveOutputPath(args.outputDir),
         ...optionValue("--path", args.path),
-        ...(args.overwrite ? ["--overwrite"] : []),
+        ...booleanOption("--overwrite", args.overwrite, "overwrite"),
         ...recoveryVaultArgs(args, false),
         "--json"
       ], { parseJson: true });
@@ -951,15 +955,15 @@ function buildPackArgs(args) {
     ...optionPath("--cache-dir", args.cacheDir),
     ...optionValue("--threads", args.threads),
     ...optionValue("--level", args.level),
-    ...(args.noCache ? ["--no-cache"] : []),
+    ...booleanOption("--no-cache", args.noCache, "noCache"),
     ...optionValue("--format", args.format),
     ...optionValue("--manifest-format", args.manifestFormat),
-    ...(args.noBatch ? ["--no-batch"] : []),
-    ...(args.noChunk ? ["--no-chunk"] : []),
+    ...booleanOption("--no-batch", args.noBatch, "noBatch"),
+    ...booleanOption("--no-chunk", args.noChunk, "noChunk"),
     ...optionValue("--speed", args.speed),
     ...optionValue("--kdf-profile", args.kdfProfile),
-    ...(args.trustMetadata ? ["--trust-metadata"] : []),
-    ...(args.useSession ? ["--use-session"] : []),
+    ...booleanOption("--trust-metadata", args.trustMetadata, "trustMetadata"),
+    ...booleanOption("--use-session", args.useSession, "useSession"),
     ...optionValue("--daemon", args.daemon),
     ...optionValue("--project", args.project),
     ...optionValue("--solid", args.solid)
@@ -976,9 +980,9 @@ function buildBenchArgs(args) {
     ...optionValue("--encryption", args.encryption),
     ...optionPath("--cache-dir", args.cacheDir),
     ...optionPath("--bench-dir", args.benchDir),
-    ...(args.compare ? ["--compare"] : []),
+    ...booleanOption("--compare", args.compare, "compare"),
     ...optionValue("--bench-suite", args.benchSuite),
-    ...(args.useSession ? ["--use-session"] : []),
+    ...booleanOption("--use-session", args.useSession, "useSession"),
     ...optionValue("--daemon", args.daemon),
     ...optionValue("--speed", args.speed),
     ...optionValue("--kdf-profile", args.kdfProfile)
@@ -988,6 +992,12 @@ function buildBenchArgs(args) {
 function optionValue(flag, value) {
   if (value === undefined || value === null || value === "") return [];
   return [flag, String(value)];
+}
+
+function booleanOption(flag, value, name) {
+  if (value === undefined || value === null) return [];
+  if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
+  return value ? [flag] : [];
 }
 
 function optionPath(flag, value) {
@@ -1036,13 +1046,34 @@ function resolveOutputPath(value) {
 function resolveCheckedPath(value, output) {
   if (typeof value !== "string" || value.length === 0) throw new Error("path value is required");
   const absolute = path.resolve(value);
-  if (!allowAnyPath && !allowedRoots.some((root) => isInside(absolute, root))) {
+  const physical = resolvePhysicalPath(absolute);
+  if (!allowAnyPath && !allowedRoots.some((root) => (
+    isInside(absolute, root.logical) && isInside(physical, root.physical)
+  ))) {
     throw new Error(`Path is outside allowed roots: ${absolute}. Set HIG_MCP_ALLOWED_ROOTS or HIG_MCP_ALLOW_ANY_PATH=1.`);
   }
   if (!output && !fs.existsSync(absolute)) {
     throw new Error(`Input path does not exist: ${absolute}`);
   }
   return absolute;
+}
+
+function resolvePhysicalPath(value) {
+  let ancestor = path.resolve(value);
+  const missing = [];
+  for (;;) {
+    try {
+      fs.lstatSync(ancestor);
+      break;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) throw new Error(`Path has no existing ancestor: ${value}`);
+    missing.unshift(path.basename(ancestor));
+    ancestor = parent;
+  }
+  return path.join(fs.realpathSync.native(ancestor), ...missing);
 }
 
 function isInside(target, root) {
