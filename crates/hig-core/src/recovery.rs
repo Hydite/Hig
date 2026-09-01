@@ -3298,6 +3298,7 @@ fn now_unix_ns() -> i128 {
 
 #[cfg(windows)]
 mod windows_owner_only {
+    use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use std::ptr::null_mut;
@@ -3307,7 +3308,8 @@ mod windows_owner_only {
         SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, INHERITED_ACE, IsValidSid,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
     };
 
@@ -3393,7 +3395,8 @@ mod windows_owner_only {
             "recovery private DACL permits inherited access"
         );
         anyhow::ensure!(
-            acl_bytes(expected_dacl) == acl_bytes(actual_dacl),
+            canonical_aces(expected_dacl, path.is_dir())?
+                == canonical_aces(actual_dacl, path.is_dir())?,
             "recovery private DACL failed exact verification"
         );
         Ok(())
@@ -3416,9 +3419,73 @@ mod windows_owner_only {
         Ok(dacl)
     }
 
-    fn acl_bytes(acl: *const ACL) -> Vec<u8> {
-        let length = unsafe { (*acl).AclSize as usize };
-        unsafe { std::slice::from_raw_parts(acl.cast(), length) }.to_vec()
+    #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct CanonicalAce {
+        ace_type: u8,
+        ace_flags: u8,
+        mask: u32,
+        sid: Vec<u8>,
+    }
+
+    fn canonical_aces(acl: *const ACL, directory: bool) -> anyhow::Result<Vec<CanonicalAce>> {
+        anyhow::ensure!(!acl.is_null(), "recovery private DACL is missing");
+        let acl_size = unsafe { (*acl).AclSize as usize };
+        anyhow::ensure!(
+            acl_size >= size_of::<ACL>(),
+            "recovery private DACL is malformed"
+        );
+        let acl_start = acl.cast::<u8>() as usize;
+        let acl_end = acl_start
+            .checked_add(acl_size)
+            .ok_or_else(|| anyhow::anyhow!("recovery private DACL size overflows"))?;
+        let mut entries = Vec::with_capacity(unsafe { (*acl).AceCount as usize });
+        for index in 0..unsafe { (*acl).AceCount as u32 } {
+            let mut raw_ace = null_mut();
+            anyhow::ensure!(
+                unsafe { GetAce(acl, index, &mut raw_ace) } != 0,
+                "failed to inspect recovery private DACL ACE"
+            );
+            anyhow::ensure!(!raw_ace.is_null(), "recovery private DACL ACE is missing");
+            let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
+            let ace_start = ace.cast::<u8>() as usize;
+            let ace_size = unsafe { (*ace).Header.AceSize as usize };
+            anyhow::ensure!(
+                ace_size >= size_of::<ACCESS_ALLOWED_ACE>()
+                    && ace_start >= acl_start
+                    && ace_start
+                        .checked_add(ace_size)
+                        .is_some_and(|end| end <= acl_end),
+                "recovery private DACL ACE is malformed"
+            );
+            let mut ace_flags = unsafe { (*ace).Header.AceFlags };
+            anyhow::ensure!(
+                u32::from(ace_flags) & INHERITED_ACE == 0,
+                "recovery private DACL contains inherited access"
+            );
+            if !directory {
+                // Windows may discard inheritance propagation flags on non-container objects.
+                ace_flags &= !0x03;
+            }
+            let sid = unsafe { std::ptr::addr_of!((*ace).SidStart).cast::<u8>() };
+            let sid_offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            anyhow::ensure!(
+                unsafe { IsValidSid(sid.cast()) } != 0,
+                "recovery private DACL SID is malformed"
+            );
+            let sid_length = unsafe { GetLengthSid(sid.cast()) as usize };
+            anyhow::ensure!(
+                sid_length > 0 && sid_offset + sid_length <= ace_size,
+                "recovery private DACL SID is malformed"
+            );
+            entries.push(CanonicalAce {
+                ace_type: unsafe { (*ace).Header.AceType },
+                ace_flags,
+                mask: unsafe { (*ace).Mask },
+                sid: unsafe { std::slice::from_raw_parts(sid, sid_length) }.to_vec(),
+            });
+        }
+        entries.sort_unstable();
+        Ok(entries)
     }
 }
 
