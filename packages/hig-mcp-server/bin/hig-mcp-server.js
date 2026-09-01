@@ -12,13 +12,33 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const packageRoot = path.resolve(__dirname, "..");
 
-const MAX_OUTPUT_BYTES = Number(process.env.HIG_MCP_MAX_OUTPUT_BYTES || 1_000_000);
-const DEFAULT_TIMEOUT_MS = Number(process.env.HIG_MCP_TIMEOUT_MS || 20 * 60 * 1000);
+const MAX_OUTPUT_BYTES = positiveIntegerEnv("HIG_MCP_MAX_OUTPUT_BYTES", 1_000_000);
+const DEFAULT_TIMEOUT_MS = positiveIntegerEnv("HIG_MCP_TIMEOUT_MS", 20 * 60 * 1000);
+const MAX_REQUEST_BYTES = positiveIntegerEnv("HIG_MCP_MAX_REQUEST_BYTES", 4 * 1024 * 1024);
+const MAX_HEADER_BYTES = positiveIntegerEnv("HIG_MCP_MAX_HEADER_BYTES", 16 * 1024);
+const MAX_INFLIGHT_TOOLS = positiveIntegerEnv("HIG_MCP_MAX_INFLIGHT_TOOLS", 4);
+const MAX_QUEUED_TOOLS = positiveIntegerEnv("HIG_MCP_MAX_QUEUED_TOOLS", 32);
+const MAX_REPOSITORY_WATCHERS = positiveIntegerEnv("HIG_MCP_MAX_REPOSITORY_WATCHERS", 8);
 const allowAnyPath = process.env.HIG_MCP_ALLOW_ANY_PATH === "1";
 const allowGlobalRecovery = process.env.HIG_MCP_ALLOW_GLOBAL_RECOVERY === "1";
 const allowedRoots = computeAllowedRoots();
 const repositoryWatchers = new Map();
+const repositoryWatcherStarts = new Set();
+const recoveryOperationsWithConfiguredMirrors = new Set([
+  "hig_recovery_init",
+  "hig_recovery_register",
+  "hig_recovery_capture",
+  "hig_recovery_pin",
+  "hig_recovery_unpin",
+  "hig_recovery_tombstone",
+  "hig_recovery_policy_set",
+  "hig_recovery_gc",
+  "hig_recovery_scrub",
+  "hig_recovery_repair"
+]);
 let shuttingDown = false;
+let activeToolCalls = 0;
+const queuedToolCalls = [];
 
 const tools = [
   {
@@ -635,13 +655,22 @@ if (process.argv.includes("--smoke")) {
 let nextId = 1;
 let inputBuffer = Buffer.alloc(0);
 process.stdin.on("data", (chunk) => {
-  inputBuffer = Buffer.concat([inputBuffer, chunk]);
-  for (;;) {
-    const message = readMessage();
-    if (!message) break;
-    void handleMessage(message).catch((error) => {
-      if (message.id !== undefined) sendError(message.id, -32603, String(error?.message || error));
-    });
+  try {
+    const maximumBuffer = Math.max(MAX_REQUEST_BYTES + MAX_HEADER_BYTES + 4, MAX_REQUEST_BYTES + 1);
+    if (inputBuffer.length + chunk.length > maximumBuffer) {
+      throw new Error("MCP input buffer exceeds the configured limit");
+    }
+    inputBuffer = Buffer.concat([inputBuffer, chunk]);
+    for (;;) {
+      const message = readMessage();
+      if (!message) break;
+      void handleMessage(message).catch((error) => {
+        if (message.id !== undefined) sendError(message.id, -32603, String(error?.message || error));
+      });
+    }
+  } catch (error) {
+    process.stderr.write(`Invalid MCP transport input: ${String(error?.message || error)}\n`);
+    void shutdown(1);
   }
 });
 
@@ -677,10 +706,14 @@ function pathProp(description) {
 function readMessage() {
   const headerEnd = inputBuffer.indexOf("\r\n\r\n");
   if (headerEnd >= 0) {
+    if (headerEnd > MAX_HEADER_BYTES) throw new Error("MCP header exceeds the configured limit");
     const header = inputBuffer.subarray(0, headerEnd).toString("utf8");
     const match = /^Content-Length:\s*(\d+)/im.exec(header);
     if (!match) throw new Error("Invalid MCP frame: missing Content-Length");
     const length = Number(match[1]);
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_REQUEST_BYTES) {
+      throw new Error("MCP Content-Length exceeds the configured limit");
+    }
     const bodyStart = headerEnd + 4;
     if (inputBuffer.length < bodyStart + length) return null;
     const body = inputBuffer.subarray(bodyStart, bodyStart + length).toString("utf8");
@@ -689,7 +722,13 @@ function readMessage() {
   }
 
   const newline = inputBuffer.indexOf("\n");
-  if (newline < 0) return null;
+  if (newline < 0) {
+    if (inputBuffer.length > MAX_REQUEST_BYTES) {
+      throw new Error("MCP line exceeds the configured limit");
+    }
+    return null;
+  }
+  if (newline > MAX_REQUEST_BYTES) throw new Error("MCP line exceeds the configured limit");
   const line = inputBuffer.subarray(0, newline).toString("utf8").trim();
   inputBuffer = inputBuffer.subarray(newline + 1);
   if (!line) return null;
@@ -715,7 +754,7 @@ async function handleMessage(message) {
         break;
       case "tools/call": {
         const { name, arguments: args = {} } = message.params || {};
-        const result = await callTool(name, args || {});
+        const result = await withToolPermit(() => callTool(name, args || {}));
         sendResult(message.id, {
           content: [{ type: "text", text: stringifyToolResult(result) }],
           isError: result.code !== 0
@@ -737,6 +776,9 @@ async function handleMessage(message) {
 }
 
 async function callTool(name, args) {
+  if (recoveryOperationsWithConfiguredMirrors.has(name)) {
+    await authorizeConfiguredRecoveryMirrors(name, args);
+  }
   switch (name) {
     case "hig_version":
       return runHig(["--version"]);
@@ -773,27 +815,36 @@ async function callTool(name, args) {
     case "hig_session_status":
       return runHig(["session", "status", ...optionPath("--cache-dir", args.cacheDir)]);
     case "hig_session_unlock":
-      return runHig(["session", "unlock", "--password", stringArg(args.password, "password"), ...optionPath("--cache-dir", args.cacheDir), ...optionValue("--ttl-secs", args.ttlSecs), ...optionValue("--kdf-profile", args.kdfProfile)]);
+      return runHig(
+        ["session", "unlock", "--password-stdin", ...optionPath("--cache-dir", args.cacheDir), ...optionValue("--ttl-secs", args.ttlSecs), ...optionValue("--kdf-profile", args.kdfProfile)],
+        { stdin: secretInput(stringArg(args.password, "password")) }
+      );
     case "hig_session_clear":
       return runHig(["session", "clear", ...optionPath("--cache-dir", args.cacheDir)]);
     case "hig_pack":
-      return runHig(buildPackArgs(args), { parseJson: true });
+      return runHig(buildPackArgs(args), { parseJson: true, stdin: secretInputOptional(args.password) });
     case "hig_unpack":
-      return runHig(["unpack", resolveInputPath(args.archiveFile), "--output-dir", resolveOutputPath(args.outputDir), ...optionValue("--password", args.password), ...booleanOption("--overwrite", args.overwrite, "overwrite")]);
+      return runHig(
+        ["unpack", resolveInputPath(args.archiveFile), "--output-dir", resolveOutputPath(args.outputDir), ...secretFlag("--password-stdin", args.password), ...booleanOption("--overwrite", args.overwrite, "overwrite")],
+        { stdin: secretInputOptional(args.password) }
+      );
     case "hig_inspect":
-      return runHig(["inspect", resolveInputPath(args.archiveFile), ...optionValue("--password", args.password), ...(args.json === false ? [] : ["--json"])], { parseJson: args.json !== false });
+      return runHig(
+        ["inspect", resolveInputPath(args.archiveFile), ...secretFlag("--password-stdin", args.password), ...(args.json === false ? [] : ["--json"])],
+        { parseJson: args.json !== false, stdin: secretInputOptional(args.password) }
+      );
     case "hig_migrate":
       return runHig([
         "migrate",
         resolveInputPath(args.source),
         "--output",
         resolveOutputPath(args.output),
-        ...optionValue("--password", args.password),
-        ...optionValue("--target-password", args.targetPassword),
+        ...secretFlag("--password-stdin", args.password),
+        ...secretFlag("--target-password-stdin", args.targetPassword),
         ...optionValue("--encryption", args.encryption),
         ...booleanOption("--overwrite", args.overwrite, "overwrite"),
         "--json"
-      ], { parseJson: true });
+      ], { parseJson: true, stdin: secretInputOptional(args.password, args.targetPassword) });
     case "hig_cache_status":
       return runHig(["cache", "status", ...optionPath("--cache-dir", args.cacheDir)]);
     case "hig_cache_gc":
@@ -937,7 +988,7 @@ async function callTool(name, args) {
         "--json"
       ], { parseJson: true });
     case "hig_bench":
-      return runHig(buildBenchArgs(args), { parseJson: true, timeoutMs: Number(process.env.HIG_MCP_BENCH_TIMEOUT_MS || 60 * 60 * 1000) });
+      return runHig(buildBenchArgs(args), { parseJson: true, stdin: secretInputOptional(args.password), timeoutMs: positiveIntegerEnv("HIG_MCP_BENCH_TIMEOUT_MS", 60 * 60 * 1000) });
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -950,7 +1001,7 @@ function buildPackArgs(args) {
     "--output",
     resolveOutputPath(args.output),
     "--json",
-    ...optionValue("--password", args.password),
+    ...secretFlag("--password-stdin", args.password),
     ...optionValue("--encryption", args.encryption),
     ...optionPath("--cache-dir", args.cacheDir),
     ...optionValue("--threads", args.threads),
@@ -976,7 +1027,7 @@ function buildBenchArgs(args) {
     resolveInputPath(args.inputDir),
     "--json",
     ...optionPath("-o", args.output),
-    ...optionValue("--password", args.password),
+    ...secretFlag("--password-stdin", args.password),
     ...optionValue("--encryption", args.encryption),
     ...optionPath("--cache-dir", args.cacheDir),
     ...optionPath("--bench-dir", args.benchDir),
@@ -992,6 +1043,29 @@ function buildBenchArgs(args) {
 function optionValue(flag, value) {
   if (value === undefined || value === null || value === "") return [];
   return [flag, String(value)];
+}
+
+function secretFlag(flag, value) {
+  if (value === undefined || value === null || value === "") return [];
+  if (typeof value !== "string") throw new Error(`${flag} secret must be a string`);
+  return [flag];
+}
+
+function secretInput(...values) {
+  for (const value of values) {
+    if (typeof value !== "string" || value.length === 0) {
+      throw new Error("secret input must be a nonempty string");
+    }
+    if (value.includes("\n") || value.includes("\r")) {
+      throw new Error("secret input cannot contain a line break");
+    }
+  }
+  return `${values.join("\n")}\n`;
+}
+
+function secretInputOptional(...values) {
+  const present = values.filter((value) => value !== undefined && value !== null && value !== "");
+  return present.length === 0 ? null : secretInput(...present);
 }
 
 function booleanOption(flag, value, name) {
@@ -1025,6 +1099,39 @@ function recoveryVaultArgs(args, output) {
   );
 }
 
+async function authorizeConfiguredRecoveryMirrors(name, args) {
+  let vaultArgs;
+  if (args.vaultRoot) {
+    const vaultRoot = name === "hig_recovery_init"
+      ? resolveOutputPath(args.vaultRoot)
+      : resolveInputPath(args.vaultRoot);
+    if (name === "hig_recovery_init" && !fs.existsSync(path.join(vaultRoot, "config.json"))) {
+      return;
+    }
+    vaultArgs = ["--vault-root", vaultRoot];
+  } else if (allowGlobalRecovery) {
+    vaultArgs = [];
+  } else {
+    throw new Error(
+      "vaultRoot is required for MCP recovery operations unless HIG_MCP_ALLOW_GLOBAL_RECOVERY=1"
+    );
+  }
+
+  const config = await runHig(
+    ["recovery", "policy", "show", ...vaultArgs, "--json"],
+    { parseJson: true }
+  );
+  if (config.code !== 0) {
+    if (name === "hig_recovery_init") return;
+    throw new Error(`Unable to authorize configured recovery mirrors: ${config.stderr || config.stdout}`);
+  }
+  const mirrors = config.data?.mirror_roots;
+  if (!Array.isArray(mirrors) || mirrors.some((mirror) => typeof mirror !== "string")) {
+    throw new Error("Recovery configuration returned an invalid mirror list");
+  }
+  for (const mirror of mirrors) resolveOutputPath(mirror);
+}
+
 function stringArg(value, name) {
   if (typeof value !== "string" || value.length === 0) throw new Error(`${name} is required`);
   return value;
@@ -1047,9 +1154,7 @@ function resolveCheckedPath(value, output) {
   if (typeof value !== "string" || value.length === 0) throw new Error("path value is required");
   const absolute = path.resolve(value);
   const physical = resolvePhysicalPath(absolute);
-  if (!allowAnyPath && !allowedRoots.some((root) => (
-    isInside(absolute, root.logical) && isInside(physical, root.physical)
-  ))) {
+  if (!allowAnyPath && !allowedRoots.some((root) => isInside(physical, root.physical))) {
     throw new Error(`Path is outside allowed roots: ${absolute}. Set HIG_MCP_ALLOWED_ROOTS or HIG_MCP_ALLOW_ANY_PATH=1.`);
   }
   if (!output && !fs.existsSync(absolute)) {
@@ -1088,8 +1193,9 @@ async function runHig(args, options = {}) {
     const child = spawn(higBin, args, {
       cwd: process.env.HIG_MCP_WORKDIR || process.cwd(),
       env: { ...process.env, NO_COLOR: "1" },
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe"]
     });
+    if (options.stdin) child.stdin.end(options.stdin, "utf8");
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
     const timer = setTimeout(() => {
@@ -1123,6 +1229,36 @@ async function runHig(args, options = {}) {
   });
 }
 
+async function withToolPermit(operation) {
+  await acquireToolPermit();
+  try {
+    return await operation();
+  } finally {
+    releaseToolPermit();
+  }
+}
+
+async function acquireToolPermit() {
+  if (shuttingDown) throw new Error("HIG MCP server is shutting down");
+  if (activeToolCalls < MAX_INFLIGHT_TOOLS) {
+    activeToolCalls += 1;
+    return;
+  }
+  if (queuedToolCalls.length >= MAX_QUEUED_TOOLS) {
+    throw new Error("HIG MCP tool queue is full");
+  }
+  await new Promise((resolve, reject) => queuedToolCalls.push({ resolve, reject }));
+}
+
+function releaseToolPermit() {
+  const next = queuedToolCalls.shift();
+  if (next) {
+    next.resolve();
+  } else {
+    activeToolCalls = Math.max(0, activeToolCalls - 1);
+  }
+}
+
 async function startRepositoryWatcher(args) {
   const root = resolveInputPath(args.dir || ".");
   const debounceMs = args.debounceMs ?? 750;
@@ -1145,63 +1281,76 @@ async function startRepositoryWatcher(args) {
     return watcherResult(existing, { reused: true });
   }
 
-  const preflight = await runHig(["repo", "refs", root, "--json"], { parseJson: true });
-  if (preflight.code !== 0) return preflight;
+  if (repositoryWatcherStarts.has(root)) {
+    throw new Error("repository watcher start is already in progress");
+  }
+  const activeWatchers = [...repositoryWatchers.values()].filter((watcher) => watcher.active).length;
+  if (activeWatchers >= MAX_REPOSITORY_WATCHERS) {
+    throw new Error("repository watcher limit reached");
+  }
+  repositoryWatcherStarts.add(root);
 
-  const higBin = resolveHigBinary({ packageRoot });
-  const command = [
-    "repo", "watch", root,
-    "--debounce-ms", String(debounceMs),
-    "--message", message,
-    ...(author ? ["--author", author] : []),
-    ...(recoveryVault ? ["--recovery-vault", recoveryVault] : []),
-    "--catch-up", "true",
-    "--lifecycle-stdin",
-    "--json"
-  ];
-  const child = spawn(higBin, command, {
-    cwd: process.env.HIG_MCP_WORKDIR || process.cwd(),
-    env: { ...process.env, NO_COLOR: "1" },
-    stdio: ["pipe", "pipe", "pipe"]
-  });
-  const watcher = {
-    root,
-    child,
-    active: true,
-    stopping: false,
-    startedAt: new Date().toISOString(),
-    debounceMs,
-    message,
-    author,
-    recoveryVault,
-    snapshots: 0,
-    lastSnapshot: null,
-    lastRecoveryAt: null,
-    lastRecoveryDurability: null,
-    stdout: Buffer.alloc(0),
-    stdoutLine: "",
-    stderr: Buffer.alloc(0),
-    exitCode: null,
-    signal: null
-  };
-  repositoryWatchers.set(root, watcher);
-  child.stdout.on("data", (chunk) => consumeWatcherOutput(watcher, chunk));
-  child.stderr.on("data", (chunk) => {
-    watcher.stderr = appendBounded(watcher.stderr, chunk);
-  });
-  child.on("error", (error) => {
-    watcher.active = false;
-    watcher.stderr = appendBounded(watcher.stderr, Buffer.from(String(error.message)));
-  });
-  child.on("close", (code, signal) => {
-    watcher.active = false;
-    watcher.exitCode = code;
-    watcher.signal = signal;
-  });
+  try {
+    const preflight = await runHig(["repo", "refs", root, "--json"], { parseJson: true });
+    if (preflight.code !== 0) return preflight;
 
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  if (!watcher.active) return watcherResult(watcher, { code: watcher.exitCode ?? 1 });
-  return watcherResult(watcher);
+    const higBin = resolveHigBinary({ packageRoot });
+    const command = [
+      "repo", "watch", root,
+      "--debounce-ms", String(debounceMs),
+      "--message", message,
+      ...(author ? ["--author", author] : []),
+      ...(recoveryVault ? ["--recovery-vault", recoveryVault] : []),
+      "--catch-up", "true",
+      "--lifecycle-stdin",
+      "--json"
+    ];
+    const child = spawn(higBin, command, {
+      cwd: process.env.HIG_MCP_WORKDIR || process.cwd(),
+      env: { ...process.env, NO_COLOR: "1" },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    const watcher = {
+      root,
+      child,
+      active: true,
+      stopping: false,
+      startedAt: new Date().toISOString(),
+      debounceMs,
+      message,
+      author,
+      recoveryVault,
+      snapshots: 0,
+      lastSnapshot: null,
+      lastRecoveryAt: null,
+      lastRecoveryDurability: null,
+      stdout: Buffer.alloc(0),
+      stdoutLine: "",
+      stderr: Buffer.alloc(0),
+      exitCode: null,
+      signal: null
+    };
+    repositoryWatchers.set(root, watcher);
+    child.stdout.on("data", (chunk) => consumeWatcherOutput(watcher, chunk));
+    child.stderr.on("data", (chunk) => {
+      watcher.stderr = appendBounded(watcher.stderr, chunk);
+    });
+    child.on("error", (error) => {
+      watcher.active = false;
+      watcher.stderr = appendBounded(watcher.stderr, Buffer.from(String(error.message)));
+    });
+    child.on("close", (code, signal) => {
+      watcher.active = false;
+      watcher.exitCode = code;
+      watcher.signal = signal;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (!watcher.active) return watcherResult(watcher, { code: watcher.exitCode ?? 1 });
+    return watcherResult(watcher);
+  } finally {
+    repositoryWatcherStarts.delete(root);
+  }
 }
 
 function consumeWatcherOutput(watcher, chunk) {
@@ -1299,8 +1448,21 @@ async function terminateRepositoryWatcher(watcher) {
 async function shutdown(exitCode) {
   if (shuttingDown) return;
   shuttingDown = true;
+  while (queuedToolCalls.length > 0) {
+    queuedToolCalls.shift().reject(new Error("HIG MCP server is shutting down"));
+  }
   await Promise.all([...repositoryWatchers.values()].map(terminateRepositoryWatcher));
   process.exit(exitCode);
+}
+
+function positiveIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+  return value;
 }
 
 function appendBounded(current, chunk) {

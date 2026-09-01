@@ -9,6 +9,7 @@ use hig_core::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -1165,8 +1166,8 @@ fn start_benchmark(
         .arg("--bench-dir")
         .arg(&bench_dir)
         .arg("--json")
-        .env("HIG_BENCH_PASSWORD", password.as_str())
-        .stdin(Stdio::null())
+        .arg("--password-stdin")
+        .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::null());
     if request.compare {
@@ -1178,9 +1179,25 @@ fn start_benchmark(
     if let Some(workers) = request.workers {
         command.arg("--threads").arg(workers.to_string());
     }
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|error| AppError::from_error("benchmark_tool_missing", error, true))?;
+    let mut child_stdin = child.stdin.take().ok_or_else(|| {
+        AppError::from_error(
+            "benchmark_password_pipe",
+            "Benchmark password pipe is unavailable",
+            true,
+        )
+    })?;
+    if let Err(error) = child_stdin
+        .write_all(password.as_bytes())
+        .and_then(|_| child_stdin.write_all(b"\n"))
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(AppError::from_error("benchmark_password_pipe", error, true));
+    }
+    drop(child_stdin);
     let status = TaskStatus {
         id: id_hex.clone(),
         kind: OperationKind::Benchmark,

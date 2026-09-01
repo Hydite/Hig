@@ -11,6 +11,7 @@ use hig_core::{
     resolve_project_cache_dir, run_daemon_server, stop_daemon,
 };
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
@@ -550,10 +551,26 @@ pub(crate) fn handle_session(command: SessionCommand) -> anyhow::Result<()> {
     match command {
         SessionCommand::Unlock {
             password,
+            password_stdin,
             cache_dir,
             ttl_secs,
             kdf_profile,
         } => {
+            let password = if password_stdin {
+                let mut value = String::new();
+                std::io::stdin()
+                    .take(64 * 1024 + 1)
+                    .read_to_string(&mut value)?;
+                anyhow::ensure!(value.len() <= 64 * 1024, "password exceeds stdin limit");
+                while value.ends_with(['\n', '\r']) {
+                    value.pop();
+                }
+                anyhow::ensure!(!value.is_empty(), "password from stdin is empty");
+                value
+            } else {
+                password
+                    .ok_or_else(|| anyhow::anyhow!("--password or --password-stdin is required"))?
+            };
             let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
             fs::create_dir_all(&cache_dir)?;
             let ttl_secs = default_session_ttl(ttl_secs);

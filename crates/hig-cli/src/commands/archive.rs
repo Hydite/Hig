@@ -10,6 +10,7 @@ use hig_core::{
     ManifestFormat, PackOptions, PayloadMemoryMode, PipelineOptions, ProjectMode, SolidMode,
     SpeedMode, UnpackOptions, bench, inspect_archive, migrate_archive, unpack,
 };
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
@@ -19,6 +20,8 @@ pub(crate) struct PackArgs {
     pub(crate) output: PathBuf,
     #[arg(long)]
     pub(crate) password: Option<String>,
+    #[arg(long, conflicts_with = "password")]
+    pub(crate) password_stdin: bool,
     #[arg(
         long,
         default_value = "password",
@@ -110,6 +113,8 @@ pub(crate) struct UnpackArgs {
     pub(crate) output_dir: PathBuf,
     #[arg(long)]
     pub(crate) password: Option<String>,
+    #[arg(long, conflicts_with = "password")]
+    pub(crate) password_stdin: bool,
     #[arg(long)]
     pub(crate) overwrite: bool,
 }
@@ -119,6 +124,8 @@ pub(crate) struct InspectArgs {
     pub(crate) archive_file: PathBuf,
     #[arg(long)]
     pub(crate) password: Option<String>,
+    #[arg(long, conflicts_with = "password")]
+    pub(crate) password_stdin: bool,
     #[arg(long)]
     pub(crate) json: bool,
 }
@@ -130,8 +137,12 @@ pub(crate) struct MigrateArgs {
     pub(crate) output: PathBuf,
     #[arg(long)]
     pub(crate) password: Option<String>,
+    #[arg(long, conflicts_with = "password")]
+    pub(crate) password_stdin: bool,
     #[arg(long)]
     pub(crate) target_password: Option<String>,
+    #[arg(long, conflicts_with = "target_password")]
+    pub(crate) target_password_stdin: bool,
     #[arg(long, default_value = "password")]
     pub(crate) encryption: EncryptionMode,
     #[arg(long)]
@@ -147,6 +158,8 @@ pub(crate) struct BenchArgs {
     pub(crate) output: PathBuf,
     #[arg(long)]
     pub(crate) password: Option<String>,
+    #[arg(long, conflicts_with = "password")]
+    pub(crate) password_stdin: bool,
     #[arg(
         long,
         default_value = "password",
@@ -232,17 +245,18 @@ pub(crate) struct BenchArgs {
 }
 
 pub(crate) fn handle_pack(args: PackArgs) -> anyhow::Result<()> {
+    let password = resolve_password(args.password, args.password_stdin, "password")?;
     let report_mode = ReportFlags {
         verbose: args.verbose,
         json: args.json,
         quiet: args.quiet,
     }
     .mode()?;
-    validate_pack_encryption_args(args.encryption, args.password.as_deref(), args.use_session)?;
+    validate_pack_encryption_args(args.encryption, password.as_deref(), args.use_session)?;
     let options = pack_options(
         args.input_dir,
         args.output,
-        args.password,
+        password,
         args.encryption,
         args.cache_dir,
         args.threads,
@@ -271,10 +285,11 @@ pub(crate) fn handle_pack(args: PackArgs) -> anyhow::Result<()> {
 }
 
 pub(crate) fn handle_unpack(args: UnpackArgs) -> anyhow::Result<()> {
+    let password = resolve_password(args.password, args.password_stdin, "password")?;
     unpack(UnpackOptions {
         archive_file: args.archive_file,
         output_dir: args.output_dir,
-        password: args.password,
+        password,
         overwrite: args.overwrite,
     })?;
     println!("unpack: ok");
@@ -282,7 +297,8 @@ pub(crate) fn handle_unpack(args: UnpackArgs) -> anyhow::Result<()> {
 }
 
 pub(crate) fn handle_inspect(args: InspectArgs) -> anyhow::Result<()> {
-    let inspection = inspect_archive(&args.archive_file, args.password.as_deref())?;
+    let password = resolve_password(args.password, args.password_stdin, "password")?;
+    let inspection = inspect_archive(&args.archive_file, password.as_deref())?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&inspection)?);
     } else {
@@ -308,15 +324,21 @@ pub(crate) fn handle_inspect(args: InspectArgs) -> anyhow::Result<()> {
 }
 
 pub(crate) fn handle_migrate(args: MigrateArgs) -> anyhow::Result<()> {
+    let password = resolve_password(args.password, args.password_stdin, "source password")?;
+    let target_password = resolve_password(
+        args.target_password,
+        args.target_password_stdin,
+        "target password",
+    )?;
     anyhow::ensure!(
-        args.encryption != EncryptionMode::None || args.target_password.is_none(),
+        args.encryption != EncryptionMode::None || target_password.is_none(),
         "--target-password cannot be used with --encryption none"
     );
     let report = migrate_archive(
         &args.source,
         &args.output,
-        args.password.as_deref(),
-        args.target_password.as_deref(),
+        password.as_deref(),
+        target_password.as_deref(),
         args.encryption,
         args.overwrite,
     )?;
@@ -339,9 +361,7 @@ pub(crate) fn handle_migrate(args: MigrateArgs) -> anyhow::Result<()> {
 }
 
 pub(crate) fn handle_bench(args: BenchArgs) -> anyhow::Result<()> {
-    let password = args
-        .password
-        .or_else(|| std::env::var("HIG_BENCH_PASSWORD").ok());
+    let password = resolve_password(args.password, args.password_stdin, "password")?;
     let report_mode = ReportFlags {
         verbose: args.verbose,
         json: args.json,
@@ -420,6 +440,24 @@ pub(crate) fn handle_bench(args: BenchArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn resolve_password(
+    direct: Option<String>,
+    from_stdin: bool,
+    label: &str,
+) -> anyhow::Result<Option<String>> {
+    if !from_stdin {
+        return Ok(direct);
+    }
+    let mut value = String::new();
+    io::stdin().take(64 * 1024 + 1).read_to_string(&mut value)?;
+    anyhow::ensure!(value.len() <= 64 * 1024, "{label} exceeds stdin limit");
+    while value.ends_with(['\n', '\r']) {
+        value.pop();
+    }
+    anyhow::ensure!(!value.is_empty(), "{label} from stdin is empty");
+    Ok(Some(value))
 }
 
 #[allow(clippy::too_many_arguments)]

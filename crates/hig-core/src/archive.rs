@@ -18,6 +18,7 @@ use crate::{
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +32,16 @@ const HEADER_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN + 8
 const HEADER_FLAG_PASSWORD: u32 = SALT_LEN as u32;
 const HEADER_FLAG_NONE: u32 = 0x8000_0000 | SALT_LEN as u32;
 const COMPACT_MANIFEST_MAGIC: &[u8; 4] = b"HCM1";
+const MAX_MANIFEST_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MANIFEST_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ARCHIVE_FILES: usize = 1_000_000;
+const MAX_ARCHIVE_BLOCKS: usize = 1_000_000;
+const MAX_ARCHIVE_PATH_BYTES: usize = 32 * 1024;
+const MAX_ARCHIVE_BLOCK_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_BLOCK_RAW_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_KDF_MEMORY_KIB: u32 = 256 * 1024;
+const MAX_ARCHIVE_KDF_TIME_COST: u32 = 10;
+const MAX_ARCHIVE_KDF_PARALLELISM: u32 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
@@ -879,7 +890,15 @@ pub fn inspect_archive(path: &Path, password: Option<&str>) -> anyhow::Result<Ar
     match &magic {
         MAGIC_V1 => {
             let header = read_header_after_magic(&mut archive, VERSION_V1)?;
-            let mut manifest_ciphertext = vec![0_u8; header.manifest_len as usize];
+            validate_archive_header(&header, archive_bytes)?;
+            let mut manifest_ciphertext = vec![
+                0_u8;
+                checked_archive_buffer_len(
+                    header.manifest_len,
+                    MAX_MANIFEST_PAYLOAD_BYTES,
+                    "manifest payload"
+                )?
+            ];
             archive.read_exact(&mut manifest_ciphertext)?;
             let key = crypto::derive_key(
                 password
@@ -891,6 +910,7 @@ pub fn inspect_archive(path: &Path, password: Option<&str>) -> anyhow::Result<Ar
             let manifest_plain =
                 crypto::decrypt(&key, &header.manifest_nonce, &manifest_ciphertext)?;
             let manifest: Manifest = bincode::deserialize(&manifest_plain)?;
+            validate_v1_manifest(&manifest, archive_bytes)?;
             let files = manifest
                 .files
                 .into_iter()
@@ -915,7 +935,15 @@ pub fn inspect_archive(path: &Path, password: Option<&str>) -> anyhow::Result<Ar
         }
         MAGIC_V2 => {
             let header = read_header_after_magic(&mut archive, VERSION_V2)?;
-            let mut manifest_payload = vec![0_u8; header.manifest_len as usize];
+            validate_archive_header(&header, archive_bytes)?;
+            let mut manifest_payload = vec![
+                0_u8;
+                checked_archive_buffer_len(
+                    header.manifest_len,
+                    MAX_MANIFEST_PAYLOAD_BYTES,
+                    "manifest payload"
+                )?
+            ];
             archive.read_exact(&mut manifest_payload)?;
             let key = match header.encryption {
                 EncryptionMode::Password => Some(crypto::derive_key(
@@ -933,9 +961,13 @@ pub fn inspect_archive(path: &Path, password: Option<&str>) -> anyhow::Result<Ar
                 &header.manifest_nonce,
                 &manifest_payload,
             )?;
-            let manifest_plain =
-                codec::decompress_unknown(Compression::Zstd, &manifest_compressed)?;
+            let manifest_plain = codec::decompress_unknown_bounded(
+                Compression::Zstd,
+                &manifest_compressed,
+                MAX_MANIFEST_DECODED_BYTES,
+            )?;
             let manifest = decode_v2_manifest(&manifest_plain)?;
+            validate_v2_manifest(&manifest, archive_bytes, header.manifest_len)?;
             let files = manifest
                 .files
                 .into_iter()
@@ -2342,7 +2374,16 @@ fn unpack_v1(
     control: &OperationControl,
 ) -> anyhow::Result<()> {
     let header = read_header_after_magic(&mut archive, VERSION_V1)?;
-    let mut manifest_ciphertext = vec![0_u8; header.manifest_len as usize];
+    let archive_bytes = archive.metadata()?.len();
+    validate_archive_header(&header, archive_bytes)?;
+    let mut manifest_ciphertext = vec![
+        0_u8;
+        checked_archive_buffer_len(
+            header.manifest_len,
+            MAX_MANIFEST_PAYLOAD_BYTES,
+            "manifest payload"
+        )?
+    ];
     archive.read_exact(&mut manifest_ciphertext)?;
     let key = crypto::derive_key(
         required_password(&options.password)?,
@@ -2351,6 +2392,7 @@ fn unpack_v1(
     )?;
     let manifest_plain = crypto::decrypt(&key, &header.manifest_nonce, &manifest_ciphertext)?;
     let manifest: Manifest = bincode::deserialize(&manifest_plain)?;
+    validate_v1_manifest(&manifest, archive_bytes)?;
 
     if options.output_dir.exists() && !options.output_dir.is_dir() {
         anyhow::bail!(
@@ -2380,7 +2422,14 @@ fn unpack_v1(
             .iter()
             .find(|block| block.block_id == file.block_id)
             .ok_or_else(|| anyhow::anyhow!("missing block for {}", file.relative_path))?;
-        let mut ciphertext = vec![0_u8; block.encrypted_size as usize];
+        let mut ciphertext = vec![
+            0_u8;
+            checked_archive_buffer_len(
+                block.encrypted_size,
+                MAX_ARCHIVE_BLOCK_PAYLOAD_BYTES,
+                "block payload",
+            )?
+        ];
         use std::io::{Seek, SeekFrom};
         archive.seek(SeekFrom::Start(block.archive_offset))?;
         archive.read_exact(&mut ciphertext)?;
@@ -2421,7 +2470,16 @@ fn unpack_v2(
     control: &OperationControl,
 ) -> anyhow::Result<()> {
     let header = read_header_after_magic(&mut archive, VERSION_V2)?;
-    let mut manifest_ciphertext = vec![0_u8; header.manifest_len as usize];
+    let archive_bytes = archive.metadata()?.len();
+    validate_archive_header(&header, archive_bytes)?;
+    let mut manifest_ciphertext = vec![
+        0_u8;
+        checked_archive_buffer_len(
+            header.manifest_len,
+            MAX_MANIFEST_PAYLOAD_BYTES,
+            "manifest payload"
+        )?
+    ];
     archive.read_exact(&mut manifest_ciphertext)?;
     let key = match header.encryption {
         EncryptionMode::Password => Some(crypto::derive_key(
@@ -2437,8 +2495,13 @@ fn unpack_v2(
         &header.manifest_nonce,
         &manifest_ciphertext,
     )?;
-    let manifest_plain = codec::decompress_unknown(Compression::Zstd, &manifest_compressed)?;
+    let manifest_plain = codec::decompress_unknown_bounded(
+        Compression::Zstd,
+        &manifest_compressed,
+        MAX_MANIFEST_DECODED_BYTES,
+    )?;
     let manifest = decode_v2_manifest(&manifest_plain)?;
+    validate_v2_manifest(&manifest, archive_bytes, header.manifest_len)?;
     let compact_hashes_omitted = manifest
         .files
         .iter()
@@ -2467,7 +2530,14 @@ fn unpack_v2(
     let mut raw_blocks = std::collections::BTreeMap::new();
     for block in &manifest.blocks {
         control.check_cancelled()?;
-        let mut ciphertext = vec![0_u8; block.encrypted_size as usize];
+        let mut ciphertext = vec![
+            0_u8;
+            checked_archive_buffer_len(
+                block.encrypted_size,
+                MAX_ARCHIVE_BLOCK_PAYLOAD_BYTES,
+                "block payload",
+            )?
+        ];
         archive.seek(SeekFrom::Start(next_block_offset))?;
         archive.read_exact(&mut ciphertext)?;
         next_block_offset += block.encrypted_size;
@@ -4051,6 +4121,218 @@ fn read_header_after_magic(
     })
 }
 
+fn validate_archive_header(header: &ArchiveHeader, archive_bytes: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        header.manifest_len <= MAX_MANIFEST_PAYLOAD_BYTES,
+        "manifest payload exceeds resource limit"
+    );
+    anyhow::ensure!(
+        (HEADER_FIXED_LEN as u64)
+            .checked_add(header.manifest_len)
+            .is_some_and(|end| end <= archive_bytes),
+        "manifest payload exceeds archive bounds"
+    );
+    if header.encryption == EncryptionMode::Password {
+        anyhow::ensure!(
+            header.kdf.memory_cost_kib > 0
+                && header.kdf.memory_cost_kib <= MAX_ARCHIVE_KDF_MEMORY_KIB
+                && header.kdf.time_cost > 0
+                && header.kdf.time_cost <= MAX_ARCHIVE_KDF_TIME_COST
+                && header.kdf.parallelism > 0
+                && header.kdf.parallelism <= MAX_ARCHIVE_KDF_PARALLELISM,
+            "archive key derivation parameters exceed the supported security profile"
+        );
+    }
+    Ok(())
+}
+
+fn checked_archive_buffer_len(value: u64, maximum: u64, label: &str) -> anyhow::Result<usize> {
+    anyhow::ensure!(value <= maximum, "{label} exceeds resource limit");
+    usize::try_from(value).map_err(|_| anyhow::anyhow!("{label} does not fit this platform"))
+}
+
+fn validate_v1_manifest(manifest: &Manifest, archive_bytes: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        manifest.version == VERSION_V1,
+        "invalid v1 manifest version"
+    );
+    validate_manifest_collection_sizes(manifest.files.len(), manifest.blocks.len())?;
+    validate_unique_archive_paths(
+        manifest
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str()),
+    )?;
+    let mut block_ids = BTreeSet::new();
+    for block in &manifest.blocks {
+        anyhow::ensure!(
+            block_ids.insert(block.block_id),
+            "duplicate archive block identity"
+        );
+        anyhow::ensure!(block.codec == "zstd", "unsupported archive block codec");
+        anyhow::ensure!(
+            block.encrypted_size <= MAX_ARCHIVE_BLOCK_PAYLOAD_BYTES
+                && block.original_size <= MAX_ARCHIVE_BLOCK_RAW_BYTES,
+            "archive block exceeds resource limit"
+        );
+        anyhow::ensure!(
+            block
+                .archive_offset
+                .checked_add(block.encrypted_size)
+                .is_some_and(|end| end <= archive_bytes),
+            "archive block exceeds archive bounds"
+        );
+    }
+    for file in &manifest.files {
+        let block = manifest
+            .blocks
+            .iter()
+            .find(|block| block.block_id == file.block_id)
+            .ok_or_else(|| anyhow::anyhow!("archive file references a missing block"))?;
+        anyhow::ensure!(
+            file.size == block.original_size,
+            "v1 archive file and block sizes disagree"
+        );
+    }
+    Ok(())
+}
+
+fn validate_v2_manifest(
+    manifest: &V2Manifest,
+    archive_bytes: u64,
+    manifest_len: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        manifest.version == VERSION_V2,
+        "invalid v2 manifest version"
+    );
+    validate_manifest_collection_sizes(manifest.files.len(), manifest.blocks.len())?;
+    validate_unique_archive_paths(
+        manifest
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str()),
+    )?;
+    let mut blocks = BTreeMap::new();
+    let mut payload_end = (HEADER_FIXED_LEN as u64)
+        .checked_add(manifest_len)
+        .ok_or_else(|| anyhow::anyhow!("archive payload offset overflow"))?;
+    for block in &manifest.blocks {
+        anyhow::ensure!(block.codec == "zstd", "unsupported archive block codec");
+        anyhow::ensure!(
+            block.encrypted_size <= MAX_ARCHIVE_BLOCK_PAYLOAD_BYTES
+                && block.raw_size <= MAX_ARCHIVE_BLOCK_RAW_BYTES,
+            "archive block exceeds resource limit"
+        );
+        payload_end = payload_end
+            .checked_add(block.encrypted_size)
+            .ok_or_else(|| anyhow::anyhow!("archive payload offset overflow"))?;
+        anyhow::ensure!(
+            payload_end <= archive_bytes,
+            "archive block exceeds archive bounds"
+        );
+        if let Some(existing_raw_size) = blocks.insert(block.block_id, block.raw_size) {
+            anyhow::ensure!(
+                existing_raw_size == block.raw_size,
+                "duplicate archive block identity has inconsistent raw size"
+            );
+        }
+    }
+    for file in &manifest.files {
+        validate_v2_file_layout(file, &blocks)?;
+    }
+    Ok(())
+}
+
+fn validate_manifest_collection_sizes(files: usize, blocks: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        files <= MAX_ARCHIVE_FILES,
+        "archive file count exceeds resource limit"
+    );
+    anyhow::ensure!(
+        blocks <= MAX_ARCHIVE_BLOCKS,
+        "archive block count exceeds resource limit"
+    );
+    Ok(())
+}
+
+fn validate_v2_file_layout(
+    file: &V2FileEntry,
+    blocks: &BTreeMap<[u8; 32], u64>,
+) -> anyhow::Result<()> {
+    match file.layout.as_ref() {
+        Some(FileLayout::Empty) => {
+            anyhow::ensure!(file.size == 0, "nonempty file uses empty layout")
+        }
+        Some(FileLayout::InlineBlock {
+            block_id,
+            offset,
+            len,
+        }) => {
+            let raw_size = blocks
+                .get(block_id)
+                .ok_or_else(|| anyhow::anyhow!("archive file references a missing block"))?;
+            anyhow::ensure!(*len == file.size, "inline file length mismatch");
+            anyhow::ensure!(
+                offset.checked_add(*len).is_some_and(|end| end <= *raw_size),
+                "inline file exceeds block bounds"
+            );
+        }
+        Some(FileLayout::Chunked { chunks }) => {
+            let mut ranges = chunks
+                .iter()
+                .map(|chunk| {
+                    let raw_size = blocks.get(&chunk.block_id).ok_or_else(|| {
+                        anyhow::anyhow!("archive chunk references a missing block")
+                    })?;
+                    anyhow::ensure!(*raw_size == chunk.len, "archive chunk length mismatch");
+                    let end = chunk
+                        .file_offset
+                        .checked_add(chunk.len)
+                        .ok_or_else(|| anyhow::anyhow!("archive chunk range overflow"))?;
+                    anyhow::ensure!(end <= file.size, "archive chunk exceeds file bounds");
+                    Ok((chunk.file_offset, end))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            ranges.sort_unstable();
+            let mut next = 0_u64;
+            for (start, end) in ranges {
+                anyhow::ensure!(start == next, "archive chunks overlap or leave a gap");
+                next = end;
+            }
+            anyhow::ensure!(next == file.size, "archive chunks do not cover the file");
+        }
+        None => {
+            let raw_size = blocks
+                .get(&file.block_id)
+                .ok_or_else(|| anyhow::anyhow!("archive file references a missing block"))?;
+            anyhow::ensure!(
+                file.block_len == file.size,
+                "archive file block length mismatch"
+            );
+            anyhow::ensure!(
+                file.block_offset
+                    .checked_add(file.block_len)
+                    .is_some_and(|end| end <= *raw_size),
+                "archive file exceeds block bounds"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_archive_paths<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<()> {
+    let mut targets = BTreeSet::new();
+    for path in paths {
+        let portable = portable_archive_path(path)?;
+        let key = archive_path_identity(&portable);
+        anyhow::ensure!(targets.insert(key), "duplicate archive path: {path}");
+    }
+    Ok(())
+}
+
 fn read_u32(mut reader: impl Read) -> anyhow::Result<u32> {
     let mut bytes = [0_u8; 4];
     reader.read_exact(&mut bytes)?;
@@ -4064,15 +4346,56 @@ fn read_u64(mut reader: impl Read) -> anyhow::Result<u64> {
 }
 
 fn checked_target(root: &Path, relative_path: &str) -> anyhow::Result<PathBuf> {
-    let relative = Path::new(relative_path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        anyhow::bail!("unsafe archive path: {relative_path}");
+    Ok(root.join(portable_archive_path(relative_path)?))
+}
+
+fn portable_archive_path(relative_path: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !relative_path.is_empty()
+            && relative_path.len() <= MAX_ARCHIVE_PATH_BYTES
+            && !relative_path.contains(['\\', '\0']),
+        "unsafe archive path: {relative_path}"
+    );
+    let mut portable = PathBuf::new();
+    for component in relative_path.split('/') {
+        anyhow::ensure!(
+            is_portable_archive_component(component),
+            "unsafe archive path: {relative_path}"
+        );
+        portable.push(component);
     }
-    Ok(root.join(relative))
+    Ok(portable)
+}
+
+fn is_portable_archive_component(component: &str) -> bool {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.contains(':')
+        || component.ends_with([' ', '.'])
+    {
+        return false;
+    }
+    let device = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .to_ascii_uppercase();
+    !matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !(device.len() == 4
+            && (device.starts_with("COM") || device.starts_with("LPT"))
+            && device.as_bytes()[3].is_ascii_digit()
+            && device.as_bytes()[3] != b'0')
+}
+
+fn archive_path_identity(path: &Path) -> String {
+    let value = path
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    #[cfg(windows)]
+    return value.to_ascii_lowercase();
+    #[cfg(not(windows))]
+    value
 }
 
 #[cfg(unix)]
@@ -4120,6 +4443,52 @@ mod tests {
         let bytes = bincode::serialize(&manifest).unwrap();
         let decoded: Manifest = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn portable_archive_paths_reject_roots_devices_and_aliases() {
+        for path in [
+            "",
+            "/absolute",
+            "../escape",
+            "nested/../escape",
+            "nested\\escape",
+            "C:drive",
+            "CON",
+            "nested/NUL.txt",
+            "trailing. ",
+            "double//separator",
+        ] {
+            assert!(portable_archive_path(path).is_err(), "accepted {path:?}");
+        }
+        assert_eq!(
+            portable_archive_path("nested/file.txt").unwrap(),
+            PathBuf::from("nested").join("file.txt")
+        );
+    }
+
+    #[test]
+    fn duplicate_archive_paths_are_rejected_before_extraction() {
+        let error = validate_unique_archive_paths(["same.txt", "same.txt"]).unwrap_err();
+        assert!(error.to_string().contains("duplicate archive path"));
+    }
+
+    #[test]
+    fn excessive_archive_kdf_cost_is_rejected_before_derivation() {
+        let header = ArchiveHeader {
+            version: VERSION_V2,
+            kdf: KdfParams {
+                memory_cost_kib: MAX_ARCHIVE_KDF_MEMORY_KIB + 1,
+                time_cost: 1,
+                parallelism: 1,
+            },
+            salt: [0; SALT_LEN],
+            manifest_nonce: [0; NONCE_LEN],
+            manifest_len: 1,
+            encryption: EncryptionMode::Password,
+        };
+        let error = validate_archive_header(&header, HEADER_FIXED_LEN as u64 + 1).unwrap_err();
+        assert!(error.to_string().contains("key derivation parameters"));
     }
 
     #[test]

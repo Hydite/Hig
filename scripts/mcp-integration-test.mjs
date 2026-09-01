@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { McpClient as IsolatedMcpClient } from "./lib/native-soak-runtime.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const server = process.env.HIG_MCP_SERVER
@@ -309,6 +310,22 @@ try {
   assert.equal(recoveryPromoted.data.schema, 1);
   assert.equal(recoveryPromoted.data.durability, "protected");
   assert.equal(recoveryPromoted.data.mirror_roots.length, 1);
+  const constrainedClient = await IsolatedMcpClient.start({
+    higBin,
+    mcpServer: server,
+    workspace,
+    allowedRoot: [workspace, recoveryVault].join(path.delimiter)
+  });
+  try {
+    const constrainedResponse = await constrainedClient.request("tools/call", {
+      name: "hig_recovery_gc",
+      arguments: { vaultRoot: recoveryVault }
+    });
+    assert.equal(constrainedResponse.result.isError, true);
+    assert.match(constrainedResponse.result.content[0].text, /outside allowed roots/i);
+  } finally {
+    await constrainedClient.close();
+  }
   const escapedPromotion = await tool("hig_recovery_promote", {
     vaultRoot: recoveryVault,
     mirrors: [path.join(escapeLink, "escaped-promotion")]

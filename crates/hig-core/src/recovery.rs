@@ -459,17 +459,38 @@ pub fn init_recovery_vault(
     secure_create_dir(&root.join("events"))?;
     secure_create_dir(&root.join("locks"))?;
     let _lock = lock_vault(&root)?;
+    let existing_config = if existed {
+        Some(load_vault_config(&root)?)
+    } else {
+        None
+    };
     let generation_before = if catalog_path(&root).exists() {
         enforce_private_file(&catalog_path(&root))?;
         Some(load_catalog(&root)?.generation)
     } else {
         None
     };
+    let effective_mirrors = match existing_config.as_ref() {
+        Some(config) if normalized_mirrors.is_empty() => config.mirror_roots.clone(),
+        _ => normalized_mirrors,
+    };
+    if let Some(config) = existing_config.as_ref()
+        && config.mirror_roots != effective_mirrors
+    {
+        let catalog = load_catalog(&root)?;
+        anyhow::ensure!(
+            catalog
+                .repositories
+                .values()
+                .all(|registration| registration.recovery_points.is_empty()),
+            "cannot change mirrors with recovery init after capture; use recovery promote so every existing point is replicated and verified"
+        );
+    }
     let details = BTreeMap::from([
         ("existing".to_string(), existed.to_string()),
         (
             "mirror_count".to_string(),
-            normalized_mirrors.len().to_string(),
+            effective_mirrors.len().to_string(),
         ),
     ]);
     run_audited(
@@ -480,8 +501,8 @@ pub fn init_recovery_vault(
         None,
         details,
         || {
-            initialize_vault_root(&root, normalized_mirrors.clone())?;
-            for mirror in &normalized_mirrors {
+            initialize_vault_root(&root, effective_mirrors.clone())?;
+            for mirror in &effective_mirrors {
                 initialize_mirror_vault_with_audit(mirror)?;
             }
             let generation_after = load_catalog(&root)?.generation;
@@ -490,7 +511,7 @@ pub fn init_recovery_vault(
                     schema: RECOVERY_REPORT_SCHEMA,
                     vault_root: root.display().to_string(),
                     created: !existed,
-                    mirror_roots: normalized_mirrors
+                    mirror_roots: effective_mirrors
                         .iter()
                         .map(|path| path.display().to_string())
                         .collect(),
@@ -675,7 +696,7 @@ pub fn capture_recovery_point(
             let primary = replicate_repository_revision(
                 &source_root,
                 revision,
-                &vault_repository_root(&root, source_config.repository_id),
+                &vault_repository_root(&root, source_config.repository_id)?,
                 &point_id,
             )?;
             anyhow::ensure!(
@@ -850,7 +871,7 @@ pub fn verify_recovery_point(
         point.commit_id.to_hex() == recovery_point_id,
         "recovery point identity mismatch"
     );
-    let repository_root = vault_repository_root(&root, id);
+    let repository_root = vault_repository_root(&root, id)?;
     let expected_tag = point
         .ref_name
         .strip_prefix("tags/")
@@ -883,6 +904,12 @@ pub fn restore_recovery_point(
     overwrite: bool,
 ) -> anyhow::Result<RecoveryRestoreReport> {
     let root = resolve_vault_root(requested_root)?;
+    let output_root = absolute_path(output_dir)?;
+    ensure_disjoint_roots(
+        &root,
+        &output_root,
+        "recovery Vault and restore output cannot contain each other",
+    )?;
     let id = parse_repository_id(repository_id)?;
     let _lock = lock_vault(&root)?;
     let catalog = load_catalog(&root)?;
@@ -918,7 +945,7 @@ pub fn restore_recovery_point(
             verify_recovery_point(Some(&root), repository_id, recovery_point_id)?;
             recovery_failpoint("restore_after_verification")?;
             let restore = restore_repository(
-                &vault_repository_root(&root, id),
+                &vault_repository_root(&root, id)?,
                 &point.ref_name,
                 output_dir,
                 selected_path,
@@ -1206,7 +1233,7 @@ pub fn gc_recovery_vault(
                         .get(repository_key)
                         .ok_or_else(|| anyhow::anyhow!("recovery repository missing"))?;
                     gc_repository_excluding_recovery_refs(
-                        &vault_repository_root(mirror, registration.repository_id),
+                        &vault_repository_root(mirror, registration.repository_id)?,
                         point_ids,
                         false,
                     )?;
@@ -1220,7 +1247,7 @@ pub fn gc_recovery_vault(
                     .get(repository_key)
                     .ok_or_else(|| anyhow::anyhow!("recovery repository missing"))?;
                 let report = gc_repository_excluding_recovery_refs(
-                    &vault_repository_root(&root, registration.repository_id),
+                    &vault_repository_root(&root, registration.repository_id)?,
                     point_ids,
                     false,
                 )?;
@@ -1353,9 +1380,9 @@ pub fn repair_recovery_point(
         || {
             verify_recovery_point(Some(&mirror), repository_id, recovery_point_id)?;
             let repaired = repair_repository_revision(
-                &vault_repository_root(&mirror, id),
+                &vault_repository_root(&mirror, id)?,
                 &mirror_point.ref_name,
-                &vault_repository_root(&root, id),
+                &vault_repository_root(&root, id)?,
                 recovery_point_id,
             )?;
             verify_recovery_point(Some(&root), repository_id, recovery_point_id)?;
@@ -1549,6 +1576,13 @@ fn synchronize_promoted_mirror(
         "promotion target is already configured as a primary Recovery Vault"
     );
     let mut mirror_catalog = load_catalog(mirror)?;
+    anyhow::ensure!(
+        mirror_catalog
+            .repositories
+            .keys()
+            .all(|key| source_catalog.repositories.contains_key(key)),
+        "promotion target contains an unrelated recovery repository"
+    );
     for (key, source_registration) in &source_catalog.repositories {
         if let Some(existing) = mirror_catalog.repositories.get(key) {
             validate_promotion_registration(existing, source_registration)?;
@@ -1579,9 +1613,9 @@ fn synchronize_promoted_mirror(
             for (key, source_registration) in &source_catalog.repositories {
                 for (point_id, point) in &source_registration.recovery_points {
                     let replicated = replicate_repository_revision(
-                        &vault_repository_root(source_root, source_registration.repository_id),
+                        &vault_repository_root(source_root, source_registration.repository_id)?,
                         &point.ref_name,
-                        &vault_repository_root(mirror, source_registration.repository_id),
+                        &vault_repository_root(mirror, source_registration.repository_id)?,
                         point_id,
                     )?;
                     anyhow::ensure!(
@@ -1673,7 +1707,7 @@ fn scrub_vault_location(root: &Path, primary: bool) -> RecoveryScrubLocationRepo
         let catalog = load_catalog(root)?;
         for registration in catalog.repositories.values() {
             report.checked_repositories += 1;
-            let repository_root = vault_repository_root(root, registration.repository_id);
+            let repository_root = vault_repository_root(root, registration.repository_id)?;
             let (_, repository_config) = repository_root_and_config(&repository_root)?;
             anyhow::ensure!(
                 repository_config.repository_id == registration.repository_id,
@@ -1870,7 +1904,7 @@ fn preview_gc_selection(
         reports.insert(
             repository_key.clone(),
             gc_repository_excluding_recovery_refs(
-                &vault_repository_root(root, registration.repository_id),
+                &vault_repository_root(root, registration.repository_id)?,
                 point_ids,
                 true,
             )?,
@@ -1890,7 +1924,16 @@ fn capture_mirror(
     ensure_separate_roots(source_root, mirror)?;
     ensure_mirror_vault_with_audit(mirror)?;
     let _lock = lock_vault(mirror)?;
+    let mirror_config = load_vault_config(mirror)?;
+    anyhow::ensure!(
+        mirror_config.mirror_roots.is_empty(),
+        "recovery mirror target is configured as a primary Recovery Vault"
+    );
     let mut catalog = load_catalog(mirror)?;
+    let key = hex::encode(registration.repository_id);
+    if let Some(existing) = catalog.repositories.get(&key) {
+        validate_promotion_registration(existing, registration)?;
+    }
     let generation_before = catalog.generation;
     let details = BTreeMap::from([("source_root".to_string(), source_root.display().to_string())]);
     run_audited(
@@ -1904,7 +1947,7 @@ fn capture_mirror(
             let report = replicate_repository_revision(
                 source_root,
                 revision,
-                &vault_repository_root(mirror, registration.repository_id),
+                &vault_repository_root(mirror, registration.repository_id)?,
                 point_id,
             )?;
             anyhow::ensure!(
@@ -1916,7 +1959,6 @@ fn capture_mirror(
                 "mirror reachable graph mismatch"
             );
             recovery_failpoint("capture_mirror_after_replication")?;
-            let key = hex::encode(registration.repository_id);
             let now = now_unix_ns();
             let mut mirrored_registration = registration.clone();
             let captured_unix_ns = mirrored_registration
@@ -2031,14 +2073,35 @@ fn normalize_mirror_roots(root: &Path, mirrors: Vec<PathBuf>) -> anyhow::Result<
             "recovery primary and mirror roots cannot contain each other"
         );
     }
+    validate_pairwise_disjoint_mirrors(&normalized)?;
     Ok(normalized)
 }
 
 fn ensure_separate_roots(source: &Path, vault: &Path) -> anyhow::Result<()> {
+    ensure_disjoint_roots(
+        source,
+        vault,
+        "recovery vault and source repository cannot contain each other",
+    )
+}
+
+fn ensure_disjoint_roots(left: &Path, right: &Path, message: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        !vault.starts_with(source) && !source.starts_with(vault),
-        "recovery vault and source repository cannot contain each other"
+        !right.starts_with(left) && !left.starts_with(right),
+        "{message}"
     );
+    Ok(())
+}
+
+fn validate_pairwise_disjoint_mirrors(mirrors: &[PathBuf]) -> anyhow::Result<()> {
+    for (index, mirror) in mirrors.iter().enumerate() {
+        for other in mirrors.iter().skip(index + 1) {
+            anyhow::ensure!(
+                !mirror.starts_with(other) && !other.starts_with(mirror),
+                "recovery mirror roots cannot contain each other"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2071,6 +2134,7 @@ fn validate_mirror_roots(root: &Path, mirrors: &[PathBuf]) -> anyhow::Result<()>
         }
         previous = Some(mirror);
     }
+    validate_pairwise_disjoint_mirrors(mirrors)?;
     Ok(())
 }
 
@@ -2343,8 +2407,21 @@ fn parse_repository_id(value: &str) -> anyhow::Result<[u8; 16]> {
         .map_err(|_| anyhow::anyhow!("recovery repository id must contain 16 bytes"))
 }
 
-fn vault_repository_root(root: &Path, repository_id: [u8; 16]) -> PathBuf {
-    root.join("repositories").join(hex::encode(repository_id))
+fn vault_repository_root(root: &Path, repository_id: [u8; 16]) -> anyhow::Result<PathBuf> {
+    ensure_physical_directory(root)?;
+    let repositories = root.join("repositories");
+    ensure_physical_directory(&repositories)?;
+    let repository = repositories.join(hex::encode(repository_id));
+    if repository.exists() {
+        ensure_physical_directory(&repository)?;
+        let physical_root = root.canonicalize()?;
+        let physical_repository = repository.canonicalize()?;
+        anyhow::ensure!(
+            physical_repository.starts_with(&physical_root),
+            "recovery repository resolves outside the Vault root"
+        );
+    }
+    Ok(repository)
 }
 
 fn vault_config_path(root: &Path) -> PathBuf {
@@ -2448,12 +2525,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 
 fn secure_create_dir(path: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(path)?;
+    ensure_physical_directory(path)?;
     let metadata = fs::symlink_metadata(path)?;
-    anyhow::ensure!(
-        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
-        "recovery private path is not a physical directory: {}",
-        path.display()
-    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2466,6 +2539,26 @@ fn secure_create_dir(path: &Path) -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     windows_owner_only::apply_and_verify(path)?;
+    Ok(())
+}
+
+fn ensure_physical_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "recovery private path is not a physical directory: {}",
+        path.display()
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        anyhow::ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "recovery private path is a reparse point: {}",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -2754,6 +2847,148 @@ mod tests {
         assert!(error.to_string().contains("not a physical file"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn vault_repository_directory_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let vault = temp.path().join("vault");
+        let external = temp.path().join("external-repository");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), "protected").unwrap();
+        let initialized = init_repository(&source, Vec::new()).unwrap();
+        snapshot_repository(&source, "baseline".into(), None).unwrap();
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        let captured = capture_recovery_point(&source, "HEAD", Some(&vault)).unwrap();
+        let repository = vault_repository_root(&vault, initialized.repository_id).unwrap();
+        fs::rename(&repository, &external).unwrap();
+        symlink(&external, &repository).unwrap();
+
+        let error = verify_recovery_point(
+            Some(&vault),
+            &hex::encode(initialized.repository_id),
+            &captured.recovery_point.recovery_point_id,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not a physical directory"));
+        assert!(external.join(".hig/repository/config.json").is_file());
+    }
+
+    #[test]
+    fn nested_mirror_roots_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let mirror = temp.path().join("mirror");
+        let nested = mirror.join("nested");
+
+        let error = init_recovery_vault(Some(&primary), vec![mirror, nested]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("recovery mirror roots cannot contain each other")
+        );
+    }
+
+    #[test]
+    fn init_cannot_replace_mirrors_after_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let primary = temp.path().join("primary");
+        let first_mirror = temp.path().join("first-mirror");
+        let replacement = temp.path().join("replacement");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), "protected").unwrap();
+        init_repository(&source, Vec::new()).unwrap();
+        snapshot_repository(&source, "baseline".into(), None).unwrap();
+        init_recovery_vault(Some(&primary), vec![first_mirror.clone()]).unwrap();
+        capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
+
+        let error = init_recovery_vault(Some(&primary), vec![replacement]).unwrap_err();
+        assert!(error.to_string().contains("use recovery promote"));
+        assert_eq!(
+            recovery_vault_config(Some(&primary)).unwrap().mirror_roots,
+            vec![first_mirror.canonicalize().unwrap()]
+        );
+        let status = recovery_vault_status(Some(&primary)).unwrap();
+        assert_eq!(status.protected_points, 1);
+        assert_eq!(status.durability_lag_points, 0);
+    }
+
+    #[test]
+    fn restore_rejects_output_overlapping_the_vault() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let vault = temp.path().join("vault");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), "recoverable").unwrap();
+        let initialized = init_repository(&source, Vec::new()).unwrap();
+        snapshot_repository(&source, "baseline".into(), None).unwrap();
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        let captured = capture_recovery_point(&source, "HEAD", Some(&vault)).unwrap();
+        let repository_id = hex::encode(initialized.repository_id);
+
+        for output in [&vault, temp.path()] {
+            let error = restore_recovery_point(
+                Some(&vault),
+                &repository_id,
+                &captured.recovery_point.recovery_point_id,
+                output,
+                None,
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("restore output cannot contain each other")
+            );
+        }
+        assert!(
+            verify_recovery_point(
+                Some(&vault),
+                &repository_id,
+                &captured.recovery_point.recovery_point_id
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn capture_rejects_a_primary_vault_as_a_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let primary = temp.path().join("primary");
+        let other_primary = temp.path().join("other-primary");
+        let other_mirror = temp.path().join("other-mirror");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), "protected").unwrap();
+        init_repository(&source, Vec::new()).unwrap();
+        snapshot_repository(&source, "baseline".into(), None).unwrap();
+        init_recovery_vault(Some(&other_primary), vec![other_mirror]).unwrap();
+        init_recovery_vault(Some(&primary), vec![other_primary.clone()]).unwrap();
+
+        let captured = capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
+        assert_eq!(
+            captured.recovery_point.durability,
+            RecoveryDurability::Degraded
+        );
+        assert_eq!(captured.recovery_point.replicas.len(), 1);
+        assert!(
+            captured.recovery_point.replicas[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("configured as a primary"))
+        );
+        assert_eq!(
+            recovery_vault_status(Some(&other_primary))
+                .unwrap()
+                .recovery_points,
+            0
+        );
+    }
+
     #[test]
     fn audit_log_records_committed_recovery_operations_with_generations() {
         let temp = tempfile::tempdir().unwrap();
@@ -3039,6 +3274,36 @@ mod tests {
     }
 
     #[test]
+    fn promotion_rejects_target_only_repository_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_a = temp.path().join("source-a");
+        let source_b = temp.path().join("source-b");
+        let source_primary = temp.path().join("source-primary");
+        let survivor = temp.path().join("survivor");
+        let unrelated_target = temp.path().join("unrelated-target");
+        for (source, content) in [(&source_a, "a"), (&source_b, "b")] {
+            fs::create_dir_all(source).unwrap();
+            fs::write(source.join("file.txt"), content).unwrap();
+            init_repository(source, Vec::new()).unwrap();
+            snapshot_repository(source, "baseline".into(), None).unwrap();
+        }
+
+        init_recovery_vault(Some(&source_primary), vec![survivor.clone()]).unwrap();
+        capture_recovery_point(&source_a, "HEAD", Some(&source_primary)).unwrap();
+        init_recovery_vault(Some(&unrelated_target), Vec::new()).unwrap();
+        capture_recovery_point(&source_b, "HEAD", Some(&unrelated_target)).unwrap();
+
+        let error = promote_recovery_vault(Some(&survivor), vec![unrelated_target]).unwrap_err();
+        assert!(error.to_string().contains("unrelated recovery repository"));
+        assert_eq!(
+            recovery_vault_status(Some(&survivor))
+                .unwrap()
+                .protected_points,
+            0
+        );
+    }
+
+    #[test]
     fn catalog_checksum_corruption_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let vault = temp.path().join("vault");
@@ -3075,6 +3340,7 @@ mod tests {
         snapshot_repository(&source, "baseline".into(), None).unwrap();
         let capture = capture_recovery_point(&source, "HEAD", Some(&vault)).unwrap();
         let recovery_ref = vault_repository_root(&vault, initialized.repository_id)
+            .unwrap()
             .join(".hig/repository/refs/tags/recovery")
             .join(&capture.recovery_point.recovery_point_id);
         fs::remove_file(recovery_ref).unwrap();
@@ -3322,6 +3588,7 @@ mod tests {
         let capture = capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
         let repository_id = hex::encode(initialized.repository_id);
         let objects = vault_repository_root(&primary, initialized.repository_id)
+            .unwrap()
             .join(".hig/repository/objects");
         let object = walkdir::WalkDir::new(&objects)
             .into_iter()

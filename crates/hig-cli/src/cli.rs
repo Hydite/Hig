@@ -123,7 +123,9 @@ enum Command {
 pub(crate) enum SessionCommand {
     Unlock {
         #[arg(long)]
-        password: String,
+        password: Option<String>,
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
         #[arg(long)]
         cache_dir: Option<PathBuf>,
         #[arg(long)]
