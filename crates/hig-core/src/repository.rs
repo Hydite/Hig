@@ -3645,7 +3645,7 @@ fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyh
     )
     .context("failed to restore file access control")?;
     anyhow::ensure!(
-        metadata_permissions(&fs::metadata(path)?) == state.object.permissions,
+        destination_permissions_match(&fs::metadata(path)?, state.object.permissions),
         "restored file permissions changed while applying ACL"
     );
     Ok(())
@@ -6267,10 +6267,30 @@ fn set_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
     #[cfg(not(unix))]
     {
         let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_readonly(mode != 0);
+        permissions.set_readonly(destination_readonly(mode));
         fs::set_permissions(path, permissions)?;
     }
     Ok(())
+}
+
+fn destination_permissions_match(metadata: &fs::Metadata, mode: u32) -> bool {
+    #[cfg(unix)]
+    {
+        metadata_permissions(metadata) == mode
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.permissions().readonly() == destination_readonly(mode)
+    }
+}
+
+#[cfg(not(unix))]
+fn destination_readonly(mode: u32) -> bool {
+    if mode <= 1 {
+        mode == 1
+    } else {
+        mode & 0o222 == 0
+    }
 }
 
 fn set_file_modified_time(file: &File, unix_ns: i128) -> anyhow::Result<()> {
@@ -6294,7 +6314,7 @@ fn set_directory_metadata(
         metadata.access_control.as_ref(),
     )?;
     anyhow::ensure!(
-        metadata_permissions(&fs::metadata(path)?) == metadata.permissions,
+        destination_permissions_match(&fs::metadata(path)?, metadata.permissions),
         "restored directory permissions changed while applying ACL"
     );
     set_directory_modified_time(path, metadata.mtime_ns)
@@ -6643,6 +6663,15 @@ mod tests {
         {
             0
         }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn posix_permissions_map_deterministically_to_readonly_destinations() {
+        assert!(!destination_readonly(0));
+        assert!(destination_readonly(1));
+        assert!(!destination_readonly(0o100644));
+        assert!(destination_readonly(0o100444));
     }
 
     #[test]
