@@ -7,10 +7,10 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const archive = path.resolve(process.argv[2] || "");
-if (!archive || !fs.statSync(archive).isFile()) throw new Error("archive path is required");
+const archiveBytes = readRegularFile(archive);
 const checksum = `${archive}.sha256`;
 const expected = fs.readFileSync(checksum, "utf8").trim().split(/\s+/)[0];
-const actual = createHash("sha256").update(fs.readFileSync(archive)).digest("hex");
+const actual = createHash("sha256").update(archiveBytes).digest("hex");
 if (actual !== expected) throw new Error(`checksum mismatch: expected ${expected}, got ${actual}`);
 
 const archiveDir = path.dirname(archive);
@@ -31,6 +31,17 @@ run(process.execPath, [path.join(root, "scripts", "mcp-integration-test.mjs")], 
   env: { ...process.env, HIG_BIN: binary, HIG_MCP_SERVER: server }
 });
 console.log(`hig-ide-package: PASS ${path.basename(archive)} sha256=${actual}`);
+
+function readRegularFile(file) {
+  const descriptor = fs.openSync(file, "r");
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || stat.size === 0) throw new Error("archive path is required");
+    return fs.readFileSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {

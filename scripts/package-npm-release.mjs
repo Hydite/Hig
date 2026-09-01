@@ -77,9 +77,17 @@ function stageMainPackage(destination) {
 }
 
 function assertBinary(file, specification) {
-  const stat = fs.statSync(file);
-  if (!stat.isFile() || stat.size === 0) throw new Error(`invalid native binary: ${file}`);
-  const header = fs.readFileSync(file).subarray(0, 4);
+  const descriptor = fs.openSync(file, "r");
+  let header;
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || stat.size < 4) throw new Error(`invalid native binary: ${file}`);
+    header = Buffer.alloc(4);
+    const bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
+    if (bytesRead !== header.length) throw new Error(`truncated native binary: ${file}`);
+  } finally {
+    fs.closeSync(descriptor);
+  }
   const hex = header.toString("hex");
   if (specification.format === "elf" && hex !== "7f454c46") {
     throw new Error(`expected ELF binary for ${platform}, got ${hex}`);
@@ -146,13 +154,16 @@ function platformSpecification(value) {
 }
 
 function parseArgs(values) {
-  const parsed = {};
+  const allowed = new Set(["binary", "platform", "output-dir", "version"]);
+  const parsed = Object.create(null);
   for (let index = 0; index < values.length; index += 2) {
     const flag = values[index];
     if (!flag?.startsWith("--") || values[index + 1] === undefined) {
       throw new Error(`invalid argument sequence near ${flag || "end"}`);
     }
-    parsed[flag.slice(2)] = values[index + 1];
+    const key = flag.slice(2);
+    if (!allowed.has(key)) throw new Error(`unsupported argument: --${key}`);
+    parsed[key] = values[index + 1];
   }
   return parsed;
 }

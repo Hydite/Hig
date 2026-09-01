@@ -68,13 +68,16 @@ function delay(milliseconds) {
 }
 
 function parseArgs(values) {
-  const parsed = {};
+  const allowed = new Set(["tarball", "package", "version"]);
+  const parsed = Object.create(null);
   for (let index = 0; index < values.length; index += 2) {
     const flag = values[index];
     if (!flag?.startsWith("--") || values[index + 1] === undefined) {
       throw new Error(`invalid argument sequence near ${flag || "end"}`);
     }
-    parsed[flag.slice(2)] = values[index + 1];
+    const key = flag.slice(2);
+    if (!allowed.has(key)) throw new Error(`unsupported argument: --${key}`);
+    parsed[key] = values[index + 1];
   }
   return parsed;
 }

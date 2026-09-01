@@ -12,13 +12,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const packageRoot = path.resolve(__dirname, "..");
 
-const MAX_OUTPUT_BYTES = positiveIntegerEnv("HIG_MCP_MAX_OUTPUT_BYTES", 1_000_000);
-const DEFAULT_TIMEOUT_MS = positiveIntegerEnv("HIG_MCP_TIMEOUT_MS", 20 * 60 * 1000);
-const MAX_REQUEST_BYTES = positiveIntegerEnv("HIG_MCP_MAX_REQUEST_BYTES", 4 * 1024 * 1024);
-const MAX_HEADER_BYTES = positiveIntegerEnv("HIG_MCP_MAX_HEADER_BYTES", 16 * 1024);
-const MAX_INFLIGHT_TOOLS = positiveIntegerEnv("HIG_MCP_MAX_INFLIGHT_TOOLS", 4);
-const MAX_QUEUED_TOOLS = positiveIntegerEnv("HIG_MCP_MAX_QUEUED_TOOLS", 32);
-const MAX_REPOSITORY_WATCHERS = positiveIntegerEnv("HIG_MCP_MAX_REPOSITORY_WATCHERS", 8);
+const MAX_OUTPUT_BYTES = positiveIntegerEnv("HIG_MCP_MAX_OUTPUT_BYTES", 1_000_000, 64 * 1024 * 1024);
+const DEFAULT_TIMEOUT_MS = positiveIntegerEnv("HIG_MCP_TIMEOUT_MS", 20 * 60 * 1000, 24 * 60 * 60 * 1000);
+const MAX_REQUEST_BYTES = positiveIntegerEnv("HIG_MCP_MAX_REQUEST_BYTES", 4 * 1024 * 1024, 64 * 1024 * 1024);
+const MAX_HEADER_BYTES = positiveIntegerEnv("HIG_MCP_MAX_HEADER_BYTES", 16 * 1024, 1024 * 1024);
+const MAX_INFLIGHT_TOOLS = positiveIntegerEnv("HIG_MCP_MAX_INFLIGHT_TOOLS", 4, 128);
+const MAX_QUEUED_TOOLS = positiveIntegerEnv("HIG_MCP_MAX_QUEUED_TOOLS", 32, 4096);
+const MAX_REPOSITORY_WATCHERS = positiveIntegerEnv("HIG_MCP_MAX_REPOSITORY_WATCHERS", 8, 256);
 const allowAnyPath = process.env.HIG_MCP_ALLOW_ANY_PATH === "1";
 const allowGlobalRecovery = process.env.HIG_MCP_ALLOW_GLOBAL_RECOVERY === "1";
 const allowedRoots = computeAllowedRoots();
@@ -998,7 +998,7 @@ async function callTool(name, args) {
         "--json"
       ], { parseJson: true });
     case "hig_bench":
-      return runHig(buildBenchArgs(args), { parseJson: true, stdin: secretInputOptional(args.password), timeoutMs: positiveIntegerEnv("HIG_MCP_BENCH_TIMEOUT_MS", 60 * 60 * 1000) });
+      return runHig(buildBenchArgs(args), { parseJson: true, stdin: secretInputOptional(args.password), timeoutMs: positiveIntegerEnv("HIG_MCP_BENCH_TIMEOUT_MS", 60 * 60 * 1000, 24 * 60 * 60 * 1000) });
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -1501,12 +1501,12 @@ async function shutdown(exitCode) {
   process.exit(exitCode);
 }
 
-function positiveIntegerEnv(name, fallback) {
+function positiveIntegerEnv(name, fallback, maximum) {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
   const value = Number(raw);
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive safe integer`);
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw new Error(`${name} must be a positive safe integer <= ${maximum}`);
   }
   return value;
 }

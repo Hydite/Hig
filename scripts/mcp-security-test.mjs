@@ -63,6 +63,15 @@ async function rejectsOversizedFrame() {
   assert.match(stderr, /Content-Length exceeds the configured limit/);
 }
 
+async function rejectsExcessiveResourceLimit() {
+  const child = startServer({ HIG_MCP_MAX_OUTPUT_BYTES: String(64 * 1024 * 1024 + 1) });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+  const result = await waitForExit(child, 5000);
+  assert.equal(result.code, 1, `excessive resource limit exit: ${JSON.stringify(result)}`);
+  assert.match(stderr, /HIG_MCP_MAX_OUTPUT_BYTES must be a positive safe integer <= 67108864/);
+}
+
 async function keepsSecretsOutOfArguments() {
   fs.rmSync(capture, { force: true });
   const client = new McpClient(startServer({ HIG_TEST_CAPTURE: capture }));
@@ -267,6 +276,7 @@ function waitForExit(child, timeoutMs) {
 
 try {
   await rejectsOversizedFrame();
+  await rejectsExcessiveResourceLimit();
   await keepsSecretsOutOfArguments();
   await boundsConcurrentProcesses();
   await boundsQueuedCalls();
