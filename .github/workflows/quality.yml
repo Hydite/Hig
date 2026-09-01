@@ -47,6 +47,10 @@ jobs:
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
         run: bash scripts/verify-golden-fixtures.sh
+      - name: Recovery Vault operator drill
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release/hig
+        run: node scripts/recovery-vault-runbook-test.mjs
       - name: MCP protocol and constrained workflow
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
@@ -137,6 +141,11 @@ jobs:
         env:
           HIG_BIN: ${{ matrix.binary }}
         run: bash scripts/verify-golden-fixtures.sh
+      - name: Native Recovery Vault operator drill
+        shell: bash
+        env:
+          HIG_BIN: ${{ matrix.binary }}
+        run: node scripts/recovery-vault-runbook-test.mjs
       - name: Assemble native IDE/MCP package
         shell: bash
         run: node scripts/package-ide-mcp.mjs --binary "${{ matrix.binary }}" --platform "${{ matrix.platform }}" --output-dir artifacts/ci
@@ -191,6 +200,10 @@ jobs:
         env:
           HIG_BIN: ${{ github.workspace }}/target/release-universal/hig
         run: bash scripts/verify-golden-fixtures.sh
+      - name: Universal Recovery Vault operator drill
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release-universal/hig
+        run: node scripts/recovery-vault-runbook-test.mjs
       - name: Verify extracted universal package
         run: node scripts/verify-ide-package.mjs artifacts/ci/hig-v1.10.0-ide-mcp-macos-universal.tar.gz
       - name: Assemble universal npm packages

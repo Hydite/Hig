@@ -38,7 +38,7 @@ excluded from this release.
 The macOS app is signed with the locally available Apple Development identity. It is **not notarized** because Developer ID notarization credentials are not configured for this build.
 
 The macOS, Linux, and Windows IDE packages bundle the platform-native CLI with
-the constrained 50-tool Node.js MCP stdio adapter. They were built and tested
+the constrained 67-tool Node.js MCP stdio adapter. They were built and tested
 natively by GitHub Actions run `31737147626` from commit `361e6ce2`. The Linux
 package targets Ubuntu 24.04 x86_64/glibc, the macOS package contains a
 universal arm64/x86_64 CLI, and the Windows package targets x86_64 MSVC.
@@ -148,6 +148,10 @@ hig repo verify <project> --json
 See [docs/ide/hig-cli-tools.md](docs/ide/hig-cli-tools.md) for the complete
 CLI/MCP interface and [docs/spec/hig-format-v2.md](docs/spec/hig-format-v2.md)
 for the public archive format specification.
+
+Recovery Vault setup, source-loss restore, primary-loss promotion, repair, and
+retention procedures are defined in
+[docs/operations/recovery-vault-runbook.md](docs/operations/recovery-vault-runbook.md).
 
 ## Benchmark Interpretation
 

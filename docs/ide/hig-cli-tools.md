@@ -71,6 +71,19 @@ hig repo restore-symbol /path/to/project --revision <commit> --symbol 'Thing::me
 hig repo watch /path/to/project --debounce-ms 750 --json
 hig repo verify /path/to/project
 hig repo gc /path/to/project
+
+hig recovery init --vault-root /path/to/vault --mirror /path/to/mirror --json
+hig recovery register /path/to/project --vault-root /path/to/vault --json
+hig recovery capture /path/to/project --vault-root /path/to/vault --json
+hig recovery list --vault-root /path/to/vault --json
+hig recovery status --vault-root /path/to/vault --json
+hig recovery audit --vault-root /path/to/vault --json
+hig recovery verify <repository-id> <recovery-point-id> --vault-root /path/to/vault --json
+hig recovery restore <repository-id> <recovery-point-id> --vault-root /path/to/vault -d /path/to/restored --json
+hig recovery scrub --vault-root /path/to/vault --json
+hig recovery repair <repository-id> <recovery-point-id> --vault-root /path/to/vault --mirror /path/to/mirror --json
+hig recovery promote --vault-root /path/to/survivor --mirror /path/to/replacement --json
+hig recovery gc --vault-root /path/to/vault --json
 ```
 
 `hig init` configures the mutable daemon/project acceleration snapshot. `hig
@@ -83,6 +96,14 @@ and is encoding-independent. `repo storage-tree` additionally reports the
 committed compression tree and, when available, its project/cache provenance.
 Function and symbol lookup use the committed Phase 3 semantic index; restore
 returns the exact source bytes from the file/chunk DAG.
+
+Recovery Vault is an independent global durability layer. A completed capture
+copies and verifies the complete immutable object graph outside the workspace.
+It can restore after the source workspace is deleted; a verified mirror can be
+promoted after primary Vault loss without the source. Recovery GC is report-only
+unless `--apply` is explicit. See the
+[operator runbook](../operations/recovery-vault-runbook.md) before configuring
+production retention or disaster recovery.
 
 Repository references use the following model:
 
@@ -182,12 +203,34 @@ unrestricted shell boundary.
 | `hig_repo_restore_symbol` | restore historical function bytes |
 | `hig_repo_verify` | verify reachable history objects |
 | `hig_repo_gc` | preview/apply repository GC |
+| `hig_recovery_init` | initialize a Vault and independent mirrors |
+| `hig_recovery_register` | bind stable repository identity and source history |
+| `hig_recovery_capture` | verify and publish a complete recovery point |
+| `hig_recovery_list` | discover repositories and points without a workspace |
+| `hig_recovery_status` | report RPO, durability, mirror, and audit lag |
+| `hig_recovery_promote` | promote a verified survivor and create replacement mirrors |
+| `hig_recovery_audit` | validate mutation and interruption history |
+| `hig_recovery_pin` | protect a recovery point from retention GC |
+| `hig_recovery_unpin` | remove an explicit recovery pin |
+| `hig_recovery_tombstone` | record deletion without removing recovery bytes |
+| `hig_recovery_policy_show` | inspect versioned retention policy |
+| `hig_recovery_policy_set` | update validated retention and quota limits |
+| `hig_recovery_gc` | preview/apply protected mirror-first GC |
+| `hig_recovery_scrub` | verify control data, refs, audit, and reachable objects |
+| `hig_recovery_repair` | repair primary objects from a verified configured mirror |
+| `hig_recovery_verify` | verify one published recovery graph |
+| `hig_recovery_restore` | restore exact bytes with source absent |
 | `hig_bench` | benchmark diagnostics |
 
 ## Security Defaults
 
-- The adapter restricts paths to `HIG_MCP_ALLOWED_ROOTS`.
+- The adapter restricts both lexical and resolved physical paths to
+  `HIG_MCP_ALLOWED_ROOTS`; symlink escapes are rejected.
 - It does not expose arbitrary shell execution.
 - It does not persist passwords.
+- Destructive and overwrite flags require actual JSON booleans. GC remains
+  report-only and restore remains no-overwrite unless explicit `true` is used.
+- Recovery operations require `vaultRoot` unless
+  `HIG_MCP_ALLOW_GLOBAL_RECOVERY=1` is explicitly configured.
 - It supports session-based packing so IDE agents can avoid repeatedly passing passwords.
 - `hig_bench` is intentionally exposed but should only be used when the user asks for benchmark work.
