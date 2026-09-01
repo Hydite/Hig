@@ -917,7 +917,7 @@ pub struct RepositoryWatcher {
     debounce: Duration,
     reconciliation_interval: Duration,
     receiver: Receiver<notify::Result<Event>>,
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
     pending: bool,
     last_event: Option<Instant>,
     last_snapshot: Instant,
@@ -947,17 +947,13 @@ impl RepositoryWatcher {
         );
         let repository = Repository::discover(start)?;
         let root = repository.root.clone();
-        let (sender, receiver) = channel();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = sender.send(event);
-        })?;
-        watcher.watch(&root, RecursiveMode::Recursive)?;
+        let (receiver, watcher) = start_repository_watcher_backend(&root)?;
         Ok(Self {
             root,
             debounce,
             reconciliation_interval,
             receiver,
-            _watcher: watcher,
+            watcher,
             pending: false,
             last_event: None,
             last_snapshot: Instant::now(),
@@ -994,7 +990,11 @@ impl RepositoryWatcher {
                 Ok(Err(error)) => self.recover_backend_error(error),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    anyhow::bail!("repository watcher disconnected")
+                    eprintln!(
+                        "repository watcher disconnected; restarting native backend and forcing authoritative reconciliation"
+                    );
+                    self.restart_backend()?;
+                    break;
                 }
             }
         }
@@ -1017,6 +1017,18 @@ impl RepositoryWatcher {
         eprintln!(
             "repository watcher backend error; forcing authoritative reconciliation: {error}"
         );
+        self.force_authoritative_reconciliation();
+    }
+
+    fn restart_backend(&mut self) -> anyhow::Result<()> {
+        let (receiver, watcher) = start_repository_watcher_backend(&self.root)?;
+        self.receiver = receiver;
+        self.watcher = watcher;
+        self.force_authoritative_reconciliation();
+        Ok(())
+    }
+
+    fn force_authoritative_reconciliation(&mut self) {
         self.pending = true;
         let now = Instant::now();
         self.last_event = Some(now.checked_sub(self.debounce).unwrap_or(now));
@@ -1032,6 +1044,17 @@ impl RepositoryWatcher {
         self.last_snapshot = Instant::now();
         report.map(Some)
     }
+}
+
+fn start_repository_watcher_backend(
+    root: &Path,
+) -> anyhow::Result<(Receiver<notify::Result<Event>>, RecommendedWatcher)> {
+    let (sender, receiver) = channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = sender.send(event);
+    })?;
+    watcher.watch(root, RecursiveMode::Recursive)?;
+    Ok((receiver, watcher))
 }
 
 pub fn init_repository(root: &Path, excludes: Vec<String>) -> anyhow::Result<RepositoryInitReport> {
@@ -8361,6 +8384,35 @@ mod tests {
             .poll("backend recovery", Some("watcher"))
             .unwrap()
             .expect("backend recovery did not reconcile immediately");
+        assert!(second.created);
+        assert_eq!(second.parent_id, Some(first.commit_id));
+        assert_eq!(repository_log(temp.path(), 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn watcher_restarts_a_disconnected_backend_and_reconciles() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("watched.txt"), b"first").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "first".to_string(), None).unwrap();
+
+        fs::write(
+            temp.path().join("watched.txt"),
+            b"changed before disconnect",
+        )
+        .unwrap();
+        let mut watcher = RepositoryWatcher::start_with_reconciliation_interval(
+            temp.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        watcher.receiver = channel::<notify::Result<Event>>().1;
+
+        let second = watcher
+            .poll("disconnect recovery", Some("watcher"))
+            .unwrap()
+            .expect("disconnected watcher did not reconcile immediately");
         assert!(second.created);
         assert_eq!(second.parent_id, Some(first.commit_id));
         assert_eq!(repository_log(temp.path(), 10).unwrap().len(), 2);

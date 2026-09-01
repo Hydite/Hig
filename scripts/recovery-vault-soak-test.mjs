@@ -275,6 +275,7 @@ async function waitForWatcherSnapshot(client) {
 
 function watcherDiagnostics(status) {
   const data = status.data;
+  const stderr = typeof status.stderr === "string" ? status.stderr : data.stderr;
   return JSON.stringify({
     active: data.active,
     snapshots: data.snapshots,
@@ -282,7 +283,7 @@ function watcherDiagnostics(status) {
     signal: data.signal,
     recovery_last_success_at: data.recovery_last_success_at,
     recovery_rpo_lag_ms: data.recovery_rpo_lag_ms,
-    stderr: typeof data.stderr === "string" ? data.stderr.slice(-8192) : data.stderr,
+    stderr: typeof stderr === "string" ? stderr.slice(-8192) : stderr,
   });
 }
 
