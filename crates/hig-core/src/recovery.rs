@@ -33,6 +33,7 @@ use audit::{atomic_write_new, begin_audit};
 const VAULT_SCHEMA: u16 = 1;
 const CATALOG_SCHEMA: u16 = 1;
 const DOCUMENT_SCHEMA: u16 = 1;
+const RECOVERY_REPORT_SCHEMA: u16 = 1;
 
 #[cfg(not(test))]
 #[inline]
@@ -246,6 +247,7 @@ struct CheckedDocument<T> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryVaultInitReport {
+    pub schema: u16,
     pub vault_root: String,
     pub created: bool,
     pub mirror_roots: Vec<String>,
@@ -253,6 +255,7 @@ pub struct RecoveryVaultInitReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryRegistrationReport {
+    pub schema: u16,
     pub vault_root: String,
     pub repository_id: [u8; 16],
     pub registration_id: [u8; 16],
@@ -262,6 +265,7 @@ pub struct RecoveryRegistrationReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryCaptureReport {
+    pub schema: u16,
     pub vault_root: String,
     pub repository_id: [u8; 16],
     pub recovery_point: RecoveryPoint,
@@ -270,6 +274,7 @@ pub struct RecoveryCaptureReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryVaultListReport {
+    pub schema: u16,
     pub vault_root: String,
     pub generation: u64,
     pub repositories: Vec<RecoveryRegistration>,
@@ -277,6 +282,7 @@ pub struct RecoveryVaultListReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryVerifyReport {
+    pub schema: u16,
     pub vault_root: String,
     pub repository_id: [u8; 16],
     pub recovery_point_id: String,
@@ -285,6 +291,7 @@ pub struct RecoveryVerifyReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryRestoreReport {
+    pub schema: u16,
     pub vault_root: String,
     pub repository_id: [u8; 16],
     pub recovery_point_id: String,
@@ -293,6 +300,7 @@ pub struct RecoveryRestoreReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryPinReport {
+    pub schema: u16,
     pub vault_root: String,
     pub repository_id: [u8; 16],
     pub recovery_point_id: String,
@@ -302,6 +310,7 @@ pub struct RecoveryPinReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryTombstoneReport {
+    pub schema: u16,
     pub vault_root: String,
     pub repository_id: [u8; 16],
     pub tombstone: RecoveryTombstone,
@@ -317,6 +326,7 @@ pub struct RecoveryGcCandidate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryVaultGcReport {
+    pub schema: u16,
     pub vault_root: String,
     pub dry_run: bool,
     pub total_recovery_points: u64,
@@ -332,6 +342,7 @@ pub struct RecoveryVaultGcReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryScrubLocationReport {
+    pub schema: u16,
     pub vault_root: String,
     pub primary: bool,
     pub healthy: bool,
@@ -346,12 +357,14 @@ pub struct RecoveryScrubLocationReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryScrubReport {
+    pub schema: u16,
     pub healthy: bool,
     pub locations: Vec<RecoveryScrubLocationReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryRepairReport {
+    pub schema: u16,
     pub vault_root: String,
     pub mirror_root: String,
     pub repository_id: [u8; 16],
@@ -438,6 +451,7 @@ pub fn init_recovery_vault(
             let generation_after = load_catalog(&root)?.generation;
             Ok((
                 RecoveryVaultInitReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
                     vault_root: root.display().to_string(),
                     created: !existed,
                     mirror_roots: normalized_mirrors
@@ -559,6 +573,7 @@ pub fn register_recovery_repository(
             save_catalog(&root, &catalog)?;
             Ok((
                 RecoveryRegistrationReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
                     vault_root: root.display().to_string(),
                     repository_id: config.repository_id,
                     registration_id,
@@ -695,6 +710,7 @@ pub fn capture_recovery_point(
             recovery_failpoint("capture_after_catalog_publish")?;
             Ok((
                 RecoveryCaptureReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
                     vault_root: root.display().to_string(),
                     repository_id: source_config.repository_id,
                     recovery_point: point,
@@ -712,6 +728,7 @@ pub fn list_recovery_vault(
     let root = resolve_vault_root(requested_root)?;
     let catalog = load_catalog(&root)?;
     Ok(RecoveryVaultListReport {
+        schema: RECOVERY_REPORT_SCHEMA,
         vault_root: root.display().to_string(),
         generation: catalog.generation,
         repositories: catalog.repositories.into_values().collect(),
@@ -751,6 +768,7 @@ pub fn verify_recovery_point(
     );
     let repository = verify_repository(&repository_root)?;
     Ok(RecoveryVerifyReport {
+        schema: RECOVERY_REPORT_SCHEMA,
         vault_root: root.display().to_string(),
         repository_id: id,
         recovery_point_id: recovery_point_id.to_string(),
@@ -815,6 +833,7 @@ pub fn restore_recovery_point(
             recovery_failpoint("restore_after_publication")?;
             Ok((
                 RecoveryRestoreReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
                     vault_root: root.display().to_string(),
                     repository_id: id,
                     recovery_point_id: recovery_point_id.to_string(),
@@ -870,6 +889,7 @@ pub fn set_recovery_point_pin(
             save_catalog(&root, &catalog)?;
             Ok((
                 RecoveryPinReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
                     vault_root: root.display().to_string(),
                     repository_id: id,
                     recovery_point_id: recovery_point_id.to_string(),
@@ -975,6 +995,7 @@ pub fn record_recovery_tombstone(
             save_catalog(&root, &catalog)?;
             Ok((
                 RecoveryTombstoneReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
                     vault_root: root.display().to_string(),
                     repository_id: id,
                     tombstone,
@@ -1025,6 +1046,7 @@ pub fn gc_recovery_vault(
 
     if dry_run || candidates.is_empty() {
         return Ok(RecoveryVaultGcReport {
+            schema: RECOVERY_REPORT_SCHEMA,
             vault_root: root.display().to_string(),
             dry_run,
             total_recovery_points: total_points,
@@ -1138,6 +1160,7 @@ pub fn gc_recovery_vault(
                 .sum();
             Ok((
                 RecoveryVaultGcReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
                     vault_root: root.display().to_string(),
                     dry_run: false,
                     total_recovery_points: total_points,
@@ -1167,6 +1190,7 @@ pub fn scrub_recovery_vault(requested_root: Option<&Path>) -> anyhow::Result<Rec
             .map(|mirror| scrub_vault_location(mirror, false)),
     );
     Ok(RecoveryScrubReport {
+        schema: RECOVERY_REPORT_SCHEMA,
         healthy: locations.iter().all(|location| location.healthy),
         locations,
     })
@@ -1268,6 +1292,7 @@ pub fn repair_recovery_point(
             save_catalog(&root, &catalog)?;
             Ok((
                 RecoveryRepairReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
                     vault_root: root.display().to_string(),
                     mirror_root: mirror.display().to_string(),
                     repository_id: id,
@@ -1285,6 +1310,7 @@ pub fn repair_recovery_point(
 
 fn scrub_vault_location(root: &Path, primary: bool) -> RecoveryScrubLocationReport {
     let mut report = RecoveryScrubLocationReport {
+        schema: RECOVERY_REPORT_SCHEMA,
         vault_root: root.display().to_string(),
         primary,
         healthy: true,

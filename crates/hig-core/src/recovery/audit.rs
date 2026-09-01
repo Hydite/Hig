@@ -1,6 +1,6 @@
 use super::{
-    checked_json_bytes, enforce_private_file, load_vault_config, now_unix_ns, read_checked_json,
-    resolve_vault_root, secure_create_dir, sync_directory,
+    RECOVERY_REPORT_SCHEMA, checked_json_bytes, enforce_private_file, load_vault_config,
+    now_unix_ns, read_checked_json, resolve_vault_root, secure_create_dir, sync_directory,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -71,6 +71,7 @@ pub struct RecoveryAuditEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryAuditReport {
+    pub schema: u16,
     pub vault_root: String,
     pub events: Vec<RecoveryAuditEvent>,
     pub incomplete_operation_ids: Vec<String>,
@@ -153,6 +154,7 @@ pub fn recovery_audit_log(requested_root: Option<&Path>) -> anyhow::Result<Recov
     }
 
     Ok(RecoveryAuditReport {
+        schema: RECOVERY_REPORT_SCHEMA,
         vault_root: root.display().to_string(),
         events,
         incomplete_operation_ids,

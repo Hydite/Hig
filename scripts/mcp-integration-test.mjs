@@ -200,7 +200,8 @@ try {
   await tool("hig_repo_verify", { dir: workspace });
 
   const recoveryVault = path.join(work, "recovery-vault");
-  await tool("hig_recovery_init", { vaultRoot: recoveryVault });
+  const recoveryInitialized = await tool("hig_recovery_init", { vaultRoot: recoveryVault });
+  assert.equal(recoveryInitialized.data.schema, 1);
 
   const watchStarted = await tool("hig_repo_watch_start", {
     dir: workspace,
@@ -218,6 +219,7 @@ try {
     return status.data.last_snapshot?.created === true ? status : null;
   }, 15000, "automatic repository snapshot");
   assert.equal(watchStatus.data.last_snapshot.created, true);
+  assert.equal(watchStatus.data.last_snapshot.recovery.schema, 1);
   assert.equal(watchStatus.data.last_snapshot.recovery.recovery_point.durability, "captured");
   const watchStopped = await tool("hig_repo_watch_stop", { dir: workspace });
   assert.equal(watchStopped.data.active, false);
@@ -238,6 +240,7 @@ try {
     return status.data.snapshots >= 1 ? status : null;
   }, 15000, "repository catch-up snapshot");
   assert.equal(catchUp.data.last_snapshot.created, true);
+  assert.equal(catchUp.data.last_snapshot.recovery.schema, 1);
   assert(catchUp.data.last_snapshot.recovery.recovery_point.recovery_point_id);
   await tool("hig_repo_watch_stop", { dir: workspace });
   await tool("hig_repo_verify", { dir: workspace });
@@ -270,6 +273,8 @@ try {
     revision: "HEAD",
     vaultRoot: recoveryVault
   });
+  assert.equal(registered.data.schema, 1);
+  assert.equal(captured.data.schema, 1);
   assert.equal(captured.data.repository_id.length, 16);
   assert.equal(captured.data.recovery_point.durability, "captured");
   const repositoryId = Buffer.from(captured.data.repository_id).toString("hex");
@@ -277,13 +282,16 @@ try {
   assert.equal(repositoryId, Buffer.from(registered.data.repository_id).toString("hex"));
   const recoveryPointId = captured.data.recovery_point.recovery_point_id;
   const recoveryList = await tool("hig_recovery_list", { vaultRoot: recoveryVault });
+  assert.equal(recoveryList.data.schema, 1);
   assert.equal(recoveryList.data.repositories.length, 1);
   const recoveryAudit = await tool("hig_recovery_audit", { vaultRoot: recoveryVault });
+  assert.equal(recoveryAudit.data.schema, 1);
   assert.equal(recoveryAudit.data.incomplete_operation_ids.length, 0);
   assert.ok(recoveryAudit.data.events.some((event) => event.operation === "capture"));
   const policy = await tool("hig_recovery_policy_show", { vaultRoot: recoveryVault });
   assert.equal(policy.data.retention.schema, 1);
   const recoveryGc = await tool("hig_recovery_gc", { vaultRoot: recoveryVault });
+  assert.equal(recoveryGc.data.schema, 1);
   assert.equal(recoveryGc.data.dry_run, true);
   assert.equal(recoveryGc.data.removed_recovery_points, 0);
   const pinned = await tool("hig_recovery_pin", {
@@ -291,19 +299,23 @@ try {
     recoveryPointId,
     vaultRoot: recoveryVault
   });
+  assert.equal(pinned.data.schema, 1);
   assert.equal(pinned.data.pinned, true);
   const unpinned = await tool("hig_recovery_unpin", {
     repositoryId,
     recoveryPointId,
     vaultRoot: recoveryVault
   });
+  assert.equal(unpinned.data.schema, 1);
   assert.equal(unpinned.data.pinned, false);
-  await tool("hig_recovery_verify", {
+  const recoveryVerified = await tool("hig_recovery_verify", {
     repositoryId,
     recoveryPointId,
     vaultRoot: recoveryVault
   });
+  assert.equal(recoveryVerified.data.schema, 1);
   const recoveryScrub = await tool("hig_recovery_scrub", { vaultRoot: recoveryVault });
+  assert.equal(recoveryScrub.data.schema, 1);
   assert.equal(recoveryScrub.data.healthy, true);
   fs.rmSync(path.join(workspace, "README.md"));
   const tombstone = await tool("hig_recovery_tombstone", {
@@ -314,14 +326,16 @@ try {
     reason: "MCP integration deletion drill",
     vaultRoot: recoveryVault
   });
+  assert.equal(tombstone.data.schema, 1);
   assert.equal(tombstone.data.tombstone.kind, "file");
   const recoveryOutput = path.join(work, "recovery-output");
-  await tool("hig_recovery_restore", {
+  const recoveryRestored = await tool("hig_recovery_restore", {
     repositoryId,
     recoveryPointId,
     outputDir: recoveryOutput,
     vaultRoot: recoveryVault
   });
+  assert.equal(recoveryRestored.data.schema, 1);
   assert.equal(
     fs.readFileSync(path.join(recoveryOutput, "README.md"), "utf8"),
     "synthetic MCP integration fixture\n"
