@@ -10,7 +10,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +34,14 @@ const VAULT_SCHEMA: u16 = 1;
 const CATALOG_SCHEMA: u16 = 1;
 const DOCUMENT_SCHEMA: u16 = 1;
 const RECOVERY_REPORT_SCHEMA: u16 = 1;
+const MAX_RECOVERY_DOCUMENT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RECOVERY_REPOSITORIES: usize = 100_000;
+const MAX_RECOVERY_POINTS_PER_REPOSITORY: usize = 100_000;
+const MAX_RECOVERY_SOURCE_PATHS: usize = 1_024;
+const MAX_RECOVERY_TOMBSTONES_PER_REPOSITORY: usize = 10_000;
+const MAX_RECOVERY_REPLICAS_PER_POINT: usize = 1_024;
+const MAX_RECOVERY_PATH_BYTES: usize = 32 * 1024;
+const MAX_RECOVERY_TEXT_BYTES: usize = 4 * 1024;
 
 #[cfg(not(test))]
 #[inline]
@@ -724,7 +732,7 @@ pub fn capture_recovery_point(
                     Err(error) => replicas.push(RecoveryReplicaStatus {
                         vault_root: mirror.display().to_string(),
                         verified: false,
-                        error: Some(error.to_string()),
+                        error: Some(bounded_recovery_text(&error.to_string())),
                     }),
                 }
             }
@@ -1039,6 +1047,7 @@ pub fn record_recovery_tombstone(
         !reason.trim().is_empty(),
         "tombstone reason must not be empty"
     );
+    validate_recovery_text("tombstone reason", &reason, MAX_RECOVERY_TEXT_BYTES)?;
     match kind {
         RecoveryTombstoneKind::File => anyhow::ensure!(
             relative_path.as_ref().is_some_and(|path| !path.is_empty()),
@@ -1053,6 +1062,9 @@ pub fn record_recovery_tombstone(
     }
     if let Some(path) = relative_path.as_deref() {
         validate_relative_label(path)?;
+    }
+    if let Some(path) = source_path.as_deref() {
+        validate_recovery_text("tombstone source path", path, MAX_RECOVERY_PATH_BYTES)?;
     }
     let source_path = source_path
         .map(|path| {
@@ -1092,6 +1104,10 @@ pub fn record_recovery_tombstone(
                 .repositories
                 .get_mut(&hex::encode(id))
                 .ok_or_else(|| anyhow::anyhow!("recovery repository not found"))?;
+            anyhow::ensure!(
+                registration.tombstones.len() < MAX_RECOVERY_TOMBSTONES_PER_REPOSITORY,
+                "recovery tombstone capacity is exhausted"
+            );
             if let Some(source_path) = source_path.as_deref() {
                 anyhow::ensure!(
                     registration
@@ -1232,11 +1248,13 @@ pub fn gc_recovery_vault(
                         .repositories
                         .get(repository_key)
                         .ok_or_else(|| anyhow::anyhow!("recovery repository missing"))?;
+                    reconcile_retained_mirror_points(&root, mirror, registration, point_ids)?;
                     gc_repository_excluding_recovery_refs(
                         &vault_repository_root(mirror, registration.repository_id)?,
                         point_ids,
                         false,
                     )?;
+                    verify_retained_recovery_points(mirror, registration, point_ids)?;
                 }
             }
             recovery_failpoint("gc_after_mirror_deletion")?;
@@ -1251,6 +1269,7 @@ pub fn gc_recovery_vault(
                     point_ids,
                     false,
                 )?;
+                verify_retained_recovery_points(&root, registration, point_ids)?;
                 applied_reports.insert(repository_key.clone(), report);
             }
             recovery_failpoint("gc_after_primary_deletion")?;
@@ -1273,6 +1292,7 @@ pub fn gc_recovery_vault(
             for mirror in &config.mirror_roots {
                 for registration in &final_registrations {
                     update_mirror_registration(mirror, registration)?;
+                    verify_retained_recovery_points(mirror, registration, &BTreeSet::new())?;
                 }
             }
             catalog.generation = catalog.generation.saturating_add(1);
@@ -1763,6 +1783,47 @@ fn scrub_vault_location(root: &Path, primary: bool) -> RecoveryScrubLocationRepo
     report
 }
 
+fn reconcile_retained_mirror_points(
+    primary: &Path,
+    mirror: &Path,
+    registration: &RecoveryRegistration,
+    selected: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let source_repository = vault_repository_root(primary, registration.repository_id)?;
+    let mirror_repository = vault_repository_root(mirror, registration.repository_id)?;
+    for (point_id, point) in &registration.recovery_points {
+        if selected.contains(point_id) {
+            continue;
+        }
+        let replicated = replicate_repository_revision(
+            &source_repository,
+            &point.ref_name,
+            &mirror_repository,
+            point_id,
+        )?;
+        anyhow::ensure!(
+            replicated.commit_id == point.commit_id
+                && replicated.reachable_objects == point.reachable_objects,
+            "retained mirror recovery graph does not match the primary"
+        );
+    }
+    verify_retained_recovery_points(mirror, registration, selected)
+}
+
+fn verify_retained_recovery_points(
+    vault: &Path,
+    registration: &RecoveryRegistration,
+    selected: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let repository_id = hex::encode(registration.repository_id);
+    for point_id in registration.recovery_points.keys() {
+        if !selected.contains(point_id) {
+            verify_recovery_point(Some(vault), &repository_id, point_id)?;
+        }
+    }
+    Ok(())
+}
+
 struct GcSelection {
     selected: BTreeMap<String, BTreeSet<String>>,
     stored_bytes_before: u64,
@@ -2222,6 +2283,7 @@ fn update_mirror_retention(
 }
 
 fn validate_relative_label(path: &str) -> anyhow::Result<()> {
+    validate_recovery_text("tombstone path", path, MAX_RECOVERY_PATH_BYTES)?;
     let value = Path::new(path);
     anyhow::ensure!(!value.is_absolute(), "tombstone path must be relative");
     anyhow::ensure!(
@@ -2234,6 +2296,7 @@ fn validate_relative_label(path: &str) -> anyhow::Result<()> {
 }
 
 fn validate_persisted_absolute_path_label(path: &str) -> anyhow::Result<()> {
+    validate_recovery_text("persisted recovery path", path, MAX_RECOVERY_PATH_BYTES)?;
     let bytes = path.as_bytes();
     let unix_absolute = bytes.first() == Some(&b'/');
     let windows_drive_absolute = bytes.len() >= 3
@@ -2246,6 +2309,24 @@ fn validate_persisted_absolute_path_label(path: &str) -> anyhow::Result<()> {
         "persisted recovery path label is not absolute"
     );
     Ok(())
+}
+
+fn validate_recovery_text(label: &str, value: &str, maximum: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(value.len() <= maximum, "{label} exceeds resource limit");
+    anyhow::ensure!(!value.contains('\0'), "{label} contains a null character");
+    Ok(())
+}
+
+fn bounded_recovery_text(value: &str) -> String {
+    let sanitized = value.replace('\0', " ");
+    if sanitized.len() <= MAX_RECOVERY_TEXT_BYTES {
+        return sanitized;
+    }
+    let mut end = MAX_RECOVERY_TEXT_BYTES;
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    sanitized[..end].to_string()
 }
 
 fn load_catalog(root: &Path) -> anyhow::Result<RecoveryCatalog> {
@@ -2265,6 +2346,10 @@ fn validate_catalog(catalog: &RecoveryCatalog) -> anyhow::Result<()> {
     anyhow::ensure!(
         catalog.schema == CATALOG_SCHEMA,
         "unsupported recovery catalog schema"
+    );
+    anyhow::ensure!(
+        catalog.repositories.len() <= MAX_RECOVERY_REPOSITORIES,
+        "recovery repository count exceeds resource limit"
     );
     for (repository_key, registration) in &catalog.repositories {
         validate_registration(repository_key, registration)?;
@@ -2291,6 +2376,18 @@ fn validate_registration(
     anyhow::ensure!(
         !registration.source_paths.is_empty(),
         "recovery registration has no source path history"
+    );
+    anyhow::ensure!(
+        registration.source_paths.len() <= MAX_RECOVERY_SOURCE_PATHS,
+        "recovery source path history exceeds resource limit"
+    );
+    anyhow::ensure!(
+        registration.recovery_points.len() <= MAX_RECOVERY_POINTS_PER_REPOSITORY,
+        "recovery point count exceeds resource limit"
+    );
+    anyhow::ensure!(
+        registration.tombstones.len() <= MAX_RECOVERY_TOMBSTONES_PER_REPOSITORY,
+        "recovery tombstone count exceeds resource limit"
     );
     let mut previous_source: Option<&str> = None;
     for source in &registration.source_paths {
@@ -2323,6 +2420,11 @@ fn validate_registration(
             !tombstone.reason.trim().is_empty() && !tombstone.reason.contains('\0'),
             "recovery tombstone reason is invalid"
         );
+        validate_recovery_text(
+            "recovery tombstone reason",
+            &tombstone.reason,
+            MAX_RECOVERY_TEXT_BYTES,
+        )?;
         if let Some(source) = tombstone.source_path.as_deref() {
             validate_persisted_absolute_path_label(source).map_err(|error| {
                 anyhow::anyhow!("recovery tombstone source path is invalid: {error}")
@@ -2363,6 +2465,10 @@ fn validate_recovery_point(point_id: &str, point: &RecoveryPoint) -> anyhow::Res
         point.captured_unix_ns <= point.last_verified_unix_ns,
         "recovery point verification time regresses"
     );
+    anyhow::ensure!(
+        point.replicas.len() <= MAX_RECOVERY_REPLICAS_PER_POINT,
+        "recovery replica count exceeds resource limit"
+    );
     let mut replica_roots = BTreeSet::new();
     for replica in &point.replicas {
         validate_persisted_absolute_path_label(&replica.vault_root)
@@ -2375,6 +2481,9 @@ fn validate_recovery_point(point_id: &str, point: &RecoveryPoint) -> anyhow::Res
             replica.verified == replica.error.is_none(),
             "recovery replica verification and error state disagree"
         );
+        if let Some(error) = replica.error.as_deref() {
+            validate_recovery_text("recovery replica error", error, MAX_RECOVERY_TEXT_BYTES)?;
+        }
     }
     match point.durability {
         RecoveryDurability::Captured => {}
@@ -2458,7 +2567,37 @@ fn lock_vault(root: &Path) -> anyhow::Result<File> {
 }
 
 fn read_checked_json<T: DeserializeOwned + Serialize>(path: &Path) -> anyhow::Result<T> {
-    let document: CheckedDocument<T> = serde_json::from_slice(&fs::read(path)?)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "recovery document is not a physical file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_RECOVERY_DOCUMENT_BYTES,
+        "recovery document exceeds resource limit"
+    );
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len())?);
+    file.take(MAX_RECOVERY_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_RECOVERY_DOCUMENT_BYTES,
+        "recovery document exceeds resource limit"
+    );
+    let document: CheckedDocument<T> = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
         document.schema == DOCUMENT_SCHEMA,
         "unsupported recovery document schema"
@@ -2478,12 +2617,21 @@ fn write_checked_json<T: Serialize>(path: &Path, payload: &T) -> anyhow::Result<
 
 fn checked_json_bytes<T: Serialize>(payload: &T) -> anyhow::Result<Vec<u8>> {
     let payload_bytes = serde_json::to_vec(payload)?;
+    anyhow::ensure!(
+        payload_bytes.len() as u64 <= MAX_RECOVERY_DOCUMENT_BYTES,
+        "recovery document exceeds resource limit"
+    );
     let document = CheckedDocument {
         schema: DOCUMENT_SCHEMA,
         payload_blake3: blake3::hash(&payload_bytes).to_hex().to_string(),
         payload,
     };
-    Ok(serde_json::to_vec_pretty(&document)?)
+    let bytes = serde_json::to_vec_pretty(&document)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_RECOVERY_DOCUMENT_BYTES,
+        "recovery document exceeds resource limit"
+    );
+    Ok(bytes)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -3522,6 +3670,104 @@ mod tests {
             fs::read_to_string(output.join("file.txt")).unwrap(),
             "three"
         );
+    }
+
+    #[test]
+    fn recovery_gc_repairs_and_verifies_retained_mirror_refs_before_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let primary = temp.path().join("primary");
+        let mirror = temp.path().join("mirror");
+        fs::create_dir_all(&source).unwrap();
+        let initialized = init_repository(&source, Vec::new()).unwrap();
+        init_recovery_vault(Some(&primary), vec![mirror.clone()]).unwrap();
+        let mut points = Vec::new();
+        for value in ["one", "two", "three"] {
+            fs::write(source.join("file.txt"), value).unwrap();
+            snapshot_repository(&source, value.into(), None).unwrap();
+            points.push(
+                capture_recovery_point(&source, "HEAD", Some(&primary))
+                    .unwrap()
+                    .recovery_point
+                    .recovery_point_id,
+            );
+        }
+        update_recovery_retention(
+            Some(&primary),
+            RecoveryRetentionPolicy {
+                minimum_points_per_repository: 1,
+                minimum_retention_days: 0,
+                maximum_points_per_repository: Some(1),
+                ..RecoveryRetentionPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let retained_ref = vault_repository_root(&mirror, initialized.repository_id)
+            .unwrap()
+            .join(".hig/repository/refs/tags/recovery")
+            .join(&points[2]);
+        fs::remove_file(&retained_ref).unwrap();
+        assert!(
+            verify_recovery_point(
+                Some(&mirror),
+                &hex::encode(initialized.repository_id),
+                &points[2]
+            )
+            .is_err()
+        );
+
+        let report = gc_recovery_vault(Some(&primary), false).unwrap();
+        assert_eq!(report.removed_recovery_points, 2);
+        verify_recovery_point(
+            Some(&mirror),
+            &hex::encode(initialized.repository_id),
+            &points[2],
+        )
+        .unwrap();
+
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&primary).unwrap();
+        let output = temp.path().join("restored");
+        restore_recovery_point(
+            Some(&mirror),
+            &hex::encode(initialized.repository_id),
+            &points[2],
+            &output,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(output.join("file.txt")).unwrap(),
+            "three"
+        );
+    }
+
+    #[test]
+    fn recovery_documents_and_tombstones_enforce_resource_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let oversized = temp.path().join("oversized.json");
+        let file = File::create(&oversized).unwrap();
+        file.set_len(MAX_RECOVERY_DOCUMENT_BYTES + 1).unwrap();
+        let error = read_checked_json::<RecoveryCatalog>(&oversized).unwrap_err();
+        assert!(error.to_string().contains("resource limit"));
+
+        let reason = "x".repeat(MAX_RECOVERY_TEXT_BYTES + 1);
+        let error = record_recovery_tombstone(
+            Some(temp.path()),
+            "00000000000000000000000000000000",
+            RecoveryTombstoneKind::Workspace,
+            None,
+            None,
+            reason,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("resource limit"));
+
+        let path = "x".repeat(MAX_RECOVERY_PATH_BYTES + 1);
+        let error = validate_relative_label(&path).unwrap_err();
+        assert!(error.to_string().contains("resource limit"));
     }
 
     #[test]

@@ -35,6 +35,12 @@ const MAX_EXTENDED_ATTRIBUTES_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ACCESS_CONTROL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ALTERNATE_DATA_STREAMS: usize = 1024;
 const MAX_ALTERNATE_DATA_STREAM_NAME_UNITS: usize = 296;
+const MAX_REPOSITORY_GRAPH_OBJECTS: usize = 1_000_000;
+const MAX_REPOSITORY_TREE_WORK: usize = 1_000_000;
+const MAX_REPOSITORY_TREE_DEPTH: usize = 4_096;
+const MAX_REPOSITORY_COMMIT_DEPTH: usize = 1_000_000;
+const MAX_SEMANTIC_AST_NODES: usize = 10_000_000;
+const MAX_SEMANTIC_AST_DEPTH: usize = 4_096;
 const REPOSITORY_WATCH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
 
 pub const DEFAULT_REPOSITORY_EXCLUDES: &[&str] = &[
@@ -3425,47 +3431,60 @@ fn flatten_tree(
     root: RepositoryObjectId,
 ) -> anyhow::Result<BTreeMap<String, FileState>> {
     let mut files = BTreeMap::new();
-    flatten_tree_at(repository, root, "", &mut files)?;
+    let mut stack = vec![(root, String::new(), 0_usize)];
+    let mut work = 0_usize;
+    while let Some((tree_id, prefix, depth)) = stack.pop() {
+        anyhow::ensure!(
+            depth <= MAX_REPOSITORY_TREE_DEPTH,
+            "repository tree depth exceeds resource limit"
+        );
+        work = work.saturating_add(1);
+        anyhow::ensure!(
+            work <= MAX_REPOSITORY_TREE_WORK,
+            "repository tree work exceeds resource limit"
+        );
+        let tree = read_tree_object(repository, tree_id)?;
+        validate_tree_entries(&tree.entries)?;
+        for entry in tree.entries.into_iter().rev() {
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{prefix}/{}", entry.name)
+            };
+            match entry.kind {
+                TreeEntryKind::File => {
+                    let object = read_file_object(repository, entry.object_id)?;
+                    anyhow::ensure!(
+                        files
+                            .insert(
+                                path,
+                                FileState {
+                                    object_id: entry.object_id,
+                                    object,
+                                }
+                            )
+                            .is_none(),
+                        "duplicate tree path"
+                    );
+                }
+                TreeEntryKind::Tree => stack.push((entry.object_id, path, depth + 1)),
+            }
+        }
+    }
     Ok(files)
 }
 
-fn flatten_tree_at(
-    repository: &Repository,
-    tree_id: RepositoryObjectId,
-    prefix: &str,
-    files: &mut BTreeMap<String, FileState>,
-) -> anyhow::Result<()> {
-    let tree = read_tree_object(repository, tree_id)?;
+fn validate_tree_entries(entries: &[TreeEntry]) -> anyhow::Result<()> {
     let mut previous = None;
-    for entry in tree.entries {
+    for entry in entries {
         validate_entry_name(&entry.name)?;
-        if let Some(previous) = &previous {
-            anyhow::ensure!(previous < &entry.name, "tree entries are not canonical");
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                previous < entry.name.as_str(),
+                "tree entries are not canonical"
+            );
         }
-        previous = Some(entry.name.clone());
-        let path = if prefix.is_empty() {
-            entry.name.clone()
-        } else {
-            format!("{prefix}/{}", entry.name)
-        };
-        match entry.kind {
-            TreeEntryKind::File => {
-                let object = read_file_object(repository, entry.object_id)?;
-                anyhow::ensure!(
-                    files
-                        .insert(
-                            path,
-                            FileState {
-                                object_id: entry.object_id,
-                                object,
-                            }
-                        )
-                        .is_none(),
-                    "duplicate tree path"
-                );
-            }
-            TreeEntryKind::Tree => flatten_tree_at(repository, entry.object_id, &path, files)?,
-        }
+        previous = Some(entry.name.as_str());
     }
     Ok(())
 }
@@ -3475,27 +3494,34 @@ fn validate_commit_hardlink_groups(
     commit_id: RepositoryObjectId,
     validated_commits: &mut BTreeSet<RepositoryObjectId>,
 ) -> anyhow::Result<()> {
-    if !validated_commits.insert(commit_id) {
-        return Ok(());
-    }
-    let commit: CommitObject = repository.read(commit_id, ObjectKind::Commit)?;
-    let files = flatten_tree(repository, commit.root_tree)?;
-    let mut groups = BTreeMap::<[u8; 32], &FileObject>::new();
-    for state in files.values() {
-        let Some(hardlink_id) = state.object.hardlink_id else {
-            continue;
-        };
-        if let Some(existing) = groups.get(&hardlink_id) {
-            anyhow::ensure!(
-                *existing == &state.object,
-                "hardlink group contains inconsistent file objects"
-            );
-        } else {
-            groups.insert(hardlink_id, &state.object);
+    let mut current = Some(commit_id);
+    let mut depth = 0_usize;
+    while let Some(current_id) = current {
+        if !validated_commits.insert(current_id) {
+            break;
         }
-    }
-    if let Some(parent) = commit.parent {
-        validate_commit_hardlink_groups(repository, parent, validated_commits)?;
+        depth = depth.saturating_add(1);
+        anyhow::ensure!(
+            depth <= MAX_REPOSITORY_COMMIT_DEPTH,
+            "repository commit history exceeds resource limit"
+        );
+        let commit: CommitObject = repository.read(current_id, ObjectKind::Commit)?;
+        let files = flatten_tree(repository, commit.root_tree)?;
+        let mut groups = BTreeMap::<[u8; 32], &FileObject>::new();
+        for state in files.values() {
+            let Some(hardlink_id) = state.object.hardlink_id else {
+                continue;
+            };
+            if let Some(existing) = groups.get(&hardlink_id) {
+                anyhow::ensure!(
+                    *existing == &state.object,
+                    "hardlink group contains inconsistent file objects"
+                );
+            } else {
+                groups.insert(hardlink_id, &state.object);
+            }
+        }
+        current = commit.parent;
     }
     Ok(())
 }
@@ -3505,38 +3531,40 @@ fn tree_directories(
     root: RepositoryObjectId,
 ) -> anyhow::Result<Vec<DirectoryState>> {
     let root_tree = read_tree_object(repository, root)?;
+    validate_tree_entries(&root_tree.entries)?;
     let mut directories = vec![DirectoryState {
         path: String::new(),
         metadata: root_tree.metadata,
     }];
-    tree_directories_entries_at(repository, root_tree.entries, "", &mut directories)?;
-    Ok(directories)
-}
-
-fn tree_directories_entries_at(
-    repository: &Repository,
-    entries: Vec<TreeEntry>,
-    prefix: &str,
-    directories: &mut Vec<DirectoryState>,
-) -> anyhow::Result<()> {
-    for entry in entries {
-        validate_entry_name(&entry.name)?;
-        if entry.kind != TreeEntryKind::Tree {
-            continue;
-        }
-        let path = if prefix.is_empty() {
-            entry.name
-        } else {
-            format!("{prefix}/{}", entry.name)
-        };
-        let tree = read_tree_object(repository, entry.object_id)?;
+    let mut stack = root_tree
+        .entries
+        .into_iter()
+        .rev()
+        .filter(|entry| entry.kind == TreeEntryKind::Tree)
+        .map(|entry| (entry.object_id, entry.name, 1_usize))
+        .collect::<Vec<_>>();
+    while let Some((tree_id, path, depth)) = stack.pop() {
+        anyhow::ensure!(
+            depth <= MAX_REPOSITORY_TREE_DEPTH,
+            "repository directory depth exceeds resource limit"
+        );
+        anyhow::ensure!(
+            directories.len() < MAX_REPOSITORY_TREE_WORK,
+            "repository directory count exceeds resource limit"
+        );
+        let tree = read_tree_object(repository, tree_id)?;
+        validate_tree_entries(&tree.entries)?;
         directories.push(DirectoryState {
             path: path.clone(),
             metadata: tree.metadata,
         });
-        tree_directories_entries_at(repository, tree.entries, &path, directories)?;
+        for entry in tree.entries.into_iter().rev() {
+            if entry.kind == TreeEntryKind::Tree {
+                stack.push((entry.object_id, format!("{path}/{}", entry.name), depth + 1));
+            }
+        }
     }
-    Ok(())
+    Ok(directories)
 }
 
 fn restore_file(repository: &Repository, state: &FileState, path: &Path) -> anyhow::Result<()> {
@@ -4160,67 +4188,97 @@ fn parse_symbols(path: &str, source: &[u8]) -> anyhow::Result<(Vec<RepositorySym
         language_name,
         &mut Vec::new(),
         &mut symbols,
-    );
+    )?;
     Ok((symbols, has_errors))
 }
 
-fn collect_symbols(
-    node: Node<'_>,
+fn collect_symbols<'tree>(
+    root: Node<'tree>,
     source: &[u8],
     path: &str,
     language: &str,
     scopes: &mut Vec<String>,
     output: &mut Vec<RepositorySymbol>,
-) {
-    let semantic_kind = semantic_node_kind(language, node.kind());
-    let name_node = semantic_kind.and_then(|_| semantic_name_node(language, node));
-    let mut pushed_scope = false;
-    if let (Some(kind), Some(name_node)) = (semantic_kind, name_node)
-        && let Ok(name) = name_node.utf8_text(source)
-    {
-        let name = name.trim();
-        if !name.is_empty() {
-            let qualified_name = if scopes.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}::{name}", scopes.join("::"))
-            };
-            let start = node.start_byte();
-            let end = node.end_byte();
-            if start <= name_node.start_byte() && name_node.end_byte() <= end && end <= source.len()
-            {
-                let content_hash = blake3::hash(&source[start..end]);
-                let mut structural = blake3::Hasher::new();
-                structural.update(b"hig-semantic-structure-v1\0");
-                structural.update(&source[start..name_node.start_byte()]);
-                structural.update(&source[name_node.end_byte()..end]);
-                let signature_hash = semantic_signature_hash(node, source, name_node);
-                let symbol_id =
-                    semantic_symbol_id(language, kind, &qualified_name, &signature_hash);
-                output.push(RepositorySymbol {
-                    symbol_id,
-                    language: language.to_string(),
-                    path: path.to_string(),
-                    kind: kind.to_string(),
-                    name: name.to_string(),
-                    qualified_name: qualified_name.clone(),
-                    start_byte: start as u64,
-                    end_byte: end as u64,
-                    content_hash: content_hash.to_hex().to_string(),
-                    structural_hash: structural.finalize().to_hex().to_string(),
-                });
-                scopes.push(name.to_string());
-                pushed_scope = true;
+) -> anyhow::Result<()> {
+    enum Visit<'tree> {
+        Enter(Node<'tree>, usize),
+        ExitScope,
+    }
+
+    let mut stack = vec![Visit::Enter(root, 0)];
+    let mut visited = 0_usize;
+    while let Some(visit) = stack.pop() {
+        let Visit::Enter(node, depth) = visit else {
+            scopes.pop();
+            continue;
+        };
+        visited = visited.saturating_add(1);
+        anyhow::ensure!(
+            visited <= MAX_SEMANTIC_AST_NODES,
+            "semantic syntax tree exceeds resource limit"
+        );
+        anyhow::ensure!(
+            depth <= MAX_SEMANTIC_AST_DEPTH,
+            "semantic syntax depth exceeds resource limit"
+        );
+
+        let semantic_kind = semantic_node_kind(language, node.kind());
+        let name_node = semantic_kind.and_then(|_| semantic_name_node(language, node));
+        let mut pushed_scope = false;
+        if let (Some(kind), Some(name_node)) = (semantic_kind, name_node)
+            && let Ok(name) = name_node.utf8_text(source)
+        {
+            let name = name.trim();
+            if !name.is_empty() {
+                let qualified_name = if scopes.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}::{name}", scopes.join("::"))
+                };
+                let start = node.start_byte();
+                let end = node.end_byte();
+                if start <= name_node.start_byte()
+                    && name_node.end_byte() <= end
+                    && end <= source.len()
+                {
+                    let content_hash = blake3::hash(&source[start..end]);
+                    let mut structural = blake3::Hasher::new();
+                    structural.update(b"hig-semantic-structure-v1\0");
+                    structural.update(&source[start..name_node.start_byte()]);
+                    structural.update(&source[name_node.end_byte()..end]);
+                    let signature_hash = semantic_signature_hash(node, source, name_node);
+                    let symbol_id =
+                        semantic_symbol_id(language, kind, &qualified_name, &signature_hash);
+                    output.push(RepositorySymbol {
+                        symbol_id,
+                        language: language.to_string(),
+                        path: path.to_string(),
+                        kind: kind.to_string(),
+                        name: name.to_string(),
+                        qualified_name: qualified_name.clone(),
+                        start_byte: start as u64,
+                        end_byte: end as u64,
+                        content_hash: content_hash.to_hex().to_string(),
+                        structural_hash: structural.finalize().to_hex().to_string(),
+                    });
+                    scopes.push(name.to_string());
+                    pushed_scope = true;
+                }
             }
         }
+        if pushed_scope {
+            stack.push(Visit::ExitScope);
+        }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|child| Visit::Enter(child, depth + 1)),
+        );
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_symbols(child, source, path, language, scopes, output);
-    }
-    if pushed_scope {
-        scopes.pop();
-    }
+    Ok(())
 }
 
 fn semantic_node_kind<'a>(language: &str, kind: &'a str) -> Option<&'a str> {
@@ -4615,92 +4673,106 @@ fn verify_reachable(
     visited: &mut BTreeSet<RepositoryObjectId>,
     report: &mut RepositoryVerifyReport,
 ) -> anyhow::Result<()> {
-    if !visited.insert(object_id) {
-        return Ok(());
-    }
-    let (kind, raw) = repository.read_raw(object_id)?;
-    report.checked_objects += 1;
-    report.checked_raw_bytes += raw.len() as u64;
-    match kind {
-        ObjectKind::Chunk => report.chunks += 1,
-        ObjectKind::File => {
-            report.files += 1;
-            let file = deserialize_file_object(&raw)?;
-            verify_alternate_data_stream_contents(repository, &file.alternate_data_streams)?;
-            for chunk in file.chunks.into_iter().chain(
-                file.alternate_data_streams
-                    .into_iter()
-                    .flat_map(|stream| stream.chunks),
-            ) {
-                verify_reachable(repository, chunk.object_id, visited, report)?;
-            }
+    let mut stack = vec![(object_id, 0_usize)];
+    while let Some((object_id, tree_depth)) = stack.pop() {
+        anyhow::ensure!(
+            tree_depth <= MAX_REPOSITORY_TREE_DEPTH,
+            "repository object tree depth exceeds resource limit"
+        );
+        if !visited.insert(object_id) {
+            continue;
         }
-        ObjectKind::Tree => {
-            report.trees += 1;
-            let tree = deserialize_tree_object(&raw)?;
-            if let Some(metadata) = tree.metadata {
-                verify_alternate_data_stream_contents(
-                    repository,
-                    &metadata.alternate_data_streams,
-                )?;
-                for chunk in metadata
-                    .alternate_data_streams
+        anyhow::ensure!(
+            visited.len() <= MAX_REPOSITORY_GRAPH_OBJECTS,
+            "repository object graph exceeds resource limit"
+        );
+        let (kind, raw) = repository.read_raw(object_id)?;
+        report.checked_objects = report.checked_objects.saturating_add(1);
+        report.checked_raw_bytes = report.checked_raw_bytes.saturating_add(raw.len() as u64);
+        match kind {
+            ObjectKind::Chunk => report.chunks = report.chunks.saturating_add(1),
+            ObjectKind::File => {
+                report.files = report.files.saturating_add(1);
+                let file = deserialize_file_object(&raw)?;
+                verify_alternate_data_stream_contents(repository, &file.alternate_data_streams)?;
+                stack.extend(
+                    file.chunks
+                        .into_iter()
+                        .map(|chunk| (chunk.object_id, tree_depth)),
+                );
+                stack.extend(
+                    file.alternate_data_streams
+                        .into_iter()
+                        .flat_map(|stream| stream.chunks)
+                        .map(|chunk| (chunk.object_id, tree_depth)),
+                );
+            }
+            ObjectKind::Tree => {
+                report.trees = report.trees.saturating_add(1);
+                let tree = deserialize_tree_object(&raw)?;
+                validate_tree_entries(&tree.entries)?;
+                if let Some(metadata) = tree.metadata {
+                    verify_alternate_data_stream_contents(
+                        repository,
+                        &metadata.alternate_data_streams,
+                    )?;
+                    stack.extend(
+                        metadata
+                            .alternate_data_streams
+                            .into_iter()
+                            .flat_map(|stream| stream.chunks)
+                            .map(|chunk| (chunk.object_id, tree_depth)),
+                    );
+                }
+                stack.extend(
+                    tree.entries
+                        .into_iter()
+                        .map(|entry| (entry.object_id, tree_depth + 1)),
+                );
+            }
+            ObjectKind::Commit => {
+                report.commits = report.commits.saturating_add(1);
+                let commit: CommitObject = deserialize_canonical(&raw)?;
+                stack.push((commit.root_tree, 0));
+                stack.extend(commit.parent.map(|parent| (parent, 0)));
+                stack.extend(
+                    [
+                        commit.change_index,
+                        commit.semantic_index,
+                        commit.compression_tree_index,
+                    ]
                     .into_iter()
-                    .flat_map(|stream| stream.chunks)
-                {
-                    verify_reachable(repository, chunk.object_id, visited, report)?;
+                    .flatten()
+                    .map(|index| (index, 0)),
+                );
+            }
+            ObjectKind::ChangeIndex => {
+                report.change_indexes = report.change_indexes.saturating_add(1);
+                let index: ChangeIndexObject = deserialize_canonical(&raw)?;
+                anyhow::ensure!(index.schema == 1, "unsupported change-index schema");
+                stack.extend(index.parent_index.map(|parent| (parent, 0)));
+            }
+            ObjectKind::SemanticIndex => {
+                report.semantic_indexes = report.semantic_indexes.saturating_add(1);
+                let index: SemanticIndexObject = deserialize_canonical(&raw)?;
+                anyhow::ensure!(index.schema == 1, "unsupported semantic-index schema");
+                anyhow::ensure!(
+                    (1..=SEMANTIC_PARSER_SCHEMA).contains(&index.parser_schema),
+                    "unsupported semantic parser schema"
+                );
+                for symbol in &index.symbols {
+                    anyhow::ensure!(
+                        symbol.start_byte <= symbol.end_byte,
+                        "invalid semantic symbol range"
+                    );
+                    normalize_requested_path(&symbol.path)?;
                 }
             }
-            for entry in tree.entries {
-                verify_reachable(repository, entry.object_id, visited, report)?;
+            ObjectKind::CompressionTreeIndex => {
+                report.compression_tree_indexes = report.compression_tree_indexes.saturating_add(1);
+                let index: CompressionTreeIndexObject = deserialize_canonical(&raw)?;
+                anyhow::ensure!(index.schema == 1, "unsupported compression-tree schema");
             }
-        }
-        ObjectKind::Commit => {
-            report.commits += 1;
-            let commit: CommitObject = deserialize_canonical(&raw)?;
-            verify_reachable(repository, commit.root_tree, visited, report)?;
-            if let Some(parent) = commit.parent {
-                verify_reachable(repository, parent, visited, report)?;
-            }
-            for index in [
-                commit.change_index,
-                commit.semantic_index,
-                commit.compression_tree_index,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                verify_reachable(repository, index, visited, report)?;
-            }
-        }
-        ObjectKind::ChangeIndex => {
-            report.change_indexes += 1;
-            let index: ChangeIndexObject = deserialize_canonical(&raw)?;
-            anyhow::ensure!(index.schema == 1, "unsupported change-index schema");
-            if let Some(parent_index) = index.parent_index {
-                verify_reachable(repository, parent_index, visited, report)?;
-            }
-        }
-        ObjectKind::SemanticIndex => {
-            report.semantic_indexes += 1;
-            let index: SemanticIndexObject = deserialize_canonical(&raw)?;
-            anyhow::ensure!(index.schema == 1, "unsupported semantic-index schema");
-            anyhow::ensure!(
-                (1..=SEMANTIC_PARSER_SCHEMA).contains(&index.parser_schema),
-                "unsupported semantic parser schema"
-            );
-            for symbol in &index.symbols {
-                anyhow::ensure!(
-                    symbol.start_byte <= symbol.end_byte,
-                    "invalid semantic symbol range"
-                );
-                normalize_requested_path(&symbol.path)?;
-            }
-        }
-        ObjectKind::CompressionTreeIndex => {
-            report.compression_tree_indexes += 1;
-            let index: CompressionTreeIndexObject = deserialize_canonical(&raw)?;
-            anyhow::ensure!(index.schema == 1, "unsupported compression-tree schema");
         }
     }
     Ok(())
@@ -7055,6 +7127,45 @@ mod tests {
             .to_string();
         assert!(restore_error.contains("hardlink group contains inconsistent"));
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn deeply_nested_repository_tree_fails_at_the_explicit_depth_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let repository = Repository::discover(temp.path()).unwrap();
+        let leaf = TreeObjectV1 {
+            schema: 1,
+            entries: Vec::new(),
+        };
+        let (mut tree_id, _, _) = repository.put(ObjectKind::Tree, &leaf).unwrap();
+        for _ in 0..=MAX_REPOSITORY_TREE_DEPTH {
+            let tree = TreeObjectV1 {
+                schema: 1,
+                entries: vec![TreeEntry {
+                    name: "d".to_string(),
+                    kind: TreeEntryKind::Tree,
+                    object_id: tree_id,
+                }],
+            };
+            tree_id = repository.put(ObjectKind::Tree, &tree).unwrap().0;
+        }
+
+        let flatten_error = flatten_tree(&repository, tree_id).unwrap_err();
+        assert!(
+            flatten_error
+                .to_string()
+                .contains("depth exceeds resource limit")
+        );
+        let mut visited = BTreeSet::new();
+        let mut report = RepositoryVerifyReport::default();
+        let verify_error =
+            verify_reachable(&repository, tree_id, &mut visited, &mut report).unwrap_err();
+        assert!(
+            verify_error
+                .to_string()
+                .contains("depth exceeds resource limit")
+        );
     }
 
     #[cfg(any(unix, windows))]
