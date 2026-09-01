@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod audit;
+mod auth;
 #[cfg(test)]
 mod concurrency_tests;
 #[cfg(test)]
@@ -509,9 +510,9 @@ pub fn init_recovery_vault(
         None,
         details,
         || {
-            initialize_vault_root(&root, effective_mirrors.clone())?;
+            let primary_identity = initialize_vault_root(&root, effective_mirrors.clone())?;
             for mirror in &effective_mirrors {
-                initialize_mirror_vault_with_audit(mirror)?;
+                initialize_mirror_vault_with_audit(mirror, &primary_identity, false)?;
             }
             let generation_after = load_catalog(&root)?.generation;
             Ok((
@@ -542,6 +543,7 @@ pub fn update_recovery_retention(
     retention.validate()?;
     let root = resolve_vault_root(requested_root)?;
     let _lock = lock_vault(&root)?;
+    auth::require_primary(&root)?;
     let mut config = load_vault_config(&root)?;
     let generation = load_catalog(&root)?.generation;
     let details = BTreeMap::from([
@@ -577,10 +579,10 @@ pub fn update_recovery_retention(
         details,
         || {
             for mirror in &config.mirror_roots {
-                update_mirror_retention(mirror, &retention)?;
+                update_mirror_retention(&root, mirror, &retention)?;
             }
             config.retention = retention;
-            write_checked_json(&vault_config_path(&root), &config)?;
+            save_vault_config(&root, &config)?;
             Ok((config, Some(generation)))
         },
     )
@@ -716,6 +718,7 @@ pub fn capture_recovery_point(
             let mut replicas = Vec::new();
             for mirror in &config.mirror_roots {
                 let result = capture_mirror(
+                    &root,
                     mirror,
                     &source_root,
                     revision,
@@ -987,6 +990,7 @@ pub fn set_recovery_point_pin(
     let root = resolve_vault_root(requested_root)?;
     let id = parse_repository_id(repository_id)?;
     let _lock = lock_vault(&root)?;
+    auth::require_primary(&root)?;
     let config = load_vault_config(&root)?;
     let mut catalog = load_catalog(&root)?;
     let generation_before = catalog.generation;
@@ -1016,7 +1020,7 @@ pub fn set_recovery_point_pin(
             registration.updated_unix_ns = now_unix_ns();
             let mirrored = registration.clone();
             for mirror in &config.mirror_roots {
-                update_mirror_registration(mirror, &mirrored)?;
+                update_mirror_registration(&root, mirror, &mirrored)?;
             }
             catalog.generation = catalog.generation.saturating_add(1);
             save_catalog(&root, &catalog)?;
@@ -1074,6 +1078,7 @@ pub fn record_recovery_tombstone(
     let root = resolve_vault_root(requested_root)?;
     let id = parse_repository_id(repository_id)?;
     let _lock = lock_vault(&root)?;
+    auth::require_primary(&root)?;
     let config = load_vault_config(&root)?;
     let mut catalog = load_catalog(&root)?;
     let generation_before = catalog.generation;
@@ -1130,7 +1135,7 @@ pub fn record_recovery_tombstone(
             registration.updated_unix_ns = tombstone.observed_unix_ns;
             let mirrored = registration.clone();
             for mirror in &config.mirror_roots {
-                update_mirror_registration(mirror, &mirrored)?;
+                update_mirror_registration(&root, mirror, &mirrored)?;
             }
             catalog.generation = catalog.generation.saturating_add(1);
             save_catalog(&root, &catalog)?;
@@ -1153,6 +1158,7 @@ pub fn gc_recovery_vault(
 ) -> anyhow::Result<RecoveryVaultGcReport> {
     let root = resolve_vault_root(requested_root)?;
     let _lock = lock_vault(&root)?;
+    auth::require_primary(&root)?;
     let config = load_vault_config(&root)?;
     let mut catalog = load_catalog(&root)?;
     let selection = select_gc_candidates(&root, &catalog, &config.retention)?;
@@ -1235,7 +1241,7 @@ pub fn gc_recovery_vault(
                 .collect::<Vec<_>>();
             for mirror in &config.mirror_roots {
                 for registration in &pending_registrations {
-                    update_mirror_registration(mirror, registration)?;
+                    update_mirror_registration(&root, mirror, registration)?;
                 }
             }
             catalog.generation = catalog.generation.saturating_add(1);
@@ -1291,7 +1297,7 @@ pub fn gc_recovery_vault(
                 .collect::<Vec<_>>();
             for mirror in &config.mirror_roots {
                 for registration in &final_registrations {
-                    update_mirror_registration(mirror, registration)?;
+                    update_mirror_registration(&root, mirror, registration)?;
                     verify_retained_recovery_points(mirror, registration, &BTreeSet::new())?;
                 }
             }
@@ -1350,6 +1356,7 @@ pub fn repair_recovery_point(
     let root = resolve_vault_root(requested_root)?;
     let id = parse_repository_id(repository_id)?;
     let _lock = lock_vault(&root)?;
+    auth::require_primary(&root)?;
     let config = load_vault_config(&root)?;
     let mut catalog = load_catalog(&root)?;
     let primary_point = find_registration(&catalog, id)?
@@ -1505,6 +1512,7 @@ pub fn promote_recovery_vault(
         None,
         details,
         || {
+            auth::promote_identity(&root, catalog.generation)?;
             let mut objects_written = 0_u64;
             let mut object_bytes_written = 0_u64;
             for mirror in &mirrors {
@@ -1545,7 +1553,7 @@ pub fn promote_recovery_vault(
                 };
                 // Publishing mirror policy first is conservative: an interruption
                 // cannot make an unreplicated point appear protected.
-                write_checked_json(&vault_config_path(&root), &promoted_config)?;
+                save_vault_config(&root, &promoted_config)?;
                 recovery_failpoint("promotion_after_config_publish")?;
                 for registration in catalog.repositories.values_mut() {
                     for point in registration.recovery_points.values_mut() {
@@ -1588,7 +1596,8 @@ fn synchronize_promoted_mirror(
     source_catalog: &RecoveryCatalog,
     mirror: &Path,
 ) -> anyhow::Result<(u64, u64)> {
-    ensure_mirror_vault_with_audit(mirror)?;
+    let primary_identity = auth::require_primary(source_root)?;
+    ensure_mirror_vault_with_audit(mirror, &primary_identity, true)?;
     let _lock = lock_vault(mirror)?;
     let mut mirror_config = load_vault_config(mirror)?;
     anyhow::ensure!(
@@ -1658,7 +1667,7 @@ fn synchronize_promoted_mirror(
             }
             mirror_config.retention = source_config.retention.clone();
             mirror_config.at_rest_policy = source_config.at_rest_policy;
-            write_checked_json(&vault_config_path(mirror), &mirror_config)?;
+            save_vault_config(mirror, &mirror_config)?;
             mirror_catalog.generation = mirror_catalog.generation.saturating_add(1);
             save_catalog(mirror, &mirror_catalog)?;
             Ok((
@@ -1975,6 +1984,7 @@ fn preview_gc_selection(
 }
 
 fn capture_mirror(
+    primary_vault: &Path,
     mirror: &Path,
     source_root: &Path,
     revision: &str,
@@ -1983,7 +1993,8 @@ fn capture_mirror(
     primary: &RepositoryReplicationReport,
 ) -> anyhow::Result<()> {
     ensure_separate_roots(source_root, mirror)?;
-    ensure_mirror_vault_with_audit(mirror)?;
+    let primary_identity = auth::require_primary(primary_vault)?;
+    ensure_mirror_vault_with_audit(mirror, &primary_identity, false)?;
     let _lock = lock_vault(mirror)?;
     let mirror_config = load_vault_config(mirror)?;
     anyhow::ensure!(
@@ -2058,12 +2069,26 @@ fn capture_mirror(
     )
 }
 
-fn initialize_vault_root(root: &Path, mirror_roots: Vec<PathBuf>) -> anyhow::Result<()> {
+fn initialize_vault_root(
+    root: &Path,
+    mirror_roots: Vec<PathBuf>,
+) -> anyhow::Result<auth::VaultIdentity> {
     secure_create_dir(root)?;
     secure_create_dir(&root.join("locks"))?;
     secure_create_dir(&root.join("repositories"))?;
     secure_create_dir(&root.join("events"))?;
+    auth::recover_state(root)?;
     let config_path = vault_config_path(root);
+    let catalog_exists = catalog_path(root).exists();
+    anyhow::ensure!(
+        config_path.exists() == catalog_exists,
+        "Recovery Vault config/catalog initialization is incomplete"
+    );
+    let identity = if config_path.exists() {
+        auth::require_primary(root)?
+    } else {
+        auth::initialize_primary_identity(root)?
+    };
     if config_path.exists() {
         enforce_private_file(&config_path)?;
         let existing = load_vault_config(root)?;
@@ -2079,32 +2104,35 @@ fn initialize_vault_root(root: &Path, mirror_roots: Vec<PathBuf>) -> anyhow::Res
                 retention: existing.retention,
                 at_rest_policy: existing.at_rest_policy,
             };
-            write_checked_json(&config_path, &updated)?;
+            save_vault_config(root, &updated)?;
         }
     } else {
-        write_checked_json(
-            &config_path,
-            &RecoveryVaultConfig {
-                schema: VAULT_SCHEMA,
-                created_unix_ns: now_unix_ns(),
-                mirror_roots,
-                retention: RecoveryRetentionPolicy::default(),
-                at_rest_policy: RecoveryAtRestPolicy::default(),
-            },
-        )?;
+        let catalog = RecoveryCatalog::default();
+        let config = RecoveryVaultConfig {
+            schema: VAULT_SCHEMA,
+            created_unix_ns: now_unix_ns(),
+            mirror_roots,
+            retention: RecoveryRetentionPolicy::default(),
+            at_rest_policy: RecoveryAtRestPolicy::default(),
+        };
+        let config_bytes = checked_json_bytes(&config)?;
+        let catalog_bytes = checked_json_bytes(&catalog)?;
+        auth::initialize_state(root, catalog.generation, &config_bytes, &catalog_bytes)?;
     }
-    if !catalog_path(root).exists() {
-        save_catalog(root, &RecoveryCatalog::default())?;
+    if catalog_exists {
+        enforce_private_file(&catalog_path(root))?;
     } else {
+        enforce_private_file(&config_path)?;
         enforce_private_file(&catalog_path(root))?;
     }
-    Ok(())
+    Ok(identity)
 }
 
 fn ensure_vault_root(root: &Path) -> anyhow::Result<()> {
     if !vault_config_path(root).exists() {
         initialize_vault_root(root, Vec::new())?;
     } else {
+        auth::require_primary(root)?;
         load_vault_config(root)?;
     }
     Ok(())
@@ -2167,6 +2195,7 @@ fn validate_pairwise_disjoint_mirrors(mirrors: &[PathBuf]) -> anyhow::Result<()>
 }
 
 fn load_vault_config(root: &Path) -> anyhow::Result<RecoveryVaultConfig> {
+    auth::recover_state(root)?;
     let path = vault_config_path(root);
     enforce_private_file(&path)?;
     let config: RecoveryVaultConfig = read_checked_json(&path)?;
@@ -2176,6 +2205,9 @@ fn load_vault_config(root: &Path) -> anyhow::Result<RecoveryVaultConfig> {
     );
     config.retention.validate()?;
     validate_mirror_roots(root, &config.mirror_roots)?;
+    let catalog: RecoveryCatalog = read_checked_json(&catalog_path(root))?;
+    validate_catalog(&catalog)?;
+    auth::verify_state(root, catalog.generation)?;
     Ok(config)
 }
 
@@ -2200,10 +2232,12 @@ fn validate_mirror_roots(root: &Path, mirrors: &[PathBuf]) -> anyhow::Result<()>
 }
 
 fn update_mirror_registration(
+    primary_root: &Path,
     mirror: &Path,
     registration: &RecoveryRegistration,
 ) -> anyhow::Result<()> {
-    ensure_mirror_vault_with_audit(mirror)?;
+    let primary_identity = auth::require_primary(primary_root)?;
+    ensure_mirror_vault_with_audit(mirror, &primary_identity, false)?;
     let _lock = lock_vault(mirror)?;
     let mut catalog = load_catalog(mirror)?;
     let generation_before = catalog.generation;
@@ -2226,7 +2260,11 @@ fn update_mirror_registration(
     )
 }
 
-fn initialize_mirror_vault_with_audit(mirror: &Path) -> anyhow::Result<()> {
+fn initialize_mirror_vault_with_audit(
+    mirror: &Path,
+    primary: &auth::VaultIdentity,
+    allow_rebind: bool,
+) -> anyhow::Result<()> {
     secure_create_dir(mirror)?;
     secure_create_dir(&mirror.join("events"))?;
     secure_create_dir(&mirror.join("locks"))?;
@@ -2245,25 +2283,73 @@ fn initialize_mirror_vault_with_audit(mirror: &Path) -> anyhow::Result<()> {
         None,
         BTreeMap::from([("replica_role".to_string(), "mirror".to_string())]),
         || {
-            initialize_vault_root(mirror, Vec::new())?;
+            initialize_mirror_vault_root(mirror, primary, allow_rebind)?;
             Ok(((), Some(load_catalog(mirror)?.generation)))
         },
     )
 }
 
-fn ensure_mirror_vault_with_audit(mirror: &Path) -> anyhow::Result<()> {
+fn ensure_mirror_vault_with_audit(
+    mirror: &Path,
+    primary: &auth::VaultIdentity,
+    allow_rebind: bool,
+) -> anyhow::Result<()> {
     if vault_config_path(mirror).exists() {
-        initialize_vault_root(mirror, Vec::new())
+        initialize_mirror_vault_root(mirror, primary, allow_rebind)
     } else {
-        initialize_mirror_vault_with_audit(mirror)
+        initialize_mirror_vault_with_audit(mirror, primary, allow_rebind)
     }
 }
 
+fn initialize_mirror_vault_root(
+    mirror: &Path,
+    primary: &auth::VaultIdentity,
+    allow_rebind: bool,
+) -> anyhow::Result<()> {
+    secure_create_dir(mirror)?;
+    secure_create_dir(&mirror.join("locks"))?;
+    secure_create_dir(&mirror.join("repositories"))?;
+    secure_create_dir(&mirror.join("events"))?;
+    auth::recover_state(mirror)?;
+    let config_exists = vault_config_path(mirror).exists();
+    let catalog_exists = catalog_path(mirror).exists();
+    anyhow::ensure!(
+        config_exists == catalog_exists,
+        "Recovery mirror config/catalog initialization is incomplete"
+    );
+    if config_exists {
+        let config = load_vault_config(mirror)?;
+        anyhow::ensure!(
+            config.mirror_roots.is_empty(),
+            "recovery mirror target is configured as a primary Recovery Vault"
+        );
+        load_catalog(mirror)?;
+        auth::initialize_mirror_identity(mirror, primary, allow_rebind)?;
+    } else {
+        auth::initialize_mirror_identity(mirror, primary, false)?;
+        let config = RecoveryVaultConfig {
+            schema: VAULT_SCHEMA,
+            created_unix_ns: now_unix_ns(),
+            mirror_roots: Vec::new(),
+            retention: RecoveryRetentionPolicy::default(),
+            at_rest_policy: RecoveryAtRestPolicy::default(),
+        };
+        let catalog = RecoveryCatalog::default();
+        let config_bytes = checked_json_bytes(&config)?;
+        let catalog_bytes = checked_json_bytes(&catalog)?;
+        auth::initialize_state(mirror, catalog.generation, &config_bytes, &catalog_bytes)?;
+    }
+    auth::require_mirror_for(mirror, primary)?;
+    Ok(())
+}
+
 fn update_mirror_retention(
+    primary_root: &Path,
     mirror: &Path,
     retention: &RecoveryRetentionPolicy,
 ) -> anyhow::Result<()> {
-    ensure_mirror_vault_with_audit(mirror)?;
+    let primary_identity = auth::require_primary(primary_root)?;
+    ensure_mirror_vault_with_audit(mirror, &primary_identity, false)?;
     let _lock = lock_vault(mirror)?;
     let mut config = load_vault_config(mirror)?;
     let generation = load_catalog(mirror)?.generation;
@@ -2276,7 +2362,7 @@ fn update_mirror_retention(
         BTreeMap::from([("replica_role".to_string(), "mirror".to_string())]),
         || {
             config.retention = retention.clone();
-            write_checked_json(&vault_config_path(mirror), &config)?;
+            save_vault_config(mirror, &config)?;
             Ok(((), Some(generation)))
         },
     )
@@ -2330,16 +2416,28 @@ fn bounded_recovery_text(value: &str) -> String {
 }
 
 fn load_catalog(root: &Path) -> anyhow::Result<RecoveryCatalog> {
+    auth::recover_state(root)?;
     let path = catalog_path(root);
     enforce_private_file(&path)?;
     let catalog: RecoveryCatalog = read_checked_json(&path)?;
     validate_catalog(&catalog)?;
+    auth::verify_state(root, catalog.generation)?;
     Ok(catalog)
 }
 
 fn save_catalog(root: &Path, catalog: &RecoveryCatalog) -> anyhow::Result<()> {
     validate_catalog(catalog)?;
-    write_checked_json(&catalog_path(root), catalog)
+    let bytes = checked_json_bytes(catalog)?;
+    auth::write_catalog(root, catalog.generation, &bytes)
+}
+
+fn save_vault_config(root: &Path, config: &RecoveryVaultConfig) -> anyhow::Result<()> {
+    config.retention.validate()?;
+    validate_mirror_roots(root, &config.mirror_roots)?;
+    let catalog: RecoveryCatalog = read_checked_json(&catalog_path(root))?;
+    validate_catalog(&catalog)?;
+    let bytes = checked_json_bytes(config)?;
+    auth::write_config(root, catalog.generation, &bytes)
 }
 
 fn validate_catalog(catalog: &RecoveryCatalog) -> anyhow::Result<()> {
@@ -2610,6 +2708,7 @@ fn read_checked_json<T: DeserializeOwned + Serialize>(path: &Path) -> anyhow::Re
     Ok(document.payload)
 }
 
+#[cfg(test)]
 fn write_checked_json<T: Serialize>(path: &Path, payload: &T) -> anyhow::Result<()> {
     let bytes = checked_json_bytes(payload)?;
     atomic_write(path, &bytes)
@@ -3115,19 +3214,11 @@ mod tests {
         init_repository(&source, Vec::new()).unwrap();
         snapshot_repository(&source, "baseline".into(), None).unwrap();
         init_recovery_vault(Some(&other_primary), vec![other_mirror]).unwrap();
-        init_recovery_vault(Some(&primary), vec![other_primary.clone()]).unwrap();
-
-        let captured = capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
-        assert_eq!(
-            captured.recovery_point.durability,
-            RecoveryDurability::Degraded
-        );
-        assert_eq!(captured.recovery_point.replicas.len(), 1);
+        let error = init_recovery_vault(Some(&primary), vec![other_primary.clone()]).unwrap_err();
         assert!(
-            captured.recovery_point.replicas[0]
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("configured as a primary"))
+            error
+                .to_string()
+                .contains("configured as a primary Recovery Vault")
         );
         assert_eq!(
             recovery_vault_status(Some(&other_primary))
@@ -3442,7 +3533,11 @@ mod tests {
         capture_recovery_point(&source_b, "HEAD", Some(&unrelated_target)).unwrap();
 
         let error = promote_recovery_vault(Some(&survivor), vec![unrelated_target]).unwrap_err();
-        assert!(error.to_string().contains("unrelated recovery repository"));
+        assert!(
+            error
+                .to_string()
+                .contains("different authenticated lineage")
+        );
         assert_eq!(
             recovery_vault_status(Some(&survivor))
                 .unwrap()
