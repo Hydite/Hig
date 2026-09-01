@@ -129,6 +129,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y acl
       - name: Native repository fidelity tests
         run: "cargo test -p hig-core repository::tests::"
+      - name: Native CLI tests
+        run: cargo test -p hig-cli
       - name: Build native CLI
         run: cargo build --release -p hig-cli
       - name: Native repository snapshot diagnostic
@@ -188,6 +190,8 @@ jobs:
           node-version: 22
       - name: Native repository fidelity tests
         run: "cargo test -p hig-core repository::tests::"
+      - name: Native CLI tests
+        run: cargo test -p hig-cli
       - name: Build both macOS architectures
         run: |
           cargo build --release -p hig-cli --target aarch64-apple-darwin

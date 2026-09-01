@@ -73,6 +73,9 @@ fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("MCP path has no existing ancestor"))?;
     }
+    #[cfg(windows)]
+    let mut physical = dunce::canonicalize(ancestor)?;
+    #[cfg(not(windows))]
     let mut physical = ancestor.canonicalize()?;
     for component in missing.into_iter().rev() {
         physical.push(component);
@@ -826,7 +829,7 @@ mod tests {
     #[test]
     fn mcp_path_guard_accepts_physical_paths_and_missing_outputs() {
         let root = tempfile::tempdir().expect("temporary root");
-        let physical_root = root.path().canonicalize().expect("canonical root");
+        let physical_root = resolve_existing_ancestor(root.path()).expect("canonical root");
         let input = physical_root.join("input.txt");
         fs::write(&input, b"guarded").expect("write input");
 
