@@ -8,6 +8,7 @@ import path from "node:path";
 
 const hig = process.env.HIG_BIN || path.resolve("target", "release", process.platform === "win32" ? "hig.exe" : "hig");
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "hig-recovery-runbook-"));
+process.env.HIG_RECOVERY_AUTH_DIR = path.join(work, "recovery-auth");
 const source = path.join(work, "source");
 const expected = path.join(work, "expected");
 const primary = path.join(work, "primary");

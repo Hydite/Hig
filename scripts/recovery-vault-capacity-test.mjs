@@ -17,6 +17,7 @@ const vaultRoot = path.resolve(options.vaultRoot);
 const executable = process.platform === "win32" ? "hig.exe" : "hig";
 const higBin = path.resolve(process.env.HIG_BIN || path.join(projectRoot, "target", "release", executable));
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "hig-recovery-capacity-"));
+process.env.HIG_RECOVERY_AUTH_DIR = path.join(work, "recovery-auth");
 const source = path.join(work, "source");
 const restored = path.join(work, "restored");
 const reservation = path.join(vaultRoot, ".capacity-reservation");

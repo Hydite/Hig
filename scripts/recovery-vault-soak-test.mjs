@@ -33,6 +33,7 @@ const mcpServer = path.resolve(
     || path.join(projectRoot, "packages", "hig-mcp-server", "bin", "hig-mcp-server.js"),
 );
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "hig-recovery-vault-soak-"));
+process.env.HIG_RECOVERY_AUTH_DIR = path.join(work, "recovery-auth");
 const workspace = path.join(work, "workspace");
 const primaryVault = path.join(work, "primary-vault");
 const mirrorVault = path.join(work, "mirror-vault");
