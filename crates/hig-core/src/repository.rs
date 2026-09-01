@@ -5949,6 +5949,9 @@ mod windows_access_control {
             AccessControlMetadata::WindowsSecurityDescriptor { sddl } => sddl,
             _ => anyhow::bail!("ACL platform does not match Windows destination"),
         };
+        if read(path)? == *expected {
+            return Ok(());
+        }
         let mut wide = std::str::from_utf8(sddl)?
             .encode_utf16()
             .collect::<Vec<_>>();
@@ -5977,8 +5980,15 @@ mod windows_access_control {
             "failed to release parsed security descriptor"
         );
         result?;
+        let actual = read(path)?;
+        #[cfg(test)]
         anyhow::ensure!(
-            read(path)? == *expected,
+            actual == *expected,
+            "restored Windows ACL failed exact verification: expected {expected:?}, actual {actual:?}"
+        );
+        #[cfg(not(test))]
+        anyhow::ensure!(
+            actual == *expected,
             "restored Windows ACL failed exact verification"
         );
         Ok(())
