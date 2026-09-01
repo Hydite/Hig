@@ -1153,24 +1153,50 @@ fn io_hotspot_summary(rows: &[BenchmarkRow], probe: &CopyProbe) -> String {
 }
 
 pub(crate) fn paths_on_same_volume(left: &Path, right: &Path) -> bool {
-    let Ok(left) = fs::metadata(left) else {
-        return false;
-    };
-    let Ok(right) = fs::metadata(right) else {
-        return false;
-    };
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let Ok(left) = fs::metadata(left) else {
+            return false;
+        };
+        let Ok(right) = fs::metadata(right) else {
+            return false;
+        };
         left.dev() == right.dev()
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = (left, right);
-        false
+        windows_volume_serial(left)
+            .is_some_and(|volume| Some(volume) == windows_volume_serial(right))
     }
+}
+
+#[cfg(windows)]
+fn windows_volume_serial(path: &Path) -> Option<u64> {
+    use std::fs::OpenOptions;
+    use std::mem::size_of;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut information = FILE_ID_INFO::default();
+    let status = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            std::ptr::addr_of_mut!(information).cast(),
+            u32::try_from(size_of::<FILE_ID_INFO>()).ok()?,
+        )
+    };
+    (status != 0).then_some(information.VolumeSerialNumber)
 }
 
 fn run_lobehub_incremental(

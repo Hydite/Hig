@@ -1504,6 +1504,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "walkdir",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
