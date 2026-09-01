@@ -25,7 +25,14 @@ pub(crate) fn enforce_mcp_argv_paths() -> anyhow::Result<()> {
         .collect::<anyhow::Result<Vec<_>>>()?;
     anyhow::ensure!(!roots.is_empty(), "MCP enforced root list is empty");
     enforce_mcp_path(&std::env::current_dir()?, &roots, false)?;
-    for argument in std::env::args_os().skip(1) {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.first().is_some_and(|value| value == "recovery")
+        && let Some(auth_root) = std::env::var_os("HIG_RECOVERY_AUTH_DIR")
+        && !auth_root.is_empty()
+    {
+        enforce_mcp_path(Path::new(&auth_root), &roots, true)?;
+    }
+    for argument in arguments {
         let path = PathBuf::from(argument);
         if path.is_absolute() {
             enforce_mcp_path(&path, &roots, true)?;

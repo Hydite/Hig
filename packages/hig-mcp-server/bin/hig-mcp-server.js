@@ -1203,13 +1203,17 @@ async function runHig(args, options = {}) {
   const enforcedRoots = allowAnyPath
     ? undefined
     : allowedRoots.map((root) => root.physical).join(path.delimiter);
+  const recoveryAuthRoot = !allowAnyPath && args[0] === "recovery"
+    ? resolveRecoveryAuthRoot()
+    : undefined;
   return new Promise((resolve) => {
     const child = spawn(higBin, args, {
       cwd: process.env.HIG_MCP_WORKDIR || process.cwd(),
       env: {
         ...process.env,
         NO_COLOR: "1",
-        ...(enforcedRoots ? { HIG_MCP_ENFORCED_ROOTS: enforcedRoots } : {})
+        ...(enforcedRoots ? { HIG_MCP_ENFORCED_ROOTS: enforcedRoots } : {}),
+        ...(recoveryAuthRoot ? { HIG_RECOVERY_AUTH_DIR: recoveryAuthRoot } : {})
       },
       stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe"]
     });
@@ -1245,6 +1249,16 @@ async function runHig(args, options = {}) {
       resolve({ code: code ?? 1, signal, stdout: out, stderr: err, data });
     });
   });
+}
+
+function resolveRecoveryAuthRoot() {
+  const configured = process.env.HIG_RECOVERY_AUTH_DIR;
+  if (configured) return resolveOutputPath(configured);
+  const home = process.env.HOME || process.env.USERPROFILE;
+  if (!home) {
+    throw new Error("HOME or USERPROFILE is required for Recovery Vault authentication");
+  }
+  return resolveOutputPath(path.join(home, ".hig", "recovery-auth"));
 }
 
 function validateSpawnPaths(args) {

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const server = path.join(root, "packages", "hig-mcp-server", "bin", "hig-mcp-server.js");
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "hig-mcp-security-"));
+const outside = fs.mkdtempSync(path.join(os.tmpdir(), "hig-mcp-security-outside-"));
 const fakeScript = path.join(work, "fake-hig.mjs");
 const capture = path.join(work, "capture.jsonl");
 const events = path.join(work, "events.jsonl");
@@ -139,6 +140,25 @@ async function boundsQueuedCalls() {
   }
 }
 
+async function rejectsRecoveryAuthenticationOutsideAllowedRoots() {
+  const vault = path.join(work, "recovery-vault");
+  const client = new McpClient(startServer({
+    HIG_RECOVERY_AUTH_DIR: path.join(outside, "recovery-auth")
+  }));
+  try {
+    await client.initialize();
+    const response = await client.request("tools/call", {
+      name: "hig_recovery_init",
+      arguments: { vaultRoot: vault }
+    });
+    assert.equal(response.result.isError, true, JSON.stringify(response));
+    assert.match(response.result.content[0].text, /outside allowed roots/i);
+    assert.equal(fs.existsSync(vault), false);
+  } finally {
+    await client.close();
+  }
+}
+
 function startServer(extraEnv = {}) {
   return spawn(process.execPath, [server], {
     cwd: work,
@@ -250,7 +270,9 @@ try {
   await keepsSecretsOutOfArguments();
   await boundsConcurrentProcesses();
   await boundsQueuedCalls();
+  await rejectsRecoveryAuthenticationOutsideAllowedRoots();
   console.log("hig-mcp-security: PASS");
 } finally {
   fs.rmSync(work, { recursive: true, force: true });
+  fs.rmSync(outside, { recursive: true, force: true });
 }

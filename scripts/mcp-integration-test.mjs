@@ -34,6 +34,7 @@ const child = spawn(process.execPath, [server], {
     HIG_BIN: higBin,
     HIG_MCP_ALLOWED_ROOTS: work,
     HIG_MCP_WORKDIR: workspace,
+    HIG_RECOVERY_AUTH_DIR: path.join(work, "recovery-auth"),
     HIG_MCP_TIMEOUT_MS: "120000"
   },
   stdio: ["pipe", "pipe", "pipe"]
