@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+trap 'status=$?; echo "hig-golden-fixtures: FAIL at line $LINENO (exit $status)" >&2' ERR
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HIG_BIN=${HIG_BIN:-"$ROOT/target/release/hig"}
