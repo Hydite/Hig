@@ -61,6 +61,18 @@ jobs:
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
         run: node scripts/recovery-vault-soak-test.mjs --mode ci --duration-minutes 0.25 --report artifacts/recovery-vault-soak-ci.json
+      - name: Recovery Vault real capacity exhaustion
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release/hig
+        run: |
+          capacity_root="${RUNNER_TEMP}/hig-recovery-capacity"
+          sudo mkdir -p "$capacity_root"
+          sudo mount -t tmpfs -o size=64m,mode=0700 tmpfs "$capacity_root"
+          sudo chown "$(id -u):$(id -g)" "$capacity_root"
+          trap 'sudo umount "$capacity_root"' EXIT
+          node scripts/recovery-vault-capacity-test.mjs \
+            --vault-root "$capacity_root" \
+            --report artifacts/recovery-vault-capacity-ci.json
       - name: Cold-path regression policy
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
@@ -74,6 +86,7 @@ jobs:
           path: |
             artifacts/repository-soak-ci.json
             artifacts/recovery-vault-soak-ci.json
+            artifacts/recovery-vault-capacity-ci.json
             artifacts/cold-path-regression-ci.json
           if-no-files-found: error
 
