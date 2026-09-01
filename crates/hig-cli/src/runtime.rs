@@ -16,6 +16,63 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
+pub(crate) fn enforce_mcp_argv_paths() -> anyhow::Result<()> {
+    let Some(raw_roots) = std::env::var_os("HIG_MCP_ENFORCED_ROOTS") else {
+        return Ok(());
+    };
+    let roots = std::env::split_paths(&raw_roots)
+        .map(|root| resolve_existing_ancestor(&root))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(!roots.is_empty(), "MCP enforced root list is empty");
+    enforce_mcp_path(&std::env::current_dir()?, &roots, false)?;
+    for argument in std::env::args_os().skip(1) {
+        let path = PathBuf::from(argument);
+        if path.is_absolute() {
+            enforce_mcp_path(&path, &roots, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn enforce_mcp_path(
+    path: &Path,
+    roots: &[PathBuf],
+    require_physical_spelling: bool,
+) -> anyhow::Result<()> {
+    let physical = resolve_existing_ancestor(path)?;
+    anyhow::ensure!(
+        (!require_physical_spelling || physical == path)
+            && roots.iter().any(|root| physical.starts_with(root)),
+        "MCP path changed or escaped its enforced root: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        let name = ancestor
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("MCP path has no existing ancestor"))?;
+        missing.push(name.to_os_string());
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("MCP path has no existing ancestor"))?;
+    }
+    let mut physical = ancestor.canonicalize()?;
+    for component in missing.into_iter().rev() {
+        physical.push(component);
+    }
+    Ok(physical)
+}
+
 pub(crate) fn handle_project_init(
     dir: &Path,
     cache_dir: Option<PathBuf>,
@@ -752,4 +809,61 @@ pub(crate) fn unlock_session_for_cache(
 
 pub(crate) fn default_cache_dir() -> PathBuf {
     PathBuf::from(".hig-cache")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enforce_mcp_path, resolve_existing_ancestor};
+    use std::fs;
+
+    #[test]
+    fn mcp_path_guard_accepts_physical_paths_and_missing_outputs() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let physical_root = root.path().canonicalize().expect("canonical root");
+        let input = physical_root.join("input.txt");
+        fs::write(&input, b"guarded").expect("write input");
+
+        enforce_mcp_path(&input, std::slice::from_ref(&physical_root), true)
+            .expect("physical input must be accepted");
+
+        let output = physical_root.join("missing").join("output.hig");
+        assert_eq!(
+            resolve_existing_ancestor(&output).expect("resolve missing output"),
+            output
+        );
+        enforce_mcp_path(&output, std::slice::from_ref(&physical_root), true)
+            .expect("missing output under the authorized root must be accepted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_path_guard_rejects_symlink_spelling_and_root_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let outside = tempfile::tempdir().expect("outside root");
+        let physical_root = root.path().canonicalize().expect("canonical root");
+        let inside_dir = physical_root.join("inside");
+        fs::create_dir(&inside_dir).expect("create inside directory");
+
+        let alias = physical_root.join("inside-alias");
+        symlink(&inside_dir, &alias).expect("create internal symlink");
+        let alias_error = enforce_mcp_path(
+            &alias.join("output.hig"),
+            std::slice::from_ref(&physical_root),
+            true,
+        )
+        .expect_err("logical symlink spelling must be rejected");
+        assert!(alias_error.to_string().contains("changed or escaped"));
+
+        let escape = physical_root.join("escape");
+        symlink(outside.path(), &escape).expect("create escaping symlink");
+        let escape_error = enforce_mcp_path(
+            &escape.join("recovered.txt"),
+            std::slice::from_ref(&physical_root),
+            false,
+        )
+        .expect_err("symlink escape must be rejected");
+        assert!(escape_error.to_string().contains("changed or escaped"));
+    }
 }

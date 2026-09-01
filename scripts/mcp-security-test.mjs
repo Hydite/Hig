@@ -22,7 +22,12 @@ let stdin = "";
 for await (const chunk of process.stdin) stdin += chunk;
 const now = () => Number(process.hrtime.bigint());
 const append = (file, value) => file && fs.appendFileSync(file, JSON.stringify(value) + "\\n");
-append(process.env.HIG_TEST_CAPTURE, { args, stdin, envSecret: process.env.HIG_TEST_SECRET || null });
+append(process.env.HIG_TEST_CAPTURE, {
+  args,
+  stdin,
+  envSecret: process.env.HIG_TEST_SECRET || null,
+  enforcedRoots: process.env.HIG_MCP_ENFORCED_ROOTS || null
+});
 append(process.env.HIG_TEST_EVENTS, { kind: "start", pid: process.pid, at: now() });
 await new Promise((resolve) => setTimeout(resolve, Number(process.env.HIG_TEST_DELAY_MS || 0)));
 append(process.env.HIG_TEST_EVENTS, { kind: "end", pid: process.pid, at: now() });
@@ -80,6 +85,10 @@ async function keepsSecretsOutOfArguments() {
   assert(!records[0].args.includes(secret), "secret leaked into child arguments");
   assert.equal(records[0].stdin, `${secret}\n`);
   assert.equal(records[0].envSecret, null);
+  const physicalWork = fs.realpathSync.native(work);
+  assert.equal(records[0].args[1], physicalWork);
+  assert.equal(records[0].args[3], path.join(physicalWork, "secret-test.hig"));
+  assert.equal(records[0].enforcedRoots, physicalWork);
 }
 
 async function boundsConcurrentProcesses() {

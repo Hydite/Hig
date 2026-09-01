@@ -951,7 +951,7 @@ async function callTool(name, args) {
       return runHig([
         "recovery", "tombstone", stringArg(args.repositoryId, "repositoryId"),
         "--kind", stringArg(args.kind, "kind"),
-        ...optionValue("--source-path", args.sourcePath),
+        ...optionPath("--source-path", args.sourcePath),
         ...optionValue("--path", args.path),
         "--reason", stringArg(args.reason, "reason"),
         ...recoveryVaultArgs(args, false),
@@ -1170,7 +1170,7 @@ function resolveCheckedPath(value, output) {
   if (!output && !fs.existsSync(absolute)) {
     throw new Error(`Input path does not exist: ${absolute}`);
   }
-  return absolute;
+  return physical;
 }
 
 function resolvePhysicalPath(value) {
@@ -1199,10 +1199,18 @@ function isInside(target, root) {
 async function runHig(args, options = {}) {
   const higBin = resolveHigBinary({ packageRoot });
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+  validateSpawnPaths(args);
+  const enforcedRoots = allowAnyPath
+    ? undefined
+    : allowedRoots.map((root) => root.physical).join(path.delimiter);
   return new Promise((resolve) => {
     const child = spawn(higBin, args, {
       cwd: process.env.HIG_MCP_WORKDIR || process.cwd(),
-      env: { ...process.env, NO_COLOR: "1" },
+      env: {
+        ...process.env,
+        NO_COLOR: "1",
+        ...(enforcedRoots ? { HIG_MCP_ENFORCED_ROOTS: enforcedRoots } : {})
+      },
       stdio: [options.stdin ? "pipe" : "ignore", "pipe", "pipe"]
     });
     if (options.stdin) child.stdin.end(options.stdin, "utf8");
@@ -1237,6 +1245,20 @@ async function runHig(args, options = {}) {
       resolve({ code: code ?? 1, signal, stdout: out, stderr: err, data });
     });
   });
+}
+
+function validateSpawnPaths(args) {
+  if (allowAnyPath) return;
+  for (const value of args) {
+    if (typeof value !== "string" || !path.isAbsolute(value)) continue;
+    const physical = resolvePhysicalPath(value);
+    if (physical !== value) {
+      throw new Error(`Path changed after MCP authorization: ${value}`);
+    }
+    if (!allowedRoots.some((root) => isInside(physical, root.physical))) {
+      throw new Error(`Path escaped allowed roots before execution: ${value}`);
+    }
+  }
 }
 
 async function withToolPermit(operation) {
