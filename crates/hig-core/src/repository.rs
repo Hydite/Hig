@@ -2283,7 +2283,7 @@ impl Repository {
                     relative,
                     metadata: capture_directory_metadata(
                         entry.path(),
-                        &entry.metadata().with_context(|| {
+                        &fs::symlink_metadata(entry.path()).with_context(|| {
                             format!(
                                 "failed to stat source directory: {}",
                                 entry.path().display()
