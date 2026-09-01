@@ -15,6 +15,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  desktop:
+    name: Desktop dependency and frontend gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/hig-desktop
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Install pinned pnpm
+        run: npm install --global pnpm@11.20.0
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: JavaScript dependency vulnerability audit
+        run: pnpm audit --audit-level moderate --registry=https://registry.npmjs.org
+      - name: Desktop tests
+        run: pnpm test
+      - name: Desktop lint
+        run: pnpm lint
+      - name: Desktop production build
+        run: pnpm build
+
   correctness:
     name: Core, CLI, compatibility, and MCP
     runs-on: ubuntu-24.04
