@@ -991,7 +991,7 @@ impl RepositoryWatcher {
                         self.last_event = Some(Instant::now());
                     }
                 }
-                Ok(Err(error)) => return Err(error.into()),
+                Ok(Err(error)) => self.recover_backend_error(error),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     anyhow::bail!("repository watcher disconnected")
@@ -1011,6 +1011,15 @@ impl RepositoryWatcher {
             return self.snapshot(message, author);
         }
         Ok(None)
+    }
+
+    fn recover_backend_error(&mut self, error: notify::Error) {
+        eprintln!(
+            "repository watcher backend error; forcing authoritative reconciliation: {error}"
+        );
+        self.pending = true;
+        let now = Instant::now();
+        self.last_event = Some(now.checked_sub(self.debounce).unwrap_or(now));
     }
 
     fn snapshot(
@@ -8327,6 +8336,31 @@ mod tests {
             .poll("reconciliation", Some("watcher"))
             .unwrap()
             .expect("reconciliation did not run");
+        assert!(second.created);
+        assert_eq!(second.parent_id, Some(first.commit_id));
+        assert_eq!(repository_log(temp.path(), 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn watcher_recovers_backend_errors_with_authoritative_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("watched.txt"), b"first").unwrap();
+        init_repository(temp.path(), Vec::new()).unwrap();
+        let first = snapshot_repository(temp.path(), "first".to_string(), None).unwrap();
+
+        fs::write(temp.path().join("watched.txt"), b"changed before fault").unwrap();
+        let mut watcher = RepositoryWatcher::start_with_reconciliation_interval(
+            temp.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        watcher.recover_backend_error(notify::Error::generic("synthetic backend fault"));
+
+        let second = watcher
+            .poll("backend recovery", Some("watcher"))
+            .unwrap()
+            .expect("backend recovery did not reconcile immediately");
         assert!(second.created);
         assert_eq!(second.parent_id, Some(first.commit_id));
         assert_eq!(repository_log(temp.path(), 10).unwrap().len(), 2);

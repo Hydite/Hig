@@ -219,12 +219,38 @@ async function startRecoveryWatcher(client, message) {
 }
 
 async function waitForWatcherSnapshot(client) {
-  const status = await waitFor(async () => {
-    const current = await client.tool("hig_repo_watch_status", { dir: workspace });
-    return current.data.snapshots > client.watcherSnapshots ? current : null;
-  }, options.mode === "release" ? 5 * 60_000 : 60_000, "Recovery Vault watcher snapshot");
+  let lastStatus;
+  let status;
+  try {
+    status = await waitFor(async () => {
+      const current = await client.tool("hig_repo_watch_status", { dir: workspace });
+      lastStatus = current;
+      if (!current.data.active) {
+        throw new Error(`Recovery Vault watcher exited: ${watcherDiagnostics(current)}`);
+      }
+      return current.data.snapshots > client.watcherSnapshots ? current : null;
+    }, options.mode === "release" ? 5 * 60_000 : 60_000, "Recovery Vault watcher snapshot");
+  } catch (error) {
+    if (lastStatus && !String(error.message).includes("Recovery Vault watcher exited")) {
+      error.message = `${error.message}; last watcher status: ${watcherDiagnostics(lastStatus)}`;
+    }
+    throw error;
+  }
   client.watcherSnapshots = status.data.snapshots;
   return status;
+}
+
+function watcherDiagnostics(status) {
+  const data = status.data;
+  return JSON.stringify({
+    active: data.active,
+    snapshots: data.snapshots,
+    exit_code: data.exit_code,
+    signal: data.signal,
+    recovery_last_success_at: data.recovery_last_success_at,
+    recovery_rpo_lag_ms: data.recovery_rpo_lag_ms,
+    stderr: typeof data.stderr === "string" ? data.stderr.slice(-8192) : data.stderr,
+  });
 }
 
 function recordWatcherCapture(status, repositoryId) {
