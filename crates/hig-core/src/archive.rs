@@ -15,6 +15,7 @@ use crate::{
     PackCriticalTimings, PackOptions, PackReport, PackTimings, PackTimingsUs, PipelineOptions,
     PipelineReport, SessionReport, SolidMode, SpeedMode, UnpackOptions, WriteProfileReport,
 };
+use bincode::Options;
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ const MAX_ARCHIVE_BLOCKS: usize = 1_000_000;
 const MAX_ARCHIVE_PATH_BYTES: usize = 32 * 1024;
 const MAX_ARCHIVE_BLOCK_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_BLOCK_RAW_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_TOTAL_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_KDF_MEMORY_KIB: u32 = 256 * 1024;
 const MAX_ARCHIVE_KDF_TIME_COST: u32 = 10;
 const MAX_ARCHIVE_KDF_PARALLELISM: u32 = 16;
@@ -817,7 +819,6 @@ pub fn migrate_archive(
         EncryptionMode::None => None,
     };
     let result = (|| -> anyhow::Result<ArchiveMigrationReport> {
-        fs::create_dir_all(&staging)?;
         unpack(UnpackOptions {
             archive_file: source_archive.clone(),
             output_dir: staging.clone(),
@@ -909,7 +910,7 @@ pub fn inspect_archive(path: &Path, password: Option<&str>) -> anyhow::Result<Ar
             )?;
             let manifest_plain =
                 crypto::decrypt(&key, &header.manifest_nonce, &manifest_ciphertext)?;
-            let manifest: Manifest = bincode::deserialize(&manifest_plain)?;
+            let manifest: Manifest = deserialize_manifest_bounded(&manifest_plain)?;
             validate_v1_manifest(&manifest, archive_bytes)?;
             let files = manifest
                 .files
@@ -2391,17 +2392,17 @@ fn unpack_v1(
         &header.kdf,
     )?;
     let manifest_plain = crypto::decrypt(&key, &header.manifest_nonce, &manifest_ciphertext)?;
-    let manifest: Manifest = bincode::deserialize(&manifest_plain)?;
+    let manifest: Manifest = deserialize_manifest_bounded(&manifest_plain)?;
     validate_v1_manifest(&manifest, archive_bytes)?;
-
-    if options.output_dir.exists() && !options.output_dir.is_dir() {
-        anyhow::bail!(
-            "output path is not a directory: {}",
-            options.output_dir.display()
-        );
-    }
-
-    let mut verified_files = Vec::with_capacity(manifest.files.len());
+    let total_bytes = total_extracted_bytes(manifest.files.iter().map(|file| file.size))?;
+    let mut stage = ExtractionStage::create(&options.output_dir, options.overwrite, total_bytes)?;
+    prepare_staged_files(
+        stage.path(),
+        manifest
+            .files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.size)),
+    )?;
     let file_count = manifest.files.len() as u64;
     for (file_index, file) in manifest.files.iter().enumerate() {
         control.check_cancelled()?;
@@ -2413,10 +2414,7 @@ fn unpack_v1(
             None,
             None,
         );
-        let target = checked_target(&options.output_dir, &file.relative_path)?;
-        if target.exists() && !options.overwrite {
-            anyhow::bail!("refusing to overwrite existing file: {}", target.display());
-        }
+        let target = checked_target(stage.path(), &file.relative_path)?;
         let block = manifest
             .blocks
             .iter()
@@ -2434,6 +2432,11 @@ fn unpack_v1(
         archive.seek(SeekFrom::Start(block.archive_offset))?;
         archive.read_exact(&mut ciphertext)?;
         let compressed = crypto::decrypt(&key, &block.nonce, &ciphertext)?;
+        anyhow::ensure!(
+            compressed.len() as u64 == block.compressed_size,
+            "compressed block length mismatch for {}",
+            file.relative_path
+        );
         if blake3::hash(&compressed).as_bytes() != &block.block_id {
             anyhow::bail!("block hash mismatch for {}", file.relative_path);
         }
@@ -2441,17 +2444,8 @@ fn unpack_v1(
         if blake3::hash(&content).as_bytes() != &file.content_hash {
             anyhow::bail!("file hash mismatch for {}", file.relative_path);
         }
-        verified_files.push((target, content, file.permissions));
-    }
-
-    fs::create_dir_all(&options.output_dir)?;
-    for (file_index, (target, content, permissions)) in verified_files.into_iter().enumerate() {
-        control.check_cancelled()?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-        set_permissions(&target, permissions)?;
+        write_staged_slice(&target, 0, &content)?;
+        set_permissions(&target, file.permissions)?;
         control.report(
             OperationPhase::Extracting,
             file_index as u64 + 1,
@@ -2461,7 +2455,24 @@ fn unpack_v1(
             None,
         );
     }
+    control.check_cancelled()?;
+    stage.publish()?;
     Ok(())
+}
+
+#[derive(Debug)]
+enum V2BlockWrite {
+    Slice {
+        file_index: usize,
+        block_offset: u64,
+        len: u64,
+    },
+    Chunk {
+        file_index: usize,
+        file_offset: u64,
+        len: u64,
+        chunk_hash: [u8; 32],
+    },
 }
 
 fn unpack_v2(
@@ -2516,18 +2527,57 @@ fn unpack_v2(
     if !compact_hashes_omitted && computed_root_hash != manifest.root_hash {
         anyhow::bail!("manifest root hash mismatch");
     }
+    let total_bytes = total_extracted_bytes(manifest.files.iter().map(|file| file.size))?;
+    let mut stage = ExtractionStage::create(&options.output_dir, options.overwrite, total_bytes)?;
+    prepare_staged_files(
+        stage.path(),
+        manifest
+            .files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.size)),
+    )?;
 
-    if options.output_dir.exists() && !options.output_dir.is_dir() {
-        anyhow::bail!(
-            "output path is not a directory: {}",
-            options.output_dir.display()
-        );
+    let mut block_writes = BTreeMap::<[u8; 32], Vec<V2BlockWrite>>::new();
+    for (file_index, file) in manifest.files.iter().enumerate() {
+        match file.layout.as_ref() {
+            Some(FileLayout::Empty) => {}
+            Some(FileLayout::InlineBlock {
+                block_id,
+                offset,
+                len,
+            }) => block_writes
+                .entry(*block_id)
+                .or_default()
+                .push(V2BlockWrite::Slice {
+                    file_index,
+                    block_offset: *offset,
+                    len: *len,
+                }),
+            Some(FileLayout::Chunked { chunks }) => {
+                for chunk in chunks {
+                    block_writes
+                        .entry(chunk.block_id)
+                        .or_default()
+                        .push(V2BlockWrite::Chunk {
+                            file_index,
+                            file_offset: chunk.file_offset,
+                            len: chunk.len,
+                            chunk_hash: chunk.chunk_hash,
+                        });
+                }
+            }
+            None => block_writes
+                .entry(file.block_id)
+                .or_default()
+                .push(V2BlockWrite::Slice {
+                    file_index,
+                    block_offset: file.block_offset,
+                    len: file.block_len,
+                }),
+        }
     }
 
-    let mut verified_files = Vec::with_capacity(manifest.files.len());
-    let mut verified_hashes = Vec::with_capacity(manifest.files.len());
     let mut next_block_offset = HEADER_FIXED_LEN as u64 + header.manifest_len;
-    let mut raw_blocks = std::collections::BTreeMap::new();
     for block in &manifest.blocks {
         control.check_cancelled()?;
         let mut ciphertext = vec![
@@ -2543,14 +2593,58 @@ fn unpack_v2(
         next_block_offset += block.encrypted_size;
         let compressed =
             unprotect_payload(header.encryption, key.as_ref(), &block.nonce, &ciphertext)?;
+        anyhow::ensure!(
+            compressed.len() as u64 == block.compressed_size,
+            "compressed block length mismatch"
+        );
         if blake3::hash(&compressed).as_bytes() != &block.block_id {
             anyhow::bail!("block hash mismatch");
         }
         let raw = codec::decompress(Compression::Zstd, &compressed, block.raw_size)?;
-        raw_blocks.insert(block.block_id, raw);
+        if let Some(writes) = block_writes.remove(&block.block_id) {
+            for write in writes {
+                match write {
+                    V2BlockWrite::Slice {
+                        file_index,
+                        block_offset,
+                        len,
+                    } => {
+                        let file = &manifest.files[file_index];
+                        let content = slice_block(&raw, block_offset, len, &file.relative_path)?;
+                        let target = checked_target(stage.path(), &file.relative_path)?;
+                        write_staged_slice(&target, 0, content)?;
+                    }
+                    V2BlockWrite::Chunk {
+                        file_index,
+                        file_offset,
+                        len,
+                        chunk_hash,
+                    } => {
+                        let file = &manifest.files[file_index];
+                        anyhow::ensure!(
+                            raw.len() as u64 == len,
+                            "chunk length mismatch for {}",
+                            file.relative_path
+                        );
+                        anyhow::ensure!(
+                            blake3::hash(&raw).as_bytes() == &chunk_hash,
+                            "chunk hash mismatch for {}",
+                            file.relative_path
+                        );
+                        let target = checked_target(stage.path(), &file.relative_path)?;
+                        write_staged_slice(&target, file_offset, &raw)?;
+                    }
+                }
+            }
+        }
     }
+    anyhow::ensure!(
+        block_writes.is_empty(),
+        "archive references a missing block"
+    );
 
     let file_count = manifest.files.len() as u64;
+    let mut verified_hashes = Vec::with_capacity(manifest.files.len());
     for (file_index, file) in manifest.files.iter().enumerate() {
         control.check_cancelled()?;
         control.report(
@@ -2561,70 +2655,13 @@ fn unpack_v2(
             None,
             None,
         );
-        let target = checked_target(&options.output_dir, &file.relative_path)?;
-        if target.exists() && !options.overwrite {
-            anyhow::bail!("refusing to overwrite existing file: {}", target.display());
-        }
-        let content = match file.layout.as_ref() {
-            Some(FileLayout::Empty) => Vec::new(),
-            Some(FileLayout::InlineBlock {
-                block_id,
-                offset,
-                len,
-            }) => {
-                let raw = raw_blocks
-                    .get(block_id)
-                    .ok_or_else(|| anyhow::anyhow!("missing block for {}", file.relative_path))?;
-                slice_block(raw, *offset, *len, &file.relative_path)?.to_vec()
-            }
-            Some(FileLayout::Chunked { chunks }) => {
-                let mut content = vec![0_u8; file.size as usize];
-                for chunk in chunks {
-                    let raw = raw_blocks.get(&chunk.block_id).ok_or_else(|| {
-                        anyhow::anyhow!("missing chunk block for {}", file.relative_path)
-                    })?;
-                    if raw.len() != chunk.len as usize {
-                        anyhow::bail!("chunk length mismatch for {}", file.relative_path);
-                    }
-                    if blake3::hash(raw).as_bytes() != &chunk.chunk_hash {
-                        anyhow::bail!("chunk hash mismatch for {}", file.relative_path);
-                    }
-                    let start = chunk.file_offset as usize;
-                    let end = start + chunk.len as usize;
-                    if end > content.len() {
-                        anyhow::bail!("chunk exceeds file bounds for {}", file.relative_path);
-                    }
-                    content[start..end].copy_from_slice(raw);
-                }
-                content
-            }
-            None => {
-                let raw = raw_blocks
-                    .get(&file.block_id)
-                    .ok_or_else(|| anyhow::anyhow!("missing block for {}", file.relative_path))?;
-                slice_block(raw, file.block_offset, file.block_len, &file.relative_path)?.to_vec()
-            }
-        };
-        let content_hash = *blake3::hash(&content).as_bytes();
+        let target = checked_target(stage.path(), &file.relative_path)?;
+        let content_hash = hash_staged_file(&target, file.size)?;
         if !compact_hashes_omitted && content_hash != file.content_hash {
             anyhow::bail!("file hash mismatch for {}", file.relative_path);
         }
         verified_hashes.push((&file.relative_path, content_hash));
-        verified_files.push((target, content, file.permissions));
-    }
-
-    if compact_hashes_omitted && root_hash(&verified_hashes) != manifest.root_hash {
-        anyhow::bail!("manifest root hash mismatch");
-    }
-
-    fs::create_dir_all(&options.output_dir)?;
-    for (file_index, (target, content, permissions)) in verified_files.into_iter().enumerate() {
-        control.check_cancelled()?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-        set_permissions(&target, permissions)?;
+        set_permissions(&target, file.permissions)?;
         control.report(
             OperationPhase::Extracting,
             file_index as u64 + 1,
@@ -2634,6 +2671,11 @@ fn unpack_v2(
             None,
         );
     }
+    if compact_hashes_omitted && root_hash(&verified_hashes) != manifest.root_hash {
+        anyhow::bail!("manifest root hash mismatch");
+    }
+    control.check_cancelled()?;
+    stage.publish()?;
     Ok(())
 }
 
@@ -3788,23 +3830,40 @@ fn slice_block<'a>(
     len: u64,
     relative_path: &str,
 ) -> anyhow::Result<&'a [u8]> {
-    let start = offset as usize;
-    let end = start + len as usize;
+    let start = usize::try_from(offset)?;
+    let end = start
+        .checked_add(usize::try_from(len)?)
+        .ok_or_else(|| anyhow::anyhow!("file slice overflow for {relative_path}"))?;
     if end > raw.len() {
         anyhow::bail!("file slice exceeds block bounds for {relative_path}");
     }
     Ok(&raw[start..end])
 }
 
+fn deserialize_manifest_bounded<T>(bytes: &[u8]) -> anyhow::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_MANIFEST_DECODED_BYTES,
+        "manifest exceeds decoded resource limit"
+    );
+    Ok(bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_MANIFEST_DECODED_BYTES)
+        .deserialize(bytes)?)
+}
+
 fn decode_v2_manifest(bytes: &[u8]) -> anyhow::Result<V2Manifest> {
     if let Some(compact) = bytes.strip_prefix(COMPACT_MANIFEST_MAGIC) {
-        let compact: CompactManifestV1 = bincode::deserialize(compact)?;
+        let compact: CompactManifestV1 = deserialize_manifest_bounded(compact)?;
         return compact_manifest_to_current(compact);
     }
-    match bincode::deserialize(bytes) {
+    match deserialize_manifest_bounded(bytes) {
         Ok(manifest) => Ok(manifest),
         Err(_) => {
-            let legacy: V2ManifestLegacy = bincode::deserialize(bytes)?;
+            let legacy: V2ManifestLegacy = deserialize_manifest_bounded(bytes)?;
             Ok(legacy.into_current())
         }
     }
@@ -4041,6 +4100,198 @@ fn upsert_path_cache(
     Ok(())
 }
 
+struct ExtractionStage {
+    target: PathBuf,
+    path: PathBuf,
+    overwrite: bool,
+    published: bool,
+}
+
+impl ExtractionStage {
+    fn create(target: &Path, overwrite: bool, extracted_bytes: u64) -> anyhow::Result<Self> {
+        let target = absolute_extraction_target(target)?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("extraction output has no parent directory"))?;
+        if target.exists() {
+            validate_physical_output_directory(&target)?;
+            anyhow::ensure!(
+                overwrite,
+                "refusing to overwrite existing output directory: {}",
+                target.display()
+            );
+        }
+        anyhow::ensure!(
+            extracted_bytes <= fs2::available_space(parent)?,
+            "archive output exceeds available destination space"
+        );
+        let path = unique_extraction_path(&target, "stage");
+        fs::create_dir(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(Self {
+            target,
+            path,
+            overwrite,
+            published: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish(&mut self) -> anyhow::Result<()> {
+        let parent = self
+            .target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("extraction output has no parent directory"))?;
+        let backup = unique_extraction_path(&self.target, "backup");
+        let had_target = self.target.exists();
+        if had_target {
+            validate_physical_output_directory(&self.target)?;
+            anyhow::ensure!(
+                self.overwrite,
+                "extraction output appeared during verification"
+            );
+            fs::rename(&self.target, &backup)?;
+        }
+        if let Err(error) = fs::rename(&self.path, &self.target) {
+            if had_target {
+                let _ = fs::rename(&backup, &self.target);
+            }
+            return Err(error.into());
+        }
+        self.published = true;
+        if had_target {
+            remove_physical_output_directory(&backup)?;
+        }
+        sync_archive_directory(parent)?;
+        Ok(())
+    }
+}
+
+impl Drop for ExtractionStage {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn absolute_extraction_target(target: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(target)
+    };
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("extraction output must name a directory"))?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("extraction output has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    Ok(parent.canonicalize()?.join(name))
+}
+
+fn unique_extraction_path(target: &Path, kind: &str) -> PathBuf {
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    target.with_file_name(format!(
+        ".{name}.hig-{kind}-{}-{}",
+        std::process::id(),
+        hex::encode(crate::random_bytes::<8>())
+    ))
+}
+
+fn validate_physical_output_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "extraction output is not a physical directory: {}",
+        path.display()
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        anyhow::ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "extraction output is a reparse point: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_physical_output_directory(path: &Path) -> anyhow::Result<()> {
+    validate_physical_output_directory(path)?;
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+fn prepare_staged_files<'a>(
+    root: &Path,
+    files: impl IntoIterator<Item = (&'a str, u64)>,
+) -> anyhow::Result<()> {
+    for (relative_path, size) in files {
+        let target = checked_target(root, relative_path)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&target)?;
+        file.set_len(size)?;
+    }
+    Ok(())
+}
+
+fn write_staged_slice(path: &Path, offset: u64, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut file = fs::OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+fn hash_staged_file(path: &Path, expected_size: u64) -> anyhow::Result<[u8; 32]> {
+    let mut file = fs::File::open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.len() == expected_size,
+        "extracted file length mismatch"
+    );
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn total_extracted_bytes(sizes: impl IntoIterator<Item = u64>) -> anyhow::Result<u64> {
+    let total = sizes.into_iter().try_fold(0_u64, |total, size| {
+        total
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("archive extracted size overflow"))
+    })?;
+    anyhow::ensure!(
+        total <= MAX_ARCHIVE_TOTAL_EXTRACTED_BYTES,
+        "archive extracted size exceeds resource limit"
+    );
+    Ok(total)
+}
+
 fn root_hash(files: &[(&String, [u8; 32])]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     for (path, hash) in files {
@@ -4157,6 +4408,7 @@ fn validate_v1_manifest(manifest: &Manifest, archive_bytes: u64) -> anyhow::Resu
         "invalid v1 manifest version"
     );
     validate_manifest_collection_sizes(manifest.files.len(), manifest.blocks.len())?;
+    total_extracted_bytes(manifest.files.iter().map(|file| file.size))?;
     validate_unique_archive_paths(
         manifest
             .files
@@ -4207,6 +4459,7 @@ fn validate_v2_manifest(
         "invalid v2 manifest version"
     );
     validate_manifest_collection_sizes(manifest.files.len(), manifest.blocks.len())?;
+    total_extracted_bytes(manifest.files.iter().map(|file| file.size))?;
     validate_unique_archive_paths(
         manifest
             .files
@@ -4241,6 +4494,10 @@ fn validate_v2_manifest(
     for file in &manifest.files {
         validate_v2_file_layout(file, &blocks)?;
     }
+    anyhow::ensure!(
+        payload_end == archive_bytes,
+        "archive has trailing payload bytes"
+    );
     Ok(())
 }
 
@@ -4416,6 +4673,34 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
 
+    fn pack_unencrypted_fixture(input_dir: PathBuf, output_file: PathBuf) {
+        pack(PackOptions {
+            input_dir,
+            output_file,
+            password: None,
+            encryption: EncryptionMode::None,
+            cache_dir: None,
+            threads: None,
+            compression: Compression::Zstd,
+            level: None,
+            use_cache: false,
+            trust_metadata: false,
+            format: ArchiveFormat::HigV2,
+            batch: BatchOptions::default(),
+            chunk: ChunkOptions::default(),
+            speed: SpeedMode::Balanced,
+            kdf_profile: KdfProfile::Secure,
+            sealed_cache: false,
+            manifest_format: ManifestFormat::Compact,
+            use_session: false,
+            session_required: false,
+            session_ttl_secs: None,
+            solid: SolidMode::Auto,
+            pipeline: PipelineOptions::default(),
+        })
+        .unwrap();
+    }
+
     #[test]
     fn manifest_roundtrip() {
         let manifest = Manifest {
@@ -4489,6 +4774,88 @@ mod tests {
         };
         let error = validate_archive_header(&header, HEADER_FIXED_LEN as u64 + 1).unwrap_err();
         assert!(error.to_string().contains("key derivation parameters"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_extraction_never_follows_existing_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir_all(input.join("nested")).unwrap();
+        fs::write(input.join("nested/file.txt"), b"verified archive bytes").unwrap();
+        let archive = temp.path().join("archive.hig");
+        pack_unencrypted_fixture(input, archive.clone());
+
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel.txt"), b"outside remains unchanged").unwrap();
+        let output = temp.path().join("output");
+        fs::create_dir_all(&output).unwrap();
+        symlink(&outside, output.join("nested")).unwrap();
+
+        unpack(UnpackOptions {
+            archive_file: archive,
+            output_dir: output.clone(),
+            password: None,
+            overwrite: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(output.join("nested/file.txt")).unwrap(),
+            b"verified archive bytes"
+        );
+        assert!(
+            !fs::symlink_metadata(output.join("nested"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(outside.join("sentinel.txt")).unwrap(),
+            b"outside remains unchanged"
+        );
+        assert!(!outside.join("file.txt").exists());
+    }
+
+    #[test]
+    fn failed_staged_extraction_preserves_existing_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("file.txt"), b"authenticated payload").unwrap();
+        let archive = temp.path().join("archive.hig");
+        pack_unencrypted_fixture(input, archive.clone());
+        let mut bytes = fs::read(&archive).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x40;
+        fs::write(&archive, bytes).unwrap();
+
+        let output = temp.path().join("output");
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("sentinel.txt"), b"preserve existing output").unwrap();
+        let error = unpack(UnpackOptions {
+            archive_file: archive,
+            output_dir: output.clone(),
+            password: None,
+            overwrite: true,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("block hash mismatch"));
+        assert_eq!(
+            fs::read(output.join("sentinel.txt")).unwrap(),
+            b"preserve existing output"
+        );
+        assert!(!output.join("file.txt").exists());
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("hig-stage")
+        }));
     }
 
     #[test]
