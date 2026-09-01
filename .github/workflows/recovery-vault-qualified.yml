@@ -1,0 +1,49 @@
+name: HIG Qualified Recovery Vault Performance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recovery-vault-qualified-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualified-recovery-vault-performance:
+    name: Qualified macOS Recovery Vault 1 GiB
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Build native release CLI
+        run: cargo build --release -p hig-cli
+      - name: Run qualified 1 GiB Recovery Vault comparison
+        env:
+          HIG_BIN: target/release/hig
+        run: >-
+          node scripts/recovery-vault-qualified-benchmark.mjs
+          --mode qualified
+          --fixture-mib 1024
+          --report artifacts/recovery-vault-qualified-macos-aarch64.json
+      - name: Validate qualified Recovery Vault performance report
+        run: >-
+          node scripts/validate-recovery-vault-qualified-report.mjs
+          --report artifacts/recovery-vault-qualified-macos-aarch64.json
+          --expected-commit "${{ github.sha }}"
+          --expected-mode qualified
+          --minimum-fixture-bytes 1073741824
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recovery-vault-qualified-macos-aarch64-${{ github.sha }}
+          path: artifacts/recovery-vault-qualified-macos-aarch64.json
+          if-no-files-found: error

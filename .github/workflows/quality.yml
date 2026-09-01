@@ -69,6 +69,12 @@ jobs:
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
         run: node scripts/recovery-vault-soak-test.mjs --mode ci --duration-minutes 0.25 --report artifacts/recovery-vault-soak-ci.json
+      - name: Recovery Vault qualified benchmark smoke
+        env:
+          HIG_BIN: ${{ github.workspace }}/target/release/hig
+        run: |
+          node scripts/recovery-vault-qualified-benchmark.mjs --mode ci --fixture-mib 32 --report artifacts/recovery-vault-qualified-ci.json
+          node scripts/validate-recovery-vault-qualified-report.mjs --report artifacts/recovery-vault-qualified-ci.json --expected-commit "${{ github.sha }}" --expected-mode ci --minimum-fixture-bytes 33554432
       - name: Recovery Vault real capacity exhaustion
         env:
           HIG_BIN: ${{ github.workspace }}/target/release/hig
