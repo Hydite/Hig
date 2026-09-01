@@ -1,9 +1,12 @@
-use crate::cli::{RecoveryCommand, RecoveryPolicyCommand, RecoveryTombstoneKindArg};
+use crate::cli::{
+    RecoveryAuthCommand, RecoveryCommand, RecoveryPolicyCommand, RecoveryTombstoneKindArg,
+};
 use hig_core::{
-    RecoveryTombstoneKind, capture_recovery_point, gc_recovery_vault, init_recovery_vault,
-    list_recovery_vault, promote_recovery_vault, record_recovery_tombstone, recovery_audit_log,
-    recovery_vault_config, recovery_vault_status, register_recovery_repository,
-    repair_recovery_point, restore_recovery_point, scrub_recovery_vault, set_recovery_point_pin,
+    RecoveryTombstoneKind, capture_recovery_point, export_recovery_auth_custody, gc_recovery_vault,
+    import_recovery_auth_custody, init_recovery_vault, list_recovery_vault, migrate_recovery_auth,
+    promote_recovery_vault, record_recovery_tombstone, recovery_audit_log, recovery_vault_config,
+    recovery_vault_status, register_recovery_repository, repair_recovery_point,
+    restore_recovery_point, scrub_recovery_vault, set_recovery_point_pin,
     update_recovery_retention, verify_recovery_point,
 };
 
@@ -156,6 +159,28 @@ pub(crate) fn handle(command: RecoveryCommand) -> anyhow::Result<()> {
                 for operation_id in report.incomplete_operation_ids {
                     println!("incomplete\t{operation_id}");
                 }
+            }
+        }
+        RecoveryCommand::Auth { command } => handle_auth(command)?,
+        RecoveryCommand::MigrateAuth { vault_root, json } => {
+            let report = migrate_recovery_auth(vault_root.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "recovery: authentication migrated vault={} created={} lineage={} vault_id={} key_id={} mirrors={} repositories={} points={} objects={} bytes={} audit_events={}",
+                    report.vault_root,
+                    report.created,
+                    report.lineage_id,
+                    report.vault_id,
+                    report.key_id,
+                    report.migrated_mirrors.len(),
+                    report.verified_repositories,
+                    report.verified_recovery_points,
+                    report.verified_objects,
+                    report.verified_raw_bytes,
+                    report.verified_audit_events
+                );
             }
         }
         RecoveryCommand::Pin {
@@ -351,6 +376,45 @@ pub(crate) fn handle(command: RecoveryCommand) -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn handle_auth(command: RecoveryAuthCommand) -> anyhow::Result<()> {
+    let (report, action) = match command {
+        RecoveryAuthCommand::Export {
+            vault_root,
+            output,
+            json,
+        } => {
+            let report = export_recovery_auth_custody(vault_root.as_deref(), &output)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            (report, "exported")
+        }
+        RecoveryAuthCommand::Import {
+            vault_root,
+            input,
+            json,
+        } => {
+            let report = import_recovery_auth_custody(vault_root.as_deref(), &input)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            (report, "imported")
+        }
+    };
+    println!(
+        "recovery: custody {action} vault={} file={} lineage={} vault_id={} key_id={} checkpoint={}",
+        report.vault_root,
+        report.custody_file,
+        report.lineage_id,
+        report.vault_id,
+        report.key_id,
+        report.checkpoint_sequence
+    );
     Ok(())
 }
 

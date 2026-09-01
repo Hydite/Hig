@@ -420,6 +420,33 @@ pub struct RecoveryPromotionReport {
     pub durability: RecoveryDurability,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryAuthCustodyReport {
+    pub schema: u16,
+    pub vault_root: String,
+    pub custody_file: String,
+    pub lineage_id: String,
+    pub vault_id: String,
+    pub key_id: String,
+    pub checkpoint_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryAuthMigrationReport {
+    pub schema: u16,
+    pub vault_root: String,
+    pub created: bool,
+    pub lineage_id: String,
+    pub vault_id: String,
+    pub key_id: String,
+    pub migrated_mirrors: Vec<String>,
+    pub verified_repositories: u64,
+    pub verified_recovery_points: u64,
+    pub verified_objects: u64,
+    pub verified_raw_bytes: u64,
+    pub verified_audit_events: u64,
+}
+
 pub fn default_recovery_vault_root() -> anyhow::Result<PathBuf> {
     if let Some(value) = std::env::var_os("HIG_RECOVERY_VAULT")
         && !value.is_empty()
@@ -534,6 +561,136 @@ pub fn init_recovery_vault(
 pub fn recovery_vault_config(requested_root: Option<&Path>) -> anyhow::Result<RecoveryVaultConfig> {
     let root = resolve_vault_root(requested_root)?;
     load_vault_config(&root)
+}
+
+pub fn export_recovery_auth_custody(
+    requested_root: Option<&Path>,
+    output: &Path,
+) -> anyhow::Result<RecoveryAuthCustodyReport> {
+    let root = resolve_vault_root(requested_root)?;
+    let output = absolute_path(output)?;
+    anyhow::ensure!(
+        !output.starts_with(&root),
+        "Recovery custody bundle cannot be stored inside the Vault"
+    );
+    let _lock = lock_vault(&root)?;
+    load_vault_config(&root)?;
+    let (identity, checkpoint_sequence) = auth::export_custody_bundle(&root, &output)?;
+    Ok(RecoveryAuthCustodyReport {
+        schema: RECOVERY_REPORT_SCHEMA,
+        vault_root: root.display().to_string(),
+        custody_file: output.display().to_string(),
+        lineage_id: identity.lineage_id,
+        vault_id: identity.vault_id,
+        key_id: identity.key_id,
+        checkpoint_sequence,
+    })
+}
+
+pub fn import_recovery_auth_custody(
+    requested_root: Option<&Path>,
+    input: &Path,
+) -> anyhow::Result<RecoveryAuthCustodyReport> {
+    let root = resolve_vault_root(requested_root)?;
+    let input = absolute_path(input)?;
+    anyhow::ensure!(
+        !input.starts_with(&root),
+        "Recovery custody bundle cannot be read from inside the Vault"
+    );
+    let _lock = lock_vault(&root)?;
+    let (identity, checkpoint_sequence) = auth::import_custody_bundle(&root, &input)?;
+    load_vault_config(&root)?;
+    Ok(RecoveryAuthCustodyReport {
+        schema: RECOVERY_REPORT_SCHEMA,
+        vault_root: root.display().to_string(),
+        custody_file: input.display().to_string(),
+        lineage_id: identity.lineage_id,
+        vault_id: identity.vault_id,
+        key_id: identity.key_id,
+        checkpoint_sequence,
+    })
+}
+
+pub fn migrate_recovery_auth(
+    requested_root: Option<&Path>,
+) -> anyhow::Result<RecoveryAuthMigrationReport> {
+    let root = resolve_vault_root(requested_root)?;
+    secure_create_dir(&root)?;
+    secure_create_dir(&root.join("locks"))?;
+    let _lock = lock_vault(&root)?;
+    let created = !auth::is_authenticated(&root);
+    let (config, catalog) = load_and_verify_recovery_documents(&root)?;
+    let primary_verification = verify_unsealed_vault(&root, &catalog)?;
+    let identity = if created {
+        let identity = auth::initialize_primary_identity(&root)?;
+        auth::initialize_state(
+            &root,
+            catalog.generation,
+            &checked_json_bytes(&config)?,
+            &checked_json_bytes(&catalog)?,
+        )?;
+        identity
+    } else {
+        let identity = auth::require_primary(&root)?;
+        auth::verify_state(&root, catalog.generation)?;
+        identity
+    };
+
+    let mut migrated_mirrors = Vec::new();
+    let mut verified_repositories = primary_verification.0;
+    let mut verified_recovery_points = primary_verification.1;
+    let mut verified_objects = primary_verification.2;
+    let mut verified_raw_bytes = primary_verification.3;
+    let mut verified_audit_events = primary_verification.4;
+    for mirror in &config.mirror_roots {
+        let _mirror_lock = lock_vault(mirror)?;
+        let mirror_created = !auth::is_authenticated(mirror);
+        let (mirror_config, mirror_catalog) = load_and_verify_recovery_documents(mirror)?;
+        anyhow::ensure!(
+            mirror_config.mirror_roots.is_empty(),
+            "legacy recovery mirror is configured as a primary Vault"
+        );
+        anyhow::ensure!(
+            mirror_config.retention == config.retention
+                && mirror_config.at_rest_policy == config.at_rest_policy,
+            "legacy recovery mirror policy differs from the primary Vault"
+        );
+        validate_migration_mirror_catalog(&catalog, &mirror_catalog)?;
+        let verification = verify_unsealed_vault(mirror, &mirror_catalog)?;
+        if mirror_created {
+            auth::initialize_mirror_identity(mirror, &identity, false)?;
+            auth::initialize_state(
+                mirror,
+                mirror_catalog.generation,
+                &checked_json_bytes(&mirror_config)?,
+                &checked_json_bytes(&mirror_catalog)?,
+            )?;
+            migrated_mirrors.push(mirror.display().to_string());
+        } else {
+            auth::require_mirror_for(mirror, &identity)?;
+            auth::verify_state(mirror, mirror_catalog.generation)?;
+        }
+        verified_repositories = verified_repositories.saturating_add(verification.0);
+        verified_recovery_points = verified_recovery_points.saturating_add(verification.1);
+        verified_objects = verified_objects.saturating_add(verification.2);
+        verified_raw_bytes = verified_raw_bytes.saturating_add(verification.3);
+        verified_audit_events = verified_audit_events.saturating_add(verification.4);
+    }
+
+    Ok(RecoveryAuthMigrationReport {
+        schema: RECOVERY_REPORT_SCHEMA,
+        vault_root: root.display().to_string(),
+        created,
+        lineage_id: identity.lineage_id,
+        vault_id: identity.vault_id,
+        key_id: identity.key_id,
+        migrated_mirrors,
+        verified_repositories,
+        verified_recovery_points,
+        verified_objects,
+        verified_raw_bytes,
+        verified_audit_events,
+    })
 }
 
 pub fn update_recovery_retention(
@@ -2211,6 +2368,138 @@ fn load_vault_config(root: &Path) -> anyhow::Result<RecoveryVaultConfig> {
     Ok(config)
 }
 
+fn load_and_verify_recovery_documents(
+    root: &Path,
+) -> anyhow::Result<(RecoveryVaultConfig, RecoveryCatalog)> {
+    let config_path = vault_config_path(root);
+    let catalog_path = catalog_path(root);
+    enforce_private_file(&config_path)?;
+    enforce_private_file(&catalog_path)?;
+    let config: RecoveryVaultConfig = read_checked_json(&config_path)?;
+    anyhow::ensure!(
+        config.schema == VAULT_SCHEMA,
+        "unsupported recovery vault schema"
+    );
+    config.retention.validate()?;
+    validate_mirror_roots(root, &config.mirror_roots)?;
+    let catalog: RecoveryCatalog = read_checked_json(&catalog_path)?;
+    validate_catalog(&catalog)?;
+    Ok((config, catalog))
+}
+
+fn verify_unsealed_vault(
+    root: &Path,
+    catalog: &RecoveryCatalog,
+) -> anyhow::Result<(u64, u64, u64, u64, u64)> {
+    let events_root = root.join("events");
+    let events_metadata = fs::symlink_metadata(&events_root)?;
+    anyhow::ensure!(
+        events_metadata.is_dir() && !events_metadata.file_type().is_symlink(),
+        "Recovery Vault audit root is not a physical directory"
+    );
+    let audit = audit::recovery_audit_log_from_root(root)?;
+    let mut repositories = 0_u64;
+    let mut recovery_points = 0_u64;
+    let mut objects = 0_u64;
+    let mut raw_bytes = 0_u64;
+    for registration in catalog.repositories.values() {
+        repositories = repositories.saturating_add(1);
+        if registration.recovery_points.is_empty() {
+            continue;
+        }
+        let repository_root = vault_repository_root(root, registration.repository_id)?;
+        let (_, repository_config) = repository_root_and_config(&repository_root)?;
+        anyhow::ensure!(
+            repository_config.repository_id == registration.repository_id,
+            "Vault repository identity does not match the migration catalog"
+        );
+        let refs = repository_refs(&repository_root)?;
+        for point in registration.recovery_points.values() {
+            if point.state != RecoveryPointState::Available {
+                continue;
+            }
+            let expected_tag = point
+                .ref_name
+                .strip_prefix("tags/")
+                .ok_or_else(|| anyhow::anyhow!("invalid recovery point ref namespace"))?;
+            anyhow::ensure!(
+                refs.refs.iter().any(|reference| {
+                    reference.kind == RepositoryRefKind::Tag
+                        && reference.name == expected_tag
+                        && reference.commit_id == point.commit_id
+                }),
+                "published recovery ref is missing or does not match the migration catalog"
+            );
+            recovery_points = recovery_points.saturating_add(1);
+        }
+        for reference in refs.refs.iter().filter(|reference| {
+            reference.kind == RepositoryRefKind::Tag && reference.name.starts_with("recovery/")
+        }) {
+            let point_id = reference
+                .name
+                .strip_prefix("recovery/")
+                .ok_or_else(|| anyhow::anyhow!("invalid recovery ref"))?;
+            anyhow::ensure!(
+                registration.recovery_points.contains_key(point_id),
+                "orphan recovery ref is not present in the migration catalog"
+            );
+        }
+        let verified = verify_repository(&repository_root)?;
+        objects = objects.saturating_add(verified.checked_objects);
+        raw_bytes = raw_bytes.saturating_add(verified.checked_raw_bytes);
+    }
+    Ok((
+        repositories,
+        recovery_points,
+        objects,
+        raw_bytes,
+        audit.events.len().try_into()?,
+    ))
+}
+
+fn validate_migration_mirror_catalog(
+    primary: &RecoveryCatalog,
+    mirror: &RecoveryCatalog,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        primary.repositories.len() == mirror.repositories.len(),
+        "legacy recovery mirror repository set differs from the primary Vault"
+    );
+    for (key, primary_registration) in &primary.repositories {
+        let mirror_registration = mirror.repositories.get(key).ok_or_else(|| {
+            anyhow::anyhow!("legacy recovery mirror is missing a primary repository")
+        })?;
+        anyhow::ensure!(
+            primary_registration.registration_id == mirror_registration.registration_id
+                && primary_registration.repository_id == mirror_registration.repository_id
+                && primary_registration.source_paths == mirror_registration.source_paths
+                && primary_registration.tombstones == mirror_registration.tombstones,
+            "legacy recovery mirror registration history differs from the primary Vault"
+        );
+        anyhow::ensure!(
+            primary_registration.recovery_points.len() == mirror_registration.recovery_points.len(),
+            "legacy recovery mirror point set differs from the primary Vault"
+        );
+        for (point_id, primary_point) in &primary_registration.recovery_points {
+            let mirror_point = mirror_registration
+                .recovery_points
+                .get(point_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("legacy recovery mirror is missing a primary recovery point")
+                })?;
+            anyhow::ensure!(
+                primary_point.commit_id == mirror_point.commit_id
+                    && primary_point.ref_name == mirror_point.ref_name
+                    && primary_point.reachable_objects == mirror_point.reachable_objects
+                    && primary_point.pinned == mirror_point.pinned
+                    && primary_point.state == mirror_point.state,
+                "legacy recovery mirror point history differs from the primary Vault"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_mirror_roots(root: &Path, mirrors: &[PathBuf]) -> anyhow::Result<()> {
     let mut previous: Option<&Path> = None;
     for mirror in mirrors {
@@ -3408,6 +3697,91 @@ mod tests {
             fs::read(output.join("nested/data.bin")).unwrap(),
             b"recovery-vault\0exact\xff"
         );
+    }
+
+    #[test]
+    fn legacy_primary_and_mirror_migrate_only_after_full_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let primary = temp.path().join("primary");
+        let mirror = temp.path().join("mirror");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("critical.bin"), b"legacy-exact\0\xff").unwrap();
+        let initialized = init_repository(&source, Vec::new()).unwrap();
+        snapshot_repository(&source, "legacy".into(), None).unwrap();
+        init_recovery_vault(Some(&primary), vec![mirror.clone()]).unwrap();
+        let captured = capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
+        for vault in [&primary, &mirror] {
+            fs::remove_file(vault.join("identity.json")).unwrap();
+            fs::remove_file(vault.join("state.json")).unwrap();
+        }
+        fs::remove_dir_all(temp.path().join(".hig-recovery-auth")).unwrap();
+
+        let migrated = migrate_recovery_auth(Some(&primary)).unwrap();
+        assert!(migrated.created);
+        assert_eq!(
+            migrated.migrated_mirrors,
+            vec![mirror.canonicalize().unwrap().display().to_string()]
+        );
+        assert_eq!(migrated.verified_repositories, 2);
+        assert_eq!(migrated.verified_recovery_points, 2);
+        assert!(migrated.verified_objects > 0);
+        assert!(migrated.verified_audit_events >= 8);
+        let repeated = migrate_recovery_auth(Some(&primary)).unwrap();
+        assert!(!repeated.created);
+        assert!(repeated.migrated_mirrors.is_empty());
+
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&primary).unwrap();
+        let output = temp.path().join("restored");
+        restore_recovery_point(
+            Some(&mirror),
+            &hex::encode(initialized.repository_id),
+            &captured.recovery_point.recovery_point_id,
+            &output,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(output.join("critical.bin")).unwrap(),
+            b"legacy-exact\0\xff"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_refuses_to_authenticate_corrupt_repository_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let vault = temp.path().join("vault");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.bin"), b"must-verify").unwrap();
+        let initialized = init_repository(&source, Vec::new()).unwrap();
+        snapshot_repository(&source, "legacy".into(), None).unwrap();
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        capture_recovery_point(&source, "HEAD", Some(&vault)).unwrap();
+        fs::remove_file(vault.join("identity.json")).unwrap();
+        fs::remove_file(vault.join("state.json")).unwrap();
+        fs::remove_dir_all(temp.path().join(".hig-recovery-auth")).unwrap();
+        let objects = vault_repository_root(&vault, initialized.repository_id)
+            .unwrap()
+            .join(".hig/repository/objects");
+        let object = walkdir::WalkDir::new(objects)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_type().is_file())
+            .unwrap()
+            .into_path();
+        fs::write(object, b"corrupt").unwrap();
+
+        let error = migrate_recovery_auth(Some(&vault)).unwrap_err();
+        assert!(
+            error.to_string().contains("checksum")
+                || error.to_string().contains("object")
+                || error.to_string().contains("decode")
+        );
+        assert!(!vault.join("identity.json").exists());
+        assert!(!vault.join("state.json").exists());
     }
 
     #[test]

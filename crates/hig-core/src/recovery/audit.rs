@@ -81,6 +81,10 @@ pub struct RecoveryAuditReport {
 pub fn recovery_audit_log(requested_root: Option<&Path>) -> anyhow::Result<RecoveryAuditReport> {
     let root = resolve_vault_root(requested_root)?;
     load_vault_config(&root)?;
+    recovery_audit_log_from_root(&root)
+}
+
+pub(super) fn recovery_audit_log_from_root(root: &Path) -> anyhow::Result<RecoveryAuditReport> {
     let events_root = root.join("events");
     secure_create_dir(&events_root)?;
     let mut events = Vec::new();

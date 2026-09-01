@@ -1,4 +1,6 @@
-use super::{MAX_RECOVERY_DOCUMENT_BYTES, atomic_write, enforce_private_file, secure_create_dir};
+use super::{
+    MAX_RECOVERY_DOCUMENT_BYTES, atomic_write, enforce_private_file, now_unix_ns, secure_create_dir,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Read;
@@ -8,6 +10,8 @@ const AUTH_SCHEMA: u16 = 1;
 const AUTH_DOMAIN_IDENTITY: &[u8] = b"hig-recovery-identity-v1\0";
 const AUTH_DOMAIN_STATE: &[u8] = b"hig-recovery-state-v1\0";
 const AUTH_DOMAIN_TRANSITION: &[u8] = b"hig-recovery-transition-v1\0";
+const AUTH_DOMAIN_BUNDLE: &[u8] = b"hig-recovery-custody-bundle-v1\0";
+const AUTH_BUNDLE_SCHEMA: u16 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +89,29 @@ struct UnsignedVaultPendingTransition<'a> {
     target: &'a VaultStateSeal,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RecoveryAuthBundle {
+    schema: u16,
+    exported_unix_ns: i128,
+    lineage_id: String,
+    vault_id: String,
+    key_id: String,
+    key_hex: String,
+    checkpoint: VaultStateSeal,
+    bundle_mac: String,
+}
+
+#[derive(Serialize)]
+struct UnsignedRecoveryAuthBundle<'a> {
+    schema: u16,
+    exported_unix_ns: i128,
+    lineage_id: &'a str,
+    vault_id: &'a str,
+    key_id: &'a str,
+    key_hex: &'a str,
+    checkpoint: &'a VaultStateSeal,
+}
+
 #[derive(Default)]
 struct TransitionDocuments<'a> {
     config: Option<&'a [u8]>,
@@ -104,7 +131,8 @@ pub(super) fn initialize_primary_identity(root: &Path) -> anyhow::Result<VaultId
     let lineage_id = hex::encode(crate::random_bytes::<16>());
     let vault_id = hex::encode(crate::random_bytes::<16>());
     let key = crate::random_bytes::<32>();
-    write_new_key(root, &lineage_id, &key)?;
+    let key_id = blake3::hash(&key).to_hex().to_string();
+    write_new_key(root, &lineage_id, &key_id, &key)?;
     write_identity(
         root,
         &lineage_id,
@@ -120,7 +148,7 @@ pub(super) fn initialize_mirror_identity(
     primary: &VaultIdentity,
     allow_rebind: bool,
 ) -> anyhow::Result<VaultIdentity> {
-    let key = load_key(root, &primary.lineage_id)?;
+    let key = load_key(root, &primary.lineage_id, &primary.key_id)?;
     validate_identity(primary, &key)?;
     if identity_path(root).exists() {
         let existing = load_identity(root)?;
@@ -179,9 +207,13 @@ pub(super) fn load_identity(root: &Path) -> anyhow::Result<VaultIdentity> {
     );
     enforce_private_file(&path)?;
     let identity: VaultIdentity = serde_json::from_slice(&read_bounded(&path)?)?;
-    let key = load_key(root, &identity.lineage_id)?;
+    let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
     validate_identity(&identity, &key)?;
     Ok(identity)
+}
+
+pub(super) fn is_authenticated(root: &Path) -> bool {
+    identity_path(root).exists()
 }
 
 pub(super) fn require_primary(root: &Path) -> anyhow::Result<VaultIdentity> {
@@ -219,7 +251,7 @@ pub(super) fn promote_identity(
     if existing.role == VaultRole::Primary && existing.primary_vault_id == existing.vault_id {
         return Ok(existing);
     }
-    let key = load_key(root, &existing.lineage_id)?;
+    let key = load_key(root, &existing.lineage_id, &existing.key_id)?;
     let promoted = build_identity(
         &existing.lineage_id,
         &existing.vault_id,
@@ -248,7 +280,7 @@ pub(super) fn initialize_state(
     catalog: &[u8],
 ) -> anyhow::Result<()> {
     let identity = load_identity(root)?;
-    let key = load_key(root, &identity.lineage_id)?;
+    let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
     anyhow::ensure!(
         !external_state_path(root, &identity.vault_id)?.exists(),
         "authenticated Recovery Vault state already exists"
@@ -272,7 +304,7 @@ pub(super) fn write_catalog(
     catalog: &[u8],
 ) -> anyhow::Result<()> {
     let identity = load_identity(root)?;
-    let key = load_key(root, &identity.lineage_id)?;
+    let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
     commit_transition(
         root,
         &identity,
@@ -291,7 +323,7 @@ pub(super) fn write_config(
     config: &[u8],
 ) -> anyhow::Result<()> {
     let identity = load_identity(root)?;
-    let key = load_key(root, &identity.lineage_id)?;
+    let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
     commit_transition(
         root,
         &identity,
@@ -306,7 +338,7 @@ pub(super) fn write_config(
 
 pub(super) fn verify_state(root: &Path, catalog_generation: u64) -> anyhow::Result<()> {
     let identity = load_identity(root)?;
-    let key = load_key(root, &identity.lineage_id)?;
+    let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
     recover_pending_transition(root, &identity, &key)?;
     let vault_path = state_path(root);
     let external_path = external_state_path(root, &identity.vault_id)?;
@@ -330,12 +362,92 @@ pub(super) fn verify_state(root: &Path, catalog_generation: u64) -> anyhow::Resu
     Ok(())
 }
 
+pub(super) fn export_custody_bundle(
+    root: &Path,
+    output: &Path,
+) -> anyhow::Result<(VaultIdentity, u64)> {
+    let identity = load_identity(root)?;
+    let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
+    recover_pending_transition(root, &identity, &key)?;
+    let checkpoint = read_state(&external_state_path(root, &identity.vault_id)?)?;
+    validate_state_seal(&checkpoint, &identity, &key)?;
+    verify_seal_files(root, &checkpoint)?;
+    anyhow::ensure!(
+        read_state(&state_path(root))? == checkpoint,
+        "Recovery Vault local checkpoint differs from custody state"
+    );
+    let mut bundle = RecoveryAuthBundle {
+        schema: AUTH_BUNDLE_SCHEMA,
+        exported_unix_ns: now_unix_ns(),
+        lineage_id: identity.lineage_id.clone(),
+        vault_id: identity.vault_id.clone(),
+        key_id: identity.key_id.clone(),
+        key_hex: hex::encode(key),
+        checkpoint,
+        bundle_mac: String::new(),
+    };
+    bundle.bundle_mac = bundle_mac(&bundle, &key)?;
+    write_private_new_file(output, &serde_json::to_vec_pretty(&bundle)?)?;
+    Ok((identity, bundle.checkpoint.sequence))
+}
+
+pub(super) fn import_custody_bundle(
+    root: &Path,
+    input: &Path,
+) -> anyhow::Result<(VaultIdentity, u64)> {
+    enforce_private_file(input)?;
+    let bundle: RecoveryAuthBundle = serde_json::from_slice(&read_bounded(input)?)?;
+    let key = validate_bundle(&bundle)?;
+    let identity: VaultIdentity = serde_json::from_slice(&read_bounded(&identity_path(root))?)?;
+    validate_identity(&identity, &key)?;
+    anyhow::ensure!(
+        identity.lineage_id == bundle.lineage_id && identity.vault_id == bundle.vault_id,
+        "Recovery custody bundle does not belong to this Vault"
+    );
+    validate_state_seal(&bundle.checkpoint, &identity, &key)?;
+    verify_seal_files(root, &bundle.checkpoint)?;
+    anyhow::ensure!(
+        read_state(&state_path(root))? == bundle.checkpoint,
+        "Recovery custody bundle checkpoint does not match local Vault state"
+    );
+
+    let key_path = key_path(root, &bundle.lineage_id, &bundle.key_id)?;
+    if key_path.exists() {
+        anyhow::ensure!(
+            load_key(root, &bundle.lineage_id, &bundle.key_id)? == key,
+            "Recovery custody key conflicts with the installed key"
+        );
+    } else {
+        write_new_key(root, &bundle.lineage_id, &bundle.key_id, &key)?;
+    }
+    let external_path = external_state_path(root, &identity.vault_id)?;
+    if external_path.exists() {
+        let existing = read_state(&external_path)?;
+        validate_state_seal(&existing, &identity, &key)?;
+        anyhow::ensure!(
+            existing.sequence <= bundle.checkpoint.sequence,
+            "Recovery custody bundle is older than the installed monotonic checkpoint"
+        );
+        if existing.sequence == bundle.checkpoint.sequence {
+            anyhow::ensure!(
+                existing == bundle.checkpoint,
+                "Recovery custody checkpoint conflicts at the same sequence"
+            );
+        }
+    }
+    atomic_write(
+        &external_path,
+        &serde_json::to_vec_pretty(&bundle.checkpoint)?,
+    )?;
+    Ok((identity, bundle.checkpoint.sequence))
+}
+
 pub(super) fn recover_state(root: &Path) -> anyhow::Result<()> {
     if !identity_path(root).exists() {
         return Ok(());
     }
     let identity = load_identity(root)?;
-    let key = load_key(root, &identity.lineage_id)?;
+    let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
     recover_pending_transition(root, &identity, &key)
 }
 
@@ -609,6 +721,7 @@ fn validate_identity(identity: &VaultIdentity, key: &[u8; 32]) -> anyhow::Result
     validate_hex_id("lineage", &identity.lineage_id)?;
     validate_hex_id("vault", &identity.vault_id)?;
     validate_hex_id("primary Vault", &identity.primary_vault_id)?;
+    validate_hash_id("key", &identity.key_id)?;
     anyhow::ensure!(
         identity.key_id == blake3::hash(key).to_hex().as_str(),
         "Recovery Vault authentication key identity mismatch"
@@ -719,6 +832,44 @@ fn transition_mac(transition: &VaultPendingTransition, key: &[u8; 32]) -> anyhow
     )
 }
 
+fn bundle_mac(bundle: &RecoveryAuthBundle, key: &[u8; 32]) -> anyhow::Result<String> {
+    keyed_json_hash(
+        key,
+        AUTH_DOMAIN_BUNDLE,
+        &UnsignedRecoveryAuthBundle {
+            schema: bundle.schema,
+            exported_unix_ns: bundle.exported_unix_ns,
+            lineage_id: &bundle.lineage_id,
+            vault_id: &bundle.vault_id,
+            key_id: &bundle.key_id,
+            key_hex: &bundle.key_hex,
+            checkpoint: &bundle.checkpoint,
+        },
+    )
+}
+
+fn validate_bundle(bundle: &RecoveryAuthBundle) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(
+        bundle.schema == AUTH_BUNDLE_SCHEMA,
+        "unsupported Recovery custody bundle schema"
+    );
+    validate_hex_id("lineage", &bundle.lineage_id)?;
+    validate_hex_id("vault", &bundle.vault_id)?;
+    validate_hash_id("key", &bundle.key_id)?;
+    let key: [u8; 32] = hex::decode(&bundle.key_hex)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Recovery custody bundle key must contain 32 bytes"))?;
+    anyhow::ensure!(
+        blake3::hash(&key).to_hex().as_str() == bundle.key_id,
+        "Recovery custody bundle key identity mismatch"
+    );
+    anyhow::ensure!(
+        bundle.bundle_mac == bundle_mac(bundle, &key)?,
+        "Recovery custody bundle authentication failed"
+    );
+    Ok(key)
+}
+
 fn keyed_json_hash(
     key: &[u8; 32],
     domain: &[u8],
@@ -729,8 +880,13 @@ fn keyed_json_hash(
     Ok(blake3::keyed_hash(key, &input).to_hex().to_string())
 }
 
-fn write_new_key(root: &Path, lineage_id: &str, key: &[u8; 32]) -> anyhow::Result<()> {
-    let path = key_path(root, lineage_id)?;
+fn write_new_key(
+    root: &Path,
+    lineage_id: &str,
+    key_id: &str,
+    key: &[u8; 32],
+) -> anyhow::Result<()> {
+    let path = key_path(root, lineage_id, key_id)?;
     if let Some(parent) = path.parent() {
         secure_create_dir(parent)?;
     }
@@ -755,9 +911,44 @@ fn write_new_key(root: &Path, lineage_id: &str, key: &[u8; 32]) -> anyhow::Resul
     Ok(())
 }
 
-fn load_key(root: &Path, lineage_id: &str) -> anyhow::Result<[u8; 32]> {
+fn write_private_new_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(!path.exists(), "Recovery custody output already exists");
+    if let Some(parent) = path.parent() {
+        if parent.exists() {
+            let metadata = fs::symlink_metadata(parent)?;
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "Recovery custody output parent is not a physical directory"
+            );
+        } else {
+            secure_create_dir(parent)?;
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    enforce_private_file(path)?;
+    Ok(())
+}
+
+fn load_key(root: &Path, lineage_id: &str, key_id: &str) -> anyhow::Result<[u8; 32]> {
     validate_hex_id("lineage", lineage_id)?;
-    let path = key_path(root, lineage_id)?;
+    validate_hash_id("key", key_id)?;
+    let path = key_path(root, lineage_id, key_id)?;
     anyhow::ensure!(
         path.exists(),
         "Recovery Vault external authentication key is unavailable; import the lineage key before promotion"
@@ -794,10 +985,10 @@ fn auth_root(_root: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
-fn key_path(root: &Path, lineage_id: &str) -> anyhow::Result<PathBuf> {
+fn key_path(root: &Path, lineage_id: &str, key_id: &str) -> anyhow::Result<PathBuf> {
     Ok(auth_root(root)?
         .join("keys")
-        .join(format!("{lineage_id}.key")))
+        .join(format!("{lineage_id}.{key_id}.key")))
 }
 
 fn external_state_path(root: &Path, vault_id: &str) -> anyhow::Result<PathBuf> {
@@ -870,6 +1061,15 @@ fn validate_hex_id(label: &str, value: &str) -> anyhow::Result<()> {
     let bytes = hex::decode(value)?;
     anyhow::ensure!(
         bytes.len() == 16 && hex::encode(bytes) == value,
+        "Recovery {label} identity is not canonical"
+    );
+    Ok(())
+}
+
+fn validate_hash_id(label: &str, value: &str) -> anyhow::Result<()> {
+    let bytes = hex::decode(value)?;
+    anyhow::ensure!(
+        bytes.len() == 32 && hex::encode(bytes) == value,
         "Recovery {label} identity is not canonical"
     );
     Ok(())
@@ -1005,11 +1205,48 @@ mod tests {
         init_recovery_vault(Some(&primary), vec![mirror.clone()]).unwrap();
         capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
         let identity = load_identity(&mirror).unwrap();
-        fs::remove_file(key_path(&mirror, &identity.lineage_id).unwrap()).unwrap();
+        fs::remove_file(key_path(&mirror, &identity.lineage_id, &identity.key_id).unwrap())
+            .unwrap();
         fs::remove_dir_all(&source).unwrap();
         fs::remove_dir_all(&primary).unwrap();
 
         let error = promote_recovery_vault(Some(&mirror), Vec::new()).unwrap_err();
         assert!(error.to_string().contains("external authentication key"));
+    }
+
+    #[test]
+    fn custody_bundle_restores_key_and_monotonic_checkpoint_on_a_new_host() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        let bundle = temp.path().join("vault-custody.json");
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        let (exported_identity, exported_sequence) =
+            export_custody_bundle(&vault, &bundle).unwrap();
+        fs::remove_dir_all(auth_root(&vault).unwrap()).unwrap();
+        assert!(load_vault_config(&vault).is_err());
+
+        let (imported_identity, imported_sequence) =
+            import_custody_bundle(&vault, &bundle).unwrap();
+        assert_eq!(imported_identity, exported_identity);
+        assert_eq!(imported_sequence, exported_sequence);
+        load_vault_config(&vault).unwrap();
+    }
+
+    #[test]
+    fn custody_bundle_tampering_is_rejected_before_key_installation() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        let bundle = temp.path().join("vault-custody.json");
+        init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+        export_custody_bundle(&vault, &bundle).unwrap();
+        fs::remove_dir_all(auth_root(&vault).unwrap()).unwrap();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&bundle).unwrap()).unwrap();
+        document["checkpoint"]["sequence"] = serde_json::Value::from(99_u64);
+        fs::write(&bundle, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let error = import_custody_bundle(&vault, &bundle).unwrap_err();
+        assert!(error.to_string().contains("bundle authentication failed"));
+        assert!(!auth_root(&vault).unwrap().join("keys").exists());
     }
 }

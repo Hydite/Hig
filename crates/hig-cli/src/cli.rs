@@ -497,6 +497,16 @@ pub(crate) enum RecoveryCommand {
         #[arg(long)]
         json: bool,
     },
+    Auth {
+        #[command(subcommand)]
+        command: RecoveryAuthCommand,
+    },
+    MigrateAuth {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     Pin {
         repository_id: String,
         recovery_point_id: String,
@@ -578,6 +588,26 @@ pub(crate) enum RecoveryCommand {
         overwrite: bool,
         #[arg(long)]
         vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RecoveryAuthCommand {
+    Export {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Import {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        input: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -864,6 +894,53 @@ mod tests {
                 && recovery_point_id.len() == 64
                 && output_dir == Path::new("restored")
                 && vault_root == Path::new("vault")
+        ));
+    }
+
+    #[test]
+    fn recovery_auth_custody_and_migration_commands_parse_explicit_paths() {
+        let export = Cli::try_parse_from([
+            "hig",
+            "recovery",
+            "auth",
+            "export",
+            "--vault-root",
+            "vault",
+            "--output",
+            "custody.json",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            export.command,
+            Command::Recovery {
+                command: RecoveryCommand::Auth {
+                    command: RecoveryAuthCommand::Export {
+                        vault_root: Some(root),
+                        output,
+                        json: true,
+                    }
+                }
+            } if root == Path::new("vault") && output == Path::new("custody.json")
+        ));
+
+        let migrate = Cli::try_parse_from([
+            "hig",
+            "recovery",
+            "migrate-auth",
+            "--vault-root",
+            "legacy-vault",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            migrate.command,
+            Command::Recovery {
+                command: RecoveryCommand::MigrateAuth {
+                    vault_root: Some(root),
+                    json: true,
+                }
+            } if root == Path::new("legacy-vault")
         ));
     }
 
