@@ -18,6 +18,10 @@ The following persisted structures carry explicit schema identifiers:
 | Catalog | 1 | `RecoveryCatalog.schema` |
 | Registration, point, tombstone | 1 | Each record's `schema` field |
 | Audit event | 1 | `RecoveryAuditEvent.schema` |
+| Vault identity and state seal | 1 | Authenticated state contract |
+| Pending state transition | 1 | Dual-MAC transition contract |
+| Audit-chain entry/head/pending | 1 | Authenticated audit contract |
+| Authentication custody bundle | 1 | Custody bundle contract |
 | Repository objects | Per object kind | Repository reader contract |
 
 Every mutable JSON file and immutable audit event is wrapped by a schema-1
@@ -25,10 +29,20 @@ checked envelope. `payload_blake3` is the lowercase BLAKE3 digest of the compact
 JSON serialization of `payload`. Readers verify the envelope schema and digest
 before interpreting any payload field.
 
+Checked JSON detects accidental corruption but is not an authenticity boundary.
+Authenticated Vaults additionally bind `identity.json`, `config.json`, and
+`catalog.json` to a monotonic keyed state seal stored both in the Vault and in
+`HIG_RECOVERY_AUTH_DIR`. Mutations use an authenticated pending transition and
+copy-on-write publication. Audit events are bound in sequence by BLAKE3 chain
+entries; the chain head and pending publication are keyed and externally
+checkpointed. Key rotation transitions are authenticated by both the previous
+and target lineage keys.
+
 ## Schema-1 Reader Rules
 
 1. A reader MUST reject an unknown envelope, configuration, retention, catalog,
-   registration, recovery-point, tombstone, or audit schema.
+   registration, recovery-point, tombstone, audit, identity, state, transition,
+   audit-chain, or custody schema.
 2. A reader MUST reject a checksum mismatch before using the document.
 3. Missing fields are accepted only where the schema explicitly defines a
    default. Schema 1 defaults absent `retention` to the non-expiring protected
@@ -43,12 +57,24 @@ before interpreting any payload field.
 6. List, verify, audit, policy inspection, and scrub MUST work without the
    original workspace. Restore may append its normal audit transaction but MUST
    not rewrite pre-existing immutable objects.
+7. An authenticated reader MUST fail closed when its lineage key, external
+   checkpoint, state seal, or audit head is missing, stale, conflicting, or has
+   an invalid MAC. It MUST NOT recreate authentication from Vault-local data.
+8. A mirror MAY verify and restore but MUST NOT perform primary mutations until
+   a verified promotion changes its authenticated role and primary binding.
 
 ## Migration Rules
 
-Schema 1 has no predecessor Recovery Vault schema, so v1.10.0 performs direct
-read compatibility rather than a migration. A future schema change MUST satisfy
-all of the following before a writer is released:
+The original schema-1 fixture predates authenticated state and audit
+publication. Current readers intentionally reject it until the operator runs
+`hig recovery migrate-auth`. Migration verifies every checked control document,
+registration, published recovery ref, reachable repository object, mirror
+policy/catalog relationship, and audit pair before creating identities, keyed
+state seals, external checkpoints, and audit chains. Migration is resumable and
+idempotent and never rewrites immutable repository objects.
+
+A future schema change MUST satisfy all of the following before a writer is
+released:
 
 1. Add an immutable fixture for every prior readable vault schema; replacing or
    regenerating an older fixture is prohibited.
@@ -76,8 +102,11 @@ contains checked configuration, catalog, audit events, one protected repository
 ref, immutable repository objects inherited from the cross-platform v1.10.0
 repository fixture, expected restored files, and a SHA-256 manifest.
 
-`scripts/verify-golden-fixtures.sh` verifies the manifest, all schema fields,
-policy, list, audit pairing, recovery-point verification, scrub, source-absent
-restore, expected files, and byte identity of every pre-existing object before
-and after the run. This gate runs in native package CI. Future schema fixtures
-are additive and MUST be covered by the same operations.
+`scripts/verify-golden-fixtures.sh` verifies the immutable manifest, proves the
+legacy copy is rejected before explicit authentication migration, performs and
+repeats migration, exports custody, simulates loss of the live authentication
+directory, imports custody, and then verifies policy, list, authenticated audit
+history, recovery points, scrub, source-absent restore, expected files, and byte
+identity of every pre-existing object before and after the run. This gate runs
+in native package CI. Future schema fixtures are additive and MUST be covered by
+the same operations.

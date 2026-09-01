@@ -125,6 +125,35 @@ status when it needs the latest automatic commit, and stop it before unloading
 the workspace. The MCP server also terminates all managed watchers when its
 stdio session closes.
 
+## Recovery Vault
+
+- `hig_recovery_init`: initialize an authenticated primary Vault and mirrors.
+- `hig_recovery_register`: bind stable repository identity and source history.
+- `hig_recovery_capture`: publish and verify an immutable recovery point.
+- `hig_recovery_list`: discover repositories and points without the workspace.
+- `hig_recovery_status`: inspect RPO, durability, mirror, and audit lag.
+- `hig_recovery_promote`: promote a verified surviving mirror.
+- `hig_recovery_audit`: verify event pairing and the authenticated audit chain.
+- `hig_recovery_auth_rotate`: rotate the lineage key across mirrors and primary.
+- `hig_recovery_pin` / `hig_recovery_unpin`: control retention protection.
+- `hig_recovery_tombstone`: record deletion evidence without deleting bytes.
+- `hig_recovery_policy_show` / `hig_recovery_policy_set`: manage retention.
+- `hig_recovery_gc`: preview or apply protected mirror-first collection.
+- `hig_recovery_scrub`: verify all configured Vault copies and reachable graphs.
+- `hig_recovery_repair`: restore damaged primary objects from a verified mirror.
+- `hig_recovery_verify`: verify one complete recovery graph.
+- `hig_recovery_restore`: restore exact bytes while the source is absent.
+
+Use an explicit `vaultRoot` for every operation. A point is media-loss protected
+only when status reports `protected`, durability lag is zero, and scrub passes.
+GC defaults to preview and restore defaults to no-overwrite. Key rotation keeps
+old keys for offline custody compatibility and is retryable after interruption.
+
+Custody export/import and `migrate-auth` are operator-only CLI commands and are
+not MCP tools. Never send a custody bundle through an AI context. Configure
+`HIG_MCP_ALLOWED_ROOTS` with only the required workspace, Vault, mirror, and
+restore roots.
+
 ## Benchmark
 
 - `hig_bench`: run Hig benchmark and optional zip/tar comparisons.
@@ -163,4 +192,22 @@ Use benchmark tools only when the user asks for performance validation. They can
 | `hig_repo_restore_symbol` | `hig repo restore-symbol <dir> --symbol <symbol> -o <file> --json` |
 | `hig_repo_verify` | `hig repo verify <dir> --json` |
 | `hig_repo_gc` | `hig repo gc <dir> [--apply] --json` |
+| `hig_recovery_init` | `hig recovery init --vault-root <vault> --json` |
+| `hig_recovery_register` | `hig recovery register <dir> --vault-root <vault> --json` |
+| `hig_recovery_capture` | `hig recovery capture <dir> --vault-root <vault> --json` |
+| `hig_recovery_list` | `hig recovery list --vault-root <vault> --json` |
+| `hig_recovery_status` | `hig recovery status --vault-root <vault> --json` |
+| `hig_recovery_promote` | `hig recovery promote --vault-root <survivor> --mirror <replacement> --json` |
+| `hig_recovery_audit` | `hig recovery audit --vault-root <vault> --json` |
+| `hig_recovery_auth_rotate` | `hig recovery auth rotate --vault-root <vault> --json` |
+| `hig_recovery_pin` | `hig recovery pin <repository-id> <point-id> --vault-root <vault> --json` |
+| `hig_recovery_unpin` | `hig recovery unpin <repository-id> <point-id> --vault-root <vault> --json` |
+| `hig_recovery_tombstone` | `hig recovery tombstone <repository-id> ... --vault-root <vault> --json` |
+| `hig_recovery_policy_show` | `hig recovery policy show --vault-root <vault> --json` |
+| `hig_recovery_policy_set` | `hig recovery policy set --vault-root <vault> ... --json` |
+| `hig_recovery_gc` | `hig recovery gc --vault-root <vault> [--apply] --json` |
+| `hig_recovery_scrub` | `hig recovery scrub --vault-root <vault> --json` |
+| `hig_recovery_repair` | `hig recovery repair <repository-id> <point-id> --vault-root <vault> --mirror <mirror> --json` |
+| `hig_recovery_verify` | `hig recovery verify <repository-id> <point-id> --vault-root <vault> --json` |
+| `hig_recovery_restore` | `hig recovery restore <repository-id> <point-id> --vault-root <vault> -d <dir> --json` |
 | `hig_bench` | `hig bench <dir> --json` |

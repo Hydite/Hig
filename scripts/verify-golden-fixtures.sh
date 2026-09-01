@@ -9,6 +9,7 @@ RECOVERY_ROOT="$ROOT/fixtures/recovery-vault/v1.10.0-schema1"
 PASSWORD='hig-public-fixture-v1'
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/hig-golden-verify.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
+export HIG_RECOVERY_AUTH_DIR="$WORK/recovery-auth"
 
 test -x "$HIG_BIN"
 test -f "$ARCHIVE_ROOT/SHA256SUMS"
@@ -104,6 +105,34 @@ test "$(jq -r '.payload.schema' "$WORK/recovery-vault/catalog.json")" = 1
 test "$(jq -r '.payload.retention.schema' "$WORK/recovery-vault/config.json")" = 1
 test "$(jq -r '.payload.at_rest_policy' "$WORK/recovery-vault/config.json")" = external_encryption_required
 test "$(find "$WORK/recovery-vault/events" -name '*.json' -print0 | xargs -0 -n1 jq -r '.payload.schema' | sort -u)" = 1
+
+if "$HIG_BIN" recovery list --vault-root "$WORK/recovery-vault" --json \
+  >"$WORK/recovery-unsealed-list.json" 2>"$WORK/recovery-unsealed-list.err"; then
+  echo "legacy Recovery Vault was accepted without explicit authentication migration" >&2
+  exit 1
+fi
+grep -q 'migrate-auth' "$WORK/recovery-unsealed-list.err"
+
+"$HIG_BIN" recovery migrate-auth --vault-root "$WORK/recovery-vault" --json \
+  > "$WORK/recovery-migrate-first.json"
+test "$(jq -r '.created' "$WORK/recovery-migrate-first.json")" = true
+test "$(jq -r '.verified_repositories' "$WORK/recovery-migrate-first.json")" = 1
+test "$(jq -r '.verified_recovery_points' "$WORK/recovery-migrate-first.json")" = 1
+test "$(jq -r '.verified_audit_events' "$WORK/recovery-migrate-first.json")" = 4
+"$HIG_BIN" recovery migrate-auth --vault-root "$WORK/recovery-vault" --json \
+  > "$WORK/recovery-migrate-second.json"
+test "$(jq -r '.created' "$WORK/recovery-migrate-second.json")" = false
+
+"$HIG_BIN" recovery auth export --vault-root "$WORK/recovery-vault" \
+  --output "$WORK/recovery-custody.json" --json > "$WORK/recovery-custody-export.json"
+mv "$HIG_RECOVERY_AUTH_DIR" "$WORK/recovery-auth-lost"
+mkdir "$HIG_RECOVERY_AUTH_DIR"
+"$HIG_BIN" recovery auth import --vault-root "$WORK/recovery-vault" \
+  --input "$WORK/recovery-custody.json" --json > "$WORK/recovery-custody-import.json"
+test "$(jq -r '.key_id' "$WORK/recovery-custody-export.json")" = \
+  "$(jq -r '.key_id' "$WORK/recovery-custody-import.json")"
+test "$(jq -r '.checkpoint_sequence' "$WORK/recovery-custody-export.json")" = \
+  "$(jq -r '.checkpoint_sequence' "$WORK/recovery-custody-import.json")"
 
 "$HIG_BIN" recovery list --vault-root "$WORK/recovery-vault" --json > "$WORK/recovery-list.json"
 test "$(jq -r '.generation' "$WORK/recovery-list.json")" = 1

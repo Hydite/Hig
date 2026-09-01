@@ -78,6 +78,10 @@ hig recovery capture /path/to/project --vault-root /path/to/vault --json
 hig recovery list --vault-root /path/to/vault --json
 hig recovery status --vault-root /path/to/vault --json
 hig recovery audit --vault-root /path/to/vault --json
+hig recovery migrate-auth --vault-root /path/to/legacy-vault --json
+hig recovery auth export --vault-root /path/to/vault --output /offline/custody.json --json
+hig recovery auth import --vault-root /path/to/vault --input /offline/custody.json --json
+hig recovery auth rotate --vault-root /path/to/vault --json
 hig recovery verify <repository-id> <recovery-point-id> --vault-root /path/to/vault --json
 hig recovery restore <repository-id> <recovery-point-id> --vault-root /path/to/vault -d /path/to/restored --json
 hig recovery scrub --vault-root /path/to/vault --json
@@ -104,6 +108,14 @@ promoted after primary Vault loss without the source. Recovery GC is report-only
 unless `--apply` is explicit. See the
 [operator runbook](../operations/recovery-vault-runbook.md) before configuring
 production retention or disaster recovery.
+
+Recovery authentication keys and monotonic checkpoints live outside the Vault
+under `HIG_RECOVERY_AUTH_DIR` or the platform user default. Custody bundles
+contain raw lineage keys and must be encrypted and controlled outside the
+workspace, Vault, IDE, and source repository. Legacy unauthenticated Vaults
+require the explicit, full-graph-verifying `migrate-auth` command. Rotation is
+mirror-first, dual-authenticated, retryable, and retains old keys for offline
+custody compatibility.
 
 Repository references use the following model:
 
@@ -210,6 +222,7 @@ unrestricted shell boundary.
 | `hig_recovery_status` | report RPO, durability, mirror, and audit lag |
 | `hig_recovery_promote` | promote a verified survivor and create replacement mirrors |
 | `hig_recovery_audit` | validate mutation and interruption history |
+| `hig_recovery_auth_rotate` | rotate authenticated lineage keys across every Vault copy |
 | `hig_recovery_pin` | protect a recovery point from retention GC |
 | `hig_recovery_unpin` | remove an explicit recovery pin |
 | `hig_recovery_tombstone` | record deletion without removing recovery bytes |
@@ -225,12 +238,16 @@ unrestricted shell boundary.
 ## Security Defaults
 
 - The adapter restricts both lexical and resolved physical paths to
-  `HIG_MCP_ALLOWED_ROOTS`; symlink escapes are rejected.
+  `HIG_MCP_ALLOWED_ROOTS`; it revalidates immediately before spawn and the HIG
+  child independently enforces the physical roots. Symlink escapes and changed
+  path identities are rejected.
 - It does not expose arbitrary shell execution.
 - It does not persist passwords.
 - Destructive and overwrite flags require actual JSON booleans. GC remains
   report-only and restore remains no-overwrite unless explicit `true` is used.
 - Recovery operations require `vaultRoot` unless
   `HIG_MCP_ALLOW_GLOBAL_RECOVERY=1` is explicitly configured.
+- Custody export/import and legacy authentication migration are deliberately
+  absent from MCP because they expose or establish root recovery authority.
 - It supports session-based packing so IDE agents can avoid repeatedly passing passwords.
 - `hig_bench` is intentionally exposed but should only be used when the user asks for benchmark work.

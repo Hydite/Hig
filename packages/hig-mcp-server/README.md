@@ -1,6 +1,8 @@
 # Hig MCP Server
 
-This package wraps the `hig` CLI as a local MCP stdio server so IDE agents can call archive, cache, byte-history, and function-history operations through constrained tools instead of hand-writing shell commands.
+This package wraps the `hig` CLI as a local MCP stdio server so IDE agents can
+call archive, cache, repository-history, and Recovery Vault operations through
+constrained tools instead of hand-writing shell commands.
 
 ## npm Installation
 
@@ -96,11 +98,18 @@ Linux example:
 - By default, paths are restricted to the server working directory.
 - Set `HIG_MCP_ALLOWED_ROOTS` for IDE use.
 - Set `HIG_MCP_ALLOW_ANY_PATH=1` only in a trusted local environment.
-- The adapter does not log passwords, but Hig CLI password commands still receive passwords as child-process arguments today. Prefer `hig_session_unlock` plus `hig_pack` with `useSession: true` for repeated operations.
+- Passwords are delivered to HIG through bounded child stdin and are not placed
+  in process arguments. Prefer `hig_session_unlock` plus `hig_pack` with
+  `useSession: true` for repeated operations.
 - `hig_bench` can be long-running and write large temporary files.
 - Repository GC is report-only unless an MCP caller explicitly sets `apply: true`.
 - Repository watcher children are confined to allowed roots and are terminated when the MCP stdio session closes.
 - Symbol restore rejects ambiguous names; call `hig_repo_symbols` to select a qualified name or ID.
+- Resolved physical paths are revalidated immediately before spawn and again by
+  the HIG child against `HIG_MCP_ENFORCED_ROOTS`; path replacement and symlink
+  escape fail closed.
+- Recovery custody export/import and legacy authentication migration are
+  intentionally CLI-only because custody bundles contain raw lineage keys.
 
 ## Tools
 
