@@ -26,6 +26,7 @@ const repositoryWatchers = new Map();
 const repositoryWatcherStarts = new Set();
 const recoveryOperationsWithConfiguredMirrors = new Set([
   "hig_recovery_init",
+  "hig_recovery_auth_rotate",
   "hig_recovery_register",
   "hig_recovery_capture",
   "hig_recovery_pin",
@@ -532,6 +533,13 @@ const tools = [
     })
   },
   {
+    name: "hig_recovery_auth_rotate",
+    description: "Rotate the authenticated key across a verified primary Recovery Vault and every configured mirror. Old custody keys are retained for explicit offline disaster-recovery policy.",
+    inputSchema: objectSchema({
+      vaultRoot: pathProp("Authenticated primary Recovery Vault root.")
+    })
+  },
+  {
     name: "hig_recovery_pin",
     description: "Pin a recovery point so retention and quota GC cannot remove it.",
     inputSchema: objectSchema({
@@ -933,6 +941,8 @@ async function callTool(name, args) {
       ], { parseJson: true });
     case "hig_recovery_audit":
       return runHig(["recovery", "audit", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
+    case "hig_recovery_auth_rotate":
+      return runHig(["recovery", "auth", "rotate", ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_pin":
       return runHig(["recovery", "pin", stringArg(args.repositoryId, "repositoryId"), stringArg(args.recoveryPointId, "recoveryPointId"), ...recoveryVaultArgs(args, false), "--json"], { parseJson: true });
     case "hig_recovery_unpin":

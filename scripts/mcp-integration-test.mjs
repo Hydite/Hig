@@ -136,7 +136,7 @@ const requiredTools = [
   "hig_repo_storage_tree", "hig_repo_symbols", "hig_repo_symbol_history",
   "hig_repo_restore_symbol", "hig_repo_verify", "hig_repo_gc",
   "hig_recovery_init", "hig_recovery_register", "hig_recovery_capture",
-  "hig_recovery_list", "hig_recovery_status", "hig_recovery_promote", "hig_recovery_audit", "hig_recovery_pin", "hig_recovery_unpin",
+  "hig_recovery_list", "hig_recovery_status", "hig_recovery_promote", "hig_recovery_audit", "hig_recovery_auth_rotate", "hig_recovery_pin", "hig_recovery_unpin",
   "hig_recovery_tombstone", "hig_recovery_policy_show", "hig_recovery_policy_set",
   "hig_recovery_gc", "hig_recovery_scrub", "hig_recovery_repair",
   "hig_recovery_verify", "hig_recovery_restore", "hig_bench"
@@ -310,6 +310,12 @@ try {
   assert.equal(recoveryPromoted.data.schema, 1);
   assert.equal(recoveryPromoted.data.durability, "protected");
   assert.equal(recoveryPromoted.data.mirror_roots.length, 1);
+  const recoveryRotated = await tool("hig_recovery_auth_rotate", {
+    vaultRoot: recoveryVault
+  });
+  assert.equal(recoveryRotated.data.schema, 1);
+  assert.equal(recoveryRotated.data.rotated_vaults.length, 2);
+  assert.equal(recoveryRotated.data.old_keys_retained, true);
   const constrainedClient = await IsolatedMcpClient.start({
     higBin,
     mcpServer: server,

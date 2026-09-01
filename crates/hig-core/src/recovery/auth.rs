@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 const AUTH_SCHEMA: u16 = 1;
 const AUTH_DOMAIN_IDENTITY: &[u8] = b"hig-recovery-identity-v1\0";
 const AUTH_DOMAIN_STATE: &[u8] = b"hig-recovery-state-v1\0";
-const AUTH_DOMAIN_TRANSITION: &[u8] = b"hig-recovery-transition-v1\0";
+const AUTH_DOMAIN_TRANSITION_PREVIOUS: &[u8] = b"hig-recovery-transition-previous-v1\0";
+const AUTH_DOMAIN_TRANSITION_TARGET: &[u8] = b"hig-recovery-transition-target-v1\0";
 const AUTH_DOMAIN_BUNDLE: &[u8] = b"hig-recovery-custody-bundle-v1\0";
 const AUTH_BUNDLE_SCHEMA: u16 = 1;
 
@@ -70,11 +71,14 @@ struct VaultPendingTransition {
     vault_id: String,
     previous_sequence: u64,
     previous_state_mac: Option<String>,
+    previous_key_id: String,
+    target_key_id: String,
     write_config: bool,
     write_catalog: bool,
     write_identity: bool,
     target: VaultStateSeal,
     transition_mac: String,
+    target_transition_mac: String,
 }
 
 #[derive(Serialize)]
@@ -83,6 +87,8 @@ struct UnsignedVaultPendingTransition<'a> {
     vault_id: &'a str,
     previous_sequence: u64,
     previous_state_mac: Option<&'a str>,
+    previous_key_id: &'a str,
+    target_key_id: &'a str,
     write_config: bool,
     write_catalog: bool,
     write_identity: bool,
@@ -273,6 +279,48 @@ pub(super) fn promote_identity(
     Ok(promoted)
 }
 
+pub(super) fn create_rotation_key(root: &Path) -> anyhow::Result<String> {
+    let identity = load_identity(root)?;
+    let key = crate::random_bytes::<32>();
+    let key_id = blake3::hash(&key).to_hex().to_string();
+    write_new_key(root, &identity.lineage_id, &key_id, &key)?;
+    Ok(key_id)
+}
+
+pub(super) fn rotate_identity_key(
+    root: &Path,
+    target_key_id: &str,
+    catalog_generation: u64,
+) -> anyhow::Result<(VaultIdentity, VaultIdentity)> {
+    let existing = load_identity(root)?;
+    if existing.key_id == target_key_id {
+        return Ok((existing.clone(), existing));
+    }
+    let previous_key = load_key(root, &existing.lineage_id, &existing.key_id)?;
+    let target_key = load_key(root, &existing.lineage_id, target_key_id)?;
+    let rotated = build_identity(
+        &existing.lineage_id,
+        &existing.vault_id,
+        existing.role,
+        &existing.primary_vault_id,
+        &target_key,
+    )?;
+    let bytes = serde_json::to_vec_pretty(&rotated)?;
+    commit_transition_with_target_key(
+        root,
+        &existing,
+        &previous_key,
+        &target_key,
+        target_key_id,
+        catalog_generation,
+        TransitionDocuments {
+            identity: Some(&bytes),
+            ..TransitionDocuments::default()
+        },
+    )?;
+    Ok((existing, rotated))
+}
+
 pub(super) fn initialize_state(
     root: &Path,
     catalog_generation: u64,
@@ -337,9 +385,11 @@ pub(super) fn write_config(
 }
 
 pub(super) fn verify_state(root: &Path, catalog_generation: u64) -> anyhow::Result<()> {
+    let initial_identity = load_identity(root)?;
+    let initial_key = load_key(root, &initial_identity.lineage_id, &initial_identity.key_id)?;
+    recover_pending_transition(root, &initial_identity, &initial_key)?;
     let identity = load_identity(root)?;
     let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
-    recover_pending_transition(root, &identity, &key)?;
     let vault_path = state_path(root);
     let external_path = external_state_path(root, &identity.vault_id)?;
     anyhow::ensure!(
@@ -366,9 +416,9 @@ pub(super) fn export_custody_bundle(
     root: &Path,
     output: &Path,
 ) -> anyhow::Result<(VaultIdentity, u64)> {
+    recover_state(root)?;
     let identity = load_identity(root)?;
     let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
-    recover_pending_transition(root, &identity, &key)?;
     let checkpoint = read_state(&external_state_path(root, &identity.vault_id)?)?;
     validate_state_seal(&checkpoint, &identity, &key)?;
     verify_seal_files(root, &checkpoint)?;
@@ -458,11 +508,36 @@ fn commit_transition(
     catalog_generation: u64,
     documents: TransitionDocuments<'_>,
 ) -> anyhow::Result<()> {
-    recover_pending_transition(root, identity, key)?;
+    commit_transition_with_target_key(
+        root,
+        identity,
+        key,
+        key,
+        &identity.key_id,
+        catalog_generation,
+        documents,
+    )
+}
+
+fn commit_transition_with_target_key(
+    root: &Path,
+    identity: &VaultIdentity,
+    previous_key: &[u8; 32],
+    target_key: &[u8; 32],
+    target_key_id: &str,
+    catalog_generation: u64,
+    documents: TransitionDocuments<'_>,
+) -> anyhow::Result<()> {
+    validate_hash_id("target key", target_key_id)?;
+    anyhow::ensure!(
+        blake3::hash(target_key).to_hex().as_str() == target_key_id,
+        "Recovery Vault target key identity mismatch"
+    );
+    recover_pending_transition(root, identity, previous_key)?;
     let external_path = external_state_path(root, &identity.vault_id)?;
     let current = if external_path.exists() {
         let current = read_state(&external_path)?;
-        validate_state_seal(&current, identity, key)?;
+        validate_state_seal(&current, identity, previous_key)?;
         verify_seal_files(root, &current)?;
         anyhow::ensure!(
             state_path(root).exists() && read_state(&state_path(root))? == current,
@@ -497,28 +572,41 @@ fn commit_transition(
         identity_blake3: target_file_hash(root, "identity.json", documents.identity)?,
         state_mac: String::new(),
     };
-    target.state_mac = state_mac(&target, key)?;
+    target.state_mac = state_mac(&target, target_key)?;
     let mut pending = VaultPendingTransition {
         schema: AUTH_SCHEMA,
         vault_id: identity.vault_id.clone(),
         previous_sequence: current.as_ref().map_or(0, |state| state.sequence),
         previous_state_mac: current.as_ref().map(|state| state.state_mac.clone()),
+        previous_key_id: identity.key_id.clone(),
+        target_key_id: target_key_id.to_string(),
         write_config: documents.config.is_some(),
         write_catalog: documents.catalog.is_some(),
         write_identity: documents.identity.is_some(),
         target,
         transition_mac: String::new(),
+        target_transition_mac: String::new(),
     };
-    pending.transition_mac = transition_mac(&pending, key)?;
+    pending.transition_mac =
+        transition_mac(&pending, previous_key, AUTH_DOMAIN_TRANSITION_PREVIOUS)?;
+    pending.target_transition_mac =
+        transition_mac(&pending, target_key, AUTH_DOMAIN_TRANSITION_TARGET)?;
     let pending_path = pending_path(root, &identity.vault_id)?;
     atomic_write(&pending_path, &serde_json::to_vec_pretty(&pending)?)?;
-    finish_pending_transition(root, identity, key, &pending, current.as_ref())
+    finish_pending_transition(
+        root,
+        identity,
+        previous_key,
+        target_key,
+        &pending,
+        current.as_ref(),
+    )
 }
 
 fn recover_pending_transition(
     root: &Path,
     identity: &VaultIdentity,
-    key: &[u8; 32],
+    _identity_key: &[u8; 32],
 ) -> anyhow::Result<()> {
     let pending_path = pending_path(root, &identity.vault_id)?;
     let external_path = external_state_path(root, &identity.vault_id)?;
@@ -527,10 +615,16 @@ fn recover_pending_transition(
         return Ok(());
     }
     let pending: VaultPendingTransition = serde_json::from_slice(&read_bounded(&pending_path)?)?;
-    validate_pending_transition(&pending, identity, key)?;
+    let previous_key = load_key(root, &identity.lineage_id, &pending.previous_key_id)?;
+    let target_key = load_key(root, &identity.lineage_id, &pending.target_key_id)?;
+    validate_pending_transition(&pending, identity, &previous_key, &target_key)?;
     let current = if external_path.exists() {
         let current = read_state(&external_path)?;
-        validate_state_seal(&current, identity, key)?;
+        if current == pending.target {
+            validate_state_seal(&current, identity, &target_key)?;
+        } else {
+            validate_state_seal(&current, identity, &previous_key)?;
+        }
         Some(current)
     } else {
         None
@@ -544,17 +638,25 @@ fn recover_pending_transition(
         cleanup_pending(root, &pending_path)?;
         return Ok(());
     }
-    finish_pending_transition(root, identity, key, &pending, current.as_ref())
+    finish_pending_transition(
+        root,
+        identity,
+        &previous_key,
+        &target_key,
+        &pending,
+        current.as_ref(),
+    )
 }
 
 fn finish_pending_transition(
     root: &Path,
     identity: &VaultIdentity,
-    key: &[u8; 32],
+    previous_key: &[u8; 32],
+    target_key: &[u8; 32],
     pending: &VaultPendingTransition,
     current: Option<&VaultStateSeal>,
 ) -> anyhow::Result<()> {
-    validate_pending_transition(pending, identity, key)?;
+    validate_pending_transition(pending, identity, previous_key, target_key)?;
     match current {
         Some(current) => {
             anyhow::ensure!(
@@ -670,8 +772,10 @@ fn current_catalog_generation(
     key: &[u8; 32],
 ) -> anyhow::Result<u64> {
     recover_pending_transition(root, identity, key)?;
+    let identity = load_identity(root)?;
+    let key = load_key(root, &identity.lineage_id, &identity.key_id)?;
     let state = read_state(&external_state_path(root, &identity.vault_id)?)?;
-    validate_state_seal(&state, identity, key)?;
+    validate_state_seal(&state, &identity, &key)?;
     verify_seal_files(root, &state)?;
     Ok(state.catalog_generation)
 }
@@ -756,7 +860,8 @@ fn validate_state_seal(
 fn validate_pending_transition(
     pending: &VaultPendingTransition,
     identity: &VaultIdentity,
-    key: &[u8; 32],
+    previous_key: &[u8; 32],
+    target_key: &[u8; 32],
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         pending.schema == AUTH_SCHEMA && pending.vault_id == identity.vault_id,
@@ -766,10 +871,23 @@ fn validate_pending_transition(
         pending.write_config || pending.write_catalog || pending.write_identity,
         "Recovery Vault pending transition contains no changes"
     );
-    validate_state_seal(&pending.target, identity, key)?;
+    validate_hash_id("previous key", &pending.previous_key_id)?;
+    validate_hash_id("target key", &pending.target_key_id)?;
     anyhow::ensure!(
-        pending.transition_mac == transition_mac(pending, key)?,
+        blake3::hash(previous_key).to_hex().as_str() == pending.previous_key_id
+            && blake3::hash(target_key).to_hex().as_str() == pending.target_key_id,
+        "Recovery Vault pending transition key identity mismatch"
+    );
+    validate_state_seal(&pending.target, identity, target_key)?;
+    anyhow::ensure!(
+        pending.transition_mac
+            == transition_mac(pending, previous_key, AUTH_DOMAIN_TRANSITION_PREVIOUS)?,
         "Recovery Vault pending transition authentication failed"
+    );
+    anyhow::ensure!(
+        pending.target_transition_mac
+            == transition_mac(pending, target_key, AUTH_DOMAIN_TRANSITION_TARGET)?,
+        "Recovery Vault target transition authentication failed"
     );
     Ok(())
 }
@@ -815,15 +933,21 @@ fn state_mac(seal: &VaultStateSeal, key: &[u8; 32]) -> anyhow::Result<String> {
     )
 }
 
-fn transition_mac(transition: &VaultPendingTransition, key: &[u8; 32]) -> anyhow::Result<String> {
+fn transition_mac(
+    transition: &VaultPendingTransition,
+    key: &[u8; 32],
+    domain: &[u8],
+) -> anyhow::Result<String> {
     keyed_json_hash(
         key,
-        AUTH_DOMAIN_TRANSITION,
+        domain,
         &UnsignedVaultPendingTransition {
             schema: transition.schema,
             vault_id: &transition.vault_id,
             previous_sequence: transition.previous_sequence,
             previous_state_mac: transition.previous_state_mac.as_deref(),
+            previous_key_id: &transition.previous_key_id,
+            target_key_id: &transition.target_key_id,
             write_config: transition.write_config,
             write_catalog: transition.write_catalog,
             write_identity: transition.write_identity,
@@ -1248,5 +1372,33 @@ mod tests {
         let error = import_custody_bundle(&vault, &bundle).unwrap_err();
         assert!(error.to_string().contains("bundle authentication failed"));
         assert!(!auth_root(&vault).unwrap().join("keys").exists());
+    }
+
+    #[test]
+    fn cross_key_rotation_recovers_every_authenticated_commit_window() {
+        for failpoint in [
+            "auth_after_config_publication",
+            "auth_after_catalog_publication",
+            "auth_after_identity_publication",
+            "auth_after_local_checkpoint",
+            "auth_after_external_checkpoint",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let vault = temp.path().join("vault");
+            init_recovery_vault(Some(&vault), Vec::new()).unwrap();
+            let previous = load_identity(&vault).unwrap();
+            let generation = load_catalog(&vault).unwrap().generation;
+            let target_key_id = create_rotation_key(&vault).unwrap();
+
+            let error = with_recovery_failpoint(failpoint, || {
+                rotate_identity_key(&vault, &target_key_id, generation).unwrap_err()
+            });
+            assert!(error.to_string().contains(failpoint));
+            load_vault_config(&vault).unwrap();
+            let rotated = load_identity(&vault).unwrap();
+            assert_eq!(rotated.key_id, target_key_id);
+            assert_ne!(rotated.key_id, previous.key_id);
+            verify_state(&vault, generation).unwrap();
+        }
     }
 }

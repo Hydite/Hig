@@ -611,6 +611,12 @@ pub(crate) enum RecoveryAuthCommand {
         #[arg(long)]
         json: bool,
     },
+    Rotate {
+        #[arg(long)]
+        vault_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -941,6 +947,28 @@ mod tests {
                     json: true,
                 }
             } if root == Path::new("legacy-vault")
+        ));
+
+        let rotate = Cli::try_parse_from([
+            "hig",
+            "recovery",
+            "auth",
+            "rotate",
+            "--vault-root",
+            "vault",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            rotate.command,
+            Command::Recovery {
+                command: RecoveryCommand::Auth {
+                    command: RecoveryAuthCommand::Rotate {
+                        vault_root: Some(root),
+                        json: true,
+                    }
+                }
+            } if root == Path::new("vault")
         ));
     }
 

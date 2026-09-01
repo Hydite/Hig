@@ -6,7 +6,7 @@ use hig_core::{
     import_recovery_auth_custody, init_recovery_vault, list_recovery_vault, migrate_recovery_auth,
     promote_recovery_vault, record_recovery_tombstone, recovery_audit_log, recovery_vault_config,
     recovery_vault_status, register_recovery_repository, repair_recovery_point,
-    restore_recovery_point, scrub_recovery_vault, set_recovery_point_pin,
+    restore_recovery_point, rotate_recovery_auth_key, scrub_recovery_vault, set_recovery_point_pin,
     update_recovery_retention, verify_recovery_point,
 };
 
@@ -404,6 +404,23 @@ fn handle_auth(command: RecoveryAuthCommand) -> anyhow::Result<()> {
                 return Ok(());
             }
             (report, "imported")
+        }
+        RecoveryAuthCommand::Rotate { vault_root, json } => {
+            let report = rotate_recovery_auth_key(vault_root.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "recovery: authentication rotated vault={} lineage={} key_id={} previous_keys={} vaults={} old_keys_retained={}",
+                    report.vault_root,
+                    report.lineage_id,
+                    report.key_id,
+                    report.previous_key_ids.join(","),
+                    report.rotated_vaults.len(),
+                    report.old_keys_retained
+                );
+            }
+            return Ok(());
         }
     };
     println!(

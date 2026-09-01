@@ -17,6 +17,7 @@ const MAX_AUDIT_EVENTS: usize = 1_000_000;
 pub enum RecoveryAuditOperation {
     VaultInitialize,
     VaultPromote,
+    AuthKeyRotate,
     RetentionUpdate,
     RepositoryRegister,
     Capture,

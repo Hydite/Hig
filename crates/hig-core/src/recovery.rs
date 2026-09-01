@@ -447,6 +447,17 @@ pub struct RecoveryAuthMigrationReport {
     pub verified_audit_events: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryAuthRotationReport {
+    pub schema: u16,
+    pub vault_root: String,
+    pub lineage_id: String,
+    pub previous_key_ids: Vec<String>,
+    pub key_id: String,
+    pub rotated_vaults: Vec<String>,
+    pub old_keys_retained: bool,
+}
+
 pub fn default_recovery_vault_root() -> anyhow::Result<PathBuf> {
     if let Some(value) = std::env::var_os("HIG_RECOVERY_VAULT")
         && !value.is_empty()
@@ -691,6 +702,86 @@ pub fn migrate_recovery_auth(
         verified_raw_bytes,
         verified_audit_events,
     })
+}
+
+pub fn rotate_recovery_auth_key(
+    requested_root: Option<&Path>,
+) -> anyhow::Result<RecoveryAuthRotationReport> {
+    let root = resolve_vault_root(requested_root)?;
+    let _lock = lock_vault(&root)?;
+    let primary_identity = auth::require_primary(&root)?;
+    let config = load_vault_config(&root)?;
+    let catalog = load_catalog(&root)?;
+    verify_unsealed_vault(&root, &catalog)?;
+
+    let mut previous_key_ids = BTreeSet::from([primary_identity.key_id.clone()]);
+    let mut mirror_states = Vec::with_capacity(config.mirror_roots.len());
+    for mirror in &config.mirror_roots {
+        let mirror_lock = lock_vault(mirror)?;
+        let mirror_config = load_vault_config(mirror)?;
+        anyhow::ensure!(
+            mirror_config.mirror_roots.is_empty(),
+            "Recovery auth rotation target is not a mirror Vault"
+        );
+        let mirror_catalog = load_catalog(mirror)?;
+        auth::require_mirror_for(mirror, &primary_identity)?;
+        verify_unsealed_vault(mirror, &mirror_catalog)?;
+        let mirror_identity = auth::load_identity(mirror)?;
+        previous_key_ids.insert(mirror_identity.key_id);
+        mirror_states.push((mirror.clone(), mirror_lock, mirror_catalog.generation));
+    }
+
+    let generation = catalog.generation;
+    run_audited(
+        &root,
+        RecoveryAuditOperation::AuthKeyRotate,
+        Some(generation),
+        None,
+        None,
+        BTreeMap::from([(
+            "vault_count".to_string(),
+            (mirror_states.len() + 1).to_string(),
+        )]),
+        || {
+            let key_id = auth::create_rotation_key(&root)?;
+            let mut rotated_vaults = Vec::with_capacity(mirror_states.len() + 1);
+            for (mirror, _lock, mirror_generation) in &mirror_states {
+                auth::rotate_identity_key(mirror, &key_id, *mirror_generation)?;
+                rotated_vaults.push(mirror.display().to_string());
+            }
+            recovery_failpoint("auth_rotation_after_mirrors")?;
+            auth::rotate_identity_key(&root, &key_id, generation)?;
+            rotated_vaults.push(root.display().to_string());
+            recovery_failpoint("auth_rotation_after_primary")?;
+
+            let rotated_primary = auth::require_primary(&root)?;
+            anyhow::ensure!(
+                rotated_primary.key_id == key_id,
+                "Recovery primary did not adopt the rotated key"
+            );
+            for (mirror, _lock, mirror_generation) in &mirror_states {
+                let rotated_mirror = auth::require_mirror_for(mirror, &rotated_primary)?;
+                anyhow::ensure!(
+                    rotated_mirror.key_id == key_id,
+                    "Recovery mirror did not adopt the rotated key"
+                );
+                auth::verify_state(mirror, *mirror_generation)?;
+            }
+            auth::verify_state(&root, generation)?;
+            Ok((
+                RecoveryAuthRotationReport {
+                    schema: RECOVERY_REPORT_SCHEMA,
+                    vault_root: root.display().to_string(),
+                    lineage_id: rotated_primary.lineage_id,
+                    previous_key_ids: previous_key_ids.iter().cloned().collect(),
+                    key_id,
+                    rotated_vaults,
+                    old_keys_retained: true,
+                },
+                Some(generation),
+            ))
+        },
+    )
 }
 
 pub fn update_recovery_retention(
@@ -3782,6 +3873,68 @@ mod tests {
         );
         assert!(!vault.join("identity.json").exists());
         assert!(!vault.join("state.json").exists());
+    }
+
+    #[test]
+    fn auth_key_rotation_converges_after_mirror_first_interruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let primary = temp.path().join("primary");
+        let mirror = temp.path().join("mirror");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("critical.bin"), b"before-rotation").unwrap();
+        let initialized = init_repository(&source, Vec::new()).unwrap();
+        snapshot_repository(&source, "before rotation".into(), None).unwrap();
+        init_recovery_vault(Some(&primary), vec![mirror.clone()]).unwrap();
+        capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
+        let original_key_id = auth::load_identity(&primary).unwrap().key_id;
+
+        let error = with_recovery_failpoint("auth_rotation_after_mirrors", || {
+            rotate_recovery_auth_key(Some(&primary)).unwrap_err()
+        });
+        assert!(error.to_string().contains("auth_rotation_after_mirrors"));
+        assert_eq!(
+            auth::load_identity(&primary).unwrap().key_id,
+            original_key_id
+        );
+        assert_ne!(
+            auth::load_identity(&mirror).unwrap().key_id,
+            original_key_id
+        );
+
+        let rotated = rotate_recovery_auth_key(Some(&primary)).unwrap();
+        assert_ne!(rotated.key_id, original_key_id);
+        assert_eq!(rotated.rotated_vaults.len(), 2);
+        assert!(rotated.old_keys_retained);
+        assert_eq!(
+            auth::load_identity(&primary).unwrap().key_id,
+            rotated.key_id
+        );
+        assert_eq!(auth::load_identity(&mirror).unwrap().key_id, rotated.key_id);
+
+        fs::write(source.join("critical.bin"), b"after-rotation\0\xff").unwrap();
+        snapshot_repository(&source, "after rotation".into(), None).unwrap();
+        let captured = capture_recovery_point(&source, "HEAD", Some(&primary)).unwrap();
+        assert_eq!(
+            captured.recovery_point.durability,
+            RecoveryDurability::Protected
+        );
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&primary).unwrap();
+        let output = temp.path().join("restored");
+        restore_recovery_point(
+            Some(&mirror),
+            &hex::encode(initialized.repository_id),
+            &captured.recovery_point.recovery_point_id,
+            &output,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(output.join("critical.bin")).unwrap(),
+            b"after-rotation\0\xff"
+        );
     }
 
     #[test]
