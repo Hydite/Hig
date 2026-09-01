@@ -3466,7 +3466,7 @@ mod windows_owner_only {
                 // Windows may discard inheritance propagation flags on non-container objects.
                 ace_flags &= !0x03;
             }
-            let sid = unsafe { std::ptr::addr_of!((*ace).SidStart).cast::<u8>() };
+            let sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast::<u8>() };
             let sid_offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
             anyhow::ensure!(
                 unsafe { IsValidSid(sid.cast()) } != 0,
