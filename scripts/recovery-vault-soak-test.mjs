@@ -39,8 +39,16 @@ const primaryVault = path.join(work, "primary-vault");
 const mirrorVault = path.join(work, "mirror-vault");
 const restoreRoot = path.join(work, "restores");
 const startedAt = new Date();
+const metricSamples = {
+  watcher_rpo_ms: [],
+  capture_latency_ms: [],
+  verify_latency_ms: [],
+  restore_latency_ms: [],
+  restore_throughput_mib_s: [],
+  gc_latency_ms: [],
+};
 const report = {
-  schema: 1,
+  schema: 2,
   mode: options.mode,
   source_commit: process.env.GITHUB_SHA || await gitCommit(),
   platform: process.platform,
@@ -63,6 +71,25 @@ const report = {
   final_scrub: null,
   final_audit: null,
   final_digest: null,
+  metrics: {
+    watcher_rpo_ms: null,
+    capture_latency_ms: null,
+    verify_latency_ms: null,
+    restore_latency_ms: null,
+    restore_throughput_mib_s: null,
+    gc_latency_ms: null,
+    logical_snapshot_bytes_total: 0,
+    capture_reachable_objects_total: 0,
+    capture_stored_objects_written_total: 0,
+    capture_stored_bytes_written_total: 0,
+    object_dedup_reuse_ratio: null,
+    storage_write_ratio: null,
+    restore_bytes_total: 0,
+    restore_elapsed_ms_total: 0,
+    aggregate_restore_throughput_mib_s: null,
+    large_restore_threshold_bytes: 1024 * 1024,
+    harness_peak_rss_bytes: process.memoryUsage().rss,
+  },
   status: "running",
 };
 
@@ -168,6 +195,8 @@ async function main() {
     );
     report.final_digest = digestTree(primaryLossOutput);
     assert.equal(report.final_digest, expectedDigest, "final Recovery Vault digest mismatch");
+    finalizeMetrics();
+    validateMetrics();
     report.status = "passed";
   } catch (error) {
     report.status = "failed";
@@ -175,6 +204,7 @@ async function main() {
     throw error;
   } finally {
     if (mcp) await mcp.close().catch(() => {});
+    finalizeMetrics();
     report.finished_at = new Date().toISOString();
     report.duration_seconds = Number(((Date.now() - startedAt.getTime()) / 1000).toFixed(3));
     const serialized = `${JSON.stringify(report, null, 2)}\n`;
@@ -219,6 +249,7 @@ async function startRecoveryWatcher(client, message) {
 }
 
 async function waitForWatcherSnapshot(client) {
+  const started = performance.now();
   let lastStatus;
   let status;
   try {
@@ -236,6 +267,8 @@ async function waitForWatcherSnapshot(client) {
     }
     throw error;
   }
+  addMetric("watcher_rpo_ms", performance.now() - started);
+  sampleHarnessMemory();
   client.watcherSnapshots = status.data.snapshots;
   return status;
 }
@@ -261,6 +294,7 @@ function recordWatcherCapture(status, repositoryId) {
   assert.equal(Buffer.from(snapshot.recovery.repository_id).toString("hex"), repositoryId);
   report.snapshots += 1;
   report.recovery_captures += 1;
+  recordCaptureMetrics(snapshot.recovery, snapshot.input_bytes);
   recordCommit(snapshot.commit_id);
   recordRecoveryPoint(snapshot.recovery.recovery_point.recovery_point_id);
 }
@@ -319,6 +353,7 @@ async function exerciseCaptureInterruption(repositoryId) {
     "--json",
   ]);
   assert.equal(snapshot.created, true, "capture interruption fixture did not create a revision");
+  recordSnapshotMetrics(snapshot);
   recordCommit(snapshot.commit_id);
   const expectedDigest = digestTree(workspace);
   const preparedBefore = preparedOperationIds(primaryVault);
@@ -439,8 +474,14 @@ async function exerciseGcInterruption(repositoryId) {
   const audit = await runHig(["recovery", "audit", "--vault-root", primaryVault, "--json"]);
   assert(audit.incomplete_operation_ids.includes(observation.operationId), "GC interruption is absent from audit");
 
-  const recovered = await runHig(["recovery", "gc", "--vault-root", primaryVault, "--apply", "--json"]);
-  const repeated = await runHig(["recovery", "gc", "--vault-root", primaryVault, "--apply", "--json"]);
+  const recovered = (await runHigMeasured(
+    ["recovery", "gc", "--vault-root", primaryVault, "--apply", "--json"],
+    "gc_latency_ms",
+  )).value;
+  const repeated = (await runHigMeasured(
+    ["recovery", "gc", "--vault-root", primaryVault, "--apply", "--json"],
+    "gc_latency_ms",
+  )).value;
   assert.equal(repeated.candidate_recovery_points, 0, "repeated Recovery Vault GC found candidates");
   assert.equal(repeated.removed_recovery_points, 0, "repeated Recovery Vault GC removed state");
   const finalList = await listVault(primaryVault);
@@ -473,6 +514,7 @@ async function snapshotAndCapture(message) {
     "--json",
   ]);
   assert.equal(snapshot.created, true, `${message}: snapshot was unchanged`);
+  recordSnapshotMetrics(snapshot);
   recordCommit(snapshot.commit_id);
   const capture = await captureHead();
   assert.equal(capture.recovery_point.recovery_point_id, snapshot.commit_id);
@@ -483,30 +525,40 @@ async function snapshotAndCapture(message) {
 
 async function captureHead() {
   report.recovery_captures += 1;
-  return runHig([
+  const measured = await runHigMeasured([
     "recovery", "capture", workspace,
     "--revision", "HEAD",
     "--vault-root", primaryVault,
     "--json",
-  ]);
+  ], "capture_latency_ms");
+  recordCaptureMetrics(measured.value, null);
+  return measured.value;
 }
 
 async function verifyPointAt(vault, repositoryId, recoveryPointId) {
-  return runHig([
+  const measured = await runHigMeasured([
     "recovery", "verify", repositoryId, recoveryPointId,
     "--vault-root", vault,
     "--json",
-  ]);
+  ], "verify_latency_ms");
+  return measured.value;
 }
 
 async function restorePoint(vault, repositoryId, recoveryPointId, output, overwrite) {
-  return runHig([
+  const measured = await runHigMeasured([
     "recovery", "restore", repositoryId, recoveryPointId,
     "--output-dir", output,
     ...(overwrite ? ["--overwrite"] : []),
     "--vault-root", vault,
     "--json",
-  ]);
+  ], "restore_latency_ms");
+  const bytes = measured.value.restore.bytes;
+  report.metrics.restore_bytes_total += bytes;
+  report.metrics.restore_elapsed_ms_total += measured.elapsedMs;
+  if (bytes >= report.metrics.large_restore_threshold_bytes && measured.elapsedMs > 0) {
+    addMetric("restore_throughput_mib_s", (bytes / (1024 * 1024)) / (measured.elapsedMs / 1000));
+  }
+  return measured.value;
 }
 
 async function listVault(vault) {
@@ -614,11 +666,105 @@ function summarizeGc(gc) {
 async function runHig(args) {
   const result = await runProcess(higBin, args, { cwd: projectRoot, timeoutMs: 300_000 });
   assert.equal(result.code, 0, `hig ${args.join(" ")} failed\n${result.stderr}\n${result.stdout}`);
+  sampleHarnessMemory();
   try {
     return JSON.parse(result.stdout.trim());
   } catch (error) {
     throw new Error(`hig ${args.join(" ")} returned invalid JSON: ${error.message}\n${result.stdout}`);
   }
+}
+
+async function runHigMeasured(args, metric) {
+  const started = performance.now();
+  const value = await runHig(args);
+  const elapsedMs = performance.now() - started;
+  addMetric(metric, elapsedMs);
+  return { value, elapsedMs };
+}
+
+function recordCaptureMetrics(capture, logicalSnapshotBytes) {
+  const point = capture.recovery_point;
+  report.metrics.capture_reachable_objects_total += point.reachable_objects;
+  report.metrics.capture_stored_objects_written_total += point.stored_objects_written;
+  report.metrics.capture_stored_bytes_written_total += point.stored_bytes_written;
+  if (logicalSnapshotBytes !== null && logicalSnapshotBytes !== undefined) {
+    report.metrics.logical_snapshot_bytes_total += logicalSnapshotBytes;
+  }
+}
+
+function recordSnapshotMetrics(snapshot) {
+  report.metrics.logical_snapshot_bytes_total += snapshot.input_bytes;
+}
+
+function addMetric(name, value) {
+  assert(Number.isFinite(value) && value >= 0, `${name} produced an invalid sample`);
+  metricSamples[name].push(Number(value.toFixed(3)));
+}
+
+function sampleHarnessMemory() {
+  report.metrics.harness_peak_rss_bytes = Math.max(
+    report.metrics.harness_peak_rss_bytes,
+    process.memoryUsage().rss,
+  );
+}
+
+function summarizeMetric(samples) {
+  if (samples.length === 0) return null;
+  const sorted = [...samples].sort((left, right) => left - right);
+  const percentile = (fraction) => sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)];
+  return {
+    samples: sorted.length,
+    minimum: sorted[0],
+    p05: percentile(0.05),
+    median: percentile(0.5),
+    p95: percentile(0.95),
+    maximum: sorted.at(-1),
+  };
+}
+
+function finalizeMetrics() {
+  sampleHarnessMemory();
+  for (const [name, samples] of Object.entries(metricSamples)) {
+    report.metrics[name] = summarizeMetric(samples);
+  }
+  const reachable = report.metrics.capture_reachable_objects_total;
+  const written = report.metrics.capture_stored_objects_written_total;
+  if (reachable > 0) {
+    report.metrics.object_dedup_reuse_ratio = Number((1 - Math.min(written, reachable) / reachable).toFixed(6));
+  }
+  const logicalBytes = report.metrics.logical_snapshot_bytes_total;
+  if (logicalBytes > 0) {
+    report.metrics.storage_write_ratio = Number(
+      (report.metrics.capture_stored_bytes_written_total / logicalBytes).toFixed(6),
+    );
+  }
+  const restoreElapsedMs = report.metrics.restore_elapsed_ms_total;
+  if (report.metrics.restore_bytes_total > 0 && restoreElapsedMs > 0) {
+    report.metrics.aggregate_restore_throughput_mib_s = Number(
+      (
+        (report.metrics.restore_bytes_total / (1024 * 1024))
+        / (restoreElapsedMs / 1000)
+      ).toFixed(3),
+    );
+  }
+}
+
+function validateMetrics() {
+  assert(report.metrics.watcher_rpo_ms?.samples >= 4, "RPO evidence has too few samples");
+  assert(report.metrics.capture_latency_ms?.samples >= 1, "capture latency evidence is missing");
+  assert(report.metrics.verify_latency_ms?.samples >= 1, "verification latency evidence is missing");
+  assert(report.metrics.restore_latency_ms?.samples >= 1, "restore latency evidence is missing");
+  assert(report.metrics.restore_throughput_mib_s?.samples >= 1, "large-restore throughput evidence is missing");
+  assert(report.metrics.gc_latency_ms?.samples >= 2, "GC latency evidence is incomplete");
+  assert(report.metrics.logical_snapshot_bytes_total > 0, "logical snapshot capacity evidence is missing");
+  assert(report.metrics.capture_reachable_objects_total > 0, "capture object evidence is missing");
+  assert(
+    report.metrics.object_dedup_reuse_ratio >= 0 && report.metrics.object_dedup_reuse_ratio <= 1,
+    "object deduplication evidence is invalid",
+  );
+  assert(report.metrics.storage_write_ratio >= 0, "storage write ratio evidence is invalid");
+  assert(report.metrics.aggregate_restore_throughput_mib_s > 0, "aggregate restore throughput is invalid");
+  assert(report.metrics.harness_peak_rss_bytes > 0, "harness memory evidence is missing");
 }
 
 async function gitCommit() {

@@ -53,6 +53,14 @@ jobs:
           --mode release
           --duration-minutes "${{ inputs.duration_minutes }}"
           --report "artifacts/recovery-vault-soak-${{ matrix.platform }}.json"
+      - name: Validate qualified Recovery Vault soak report
+        shell: bash
+        run: >-
+          node scripts/validate-recovery-vault-soak-report.mjs
+          --report "artifacts/recovery-vault-soak-${{ matrix.platform }}.json"
+          --expected-commit "${{ github.sha }}"
+          --expected-mode release
+          --minimum-duration-seconds 7200
       - uses: actions/upload-artifact@v4
         if: always()
         with:
