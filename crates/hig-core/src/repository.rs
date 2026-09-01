@@ -5906,18 +5906,17 @@ mod windows_access_control {
             );
             return Err(std::io::Error::last_os_error().into());
         }
-        let text_len: usize = text_len.try_into()?;
-        if text_len > MAX_ACCESS_CONTROL_BYTES {
-            let text_free = unsafe { LocalFree(text.cast()) };
+        let decoded = (|| {
+            anyhow::ensure!(!text.is_null(), "Windows SDDL text is null");
+            let text_len: usize = text_len.try_into()?;
+            anyhow::ensure!(text_len > 0, "Windows SDDL text is empty");
             anyhow::ensure!(
-                descriptor_free.is_null(),
-                "failed to release security descriptor"
+                text_len <= MAX_ACCESS_CONTROL_BYTES.saturating_add(1),
+                "Windows security descriptor is too large"
             );
-            anyhow::ensure!(text_free.is_null(), "failed to release SDDL text");
-            anyhow::bail!("Windows security descriptor is too large");
-        }
-        let wide = unsafe { std::slice::from_raw_parts(text, text_len) };
-        let decoded = String::from_utf16(wide);
+            let wide = unsafe { std::slice::from_raw_parts(text, text_len) };
+            decode_sddl(wide)
+        })();
         let text_free = unsafe { LocalFree(text.cast()) };
         anyhow::ensure!(
             descriptor_free.is_null(),
@@ -5929,6 +5928,15 @@ mod windows_access_control {
         };
         validate_access_control(Some(&metadata))?;
         Ok(metadata)
+    }
+
+    fn decode_sddl(wide: &[u16]) -> anyhow::Result<String> {
+        let (terminator, body) = wide
+            .split_last()
+            .ok_or_else(|| anyhow::anyhow!("Windows SDDL text is empty"))?;
+        anyhow::ensure!(*terminator == 0, "Windows SDDL text is not terminated");
+        anyhow::ensure!(!body.contains(&0), "Windows SDDL contains internal NUL");
+        Ok(String::from_utf16(body)?)
     }
 
     pub(super) fn restore(path: &Path, expected: &AccessControlMetadata) -> anyhow::Result<()> {
@@ -6032,6 +6040,22 @@ mod windows_access_control {
             .access_mode(access)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::decode_sddl;
+
+        #[test]
+        fn sddl_decoder_removes_only_the_required_terminator() {
+            let encoded = "O:SYG:SYD:(A;;FA;;;SY)"
+                .encode_utf16()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            assert_eq!(decode_sddl(&encoded).unwrap(), "O:SYG:SYD:(A;;FA;;;SY)");
+            assert!(decode_sddl(&encoded[..encoded.len() - 1]).is_err());
+            assert!(decode_sddl(&[b'O' as u16, 0, b':' as u16, 0]).is_err());
+        }
     }
 }
 
@@ -7185,6 +7209,8 @@ mod tests {
             .open(&source)
             .unwrap();
         file.set_len(logical_size).unwrap();
+        #[cfg(windows)]
+        mark_file_sparse(&file).unwrap();
         file.seek(SeekFrom::Start(first_offset)).unwrap();
         file.write_all(&first_payload).unwrap();
         file.seek(SeekFrom::Start(second_offset)).unwrap();
@@ -7263,10 +7289,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("empty-volume.bin");
         let logical_size = 8 * 1024 * 1024;
-        File::create(&source)
-            .unwrap()
-            .set_len(logical_size)
-            .unwrap();
+        let file = File::create(&source).unwrap();
+        #[cfg(windows)]
+        mark_file_sparse(&file).unwrap();
+        file.set_len(logical_size).unwrap();
+        drop(file);
         init_repository(temp.path(), Vec::new()).unwrap();
         let snapshot = snapshot_repository(temp.path(), "fully sparse".to_string(), None).unwrap();
         let repository = Repository::discover(temp.path()).unwrap();
@@ -7338,7 +7365,18 @@ mod tests {
         xattr::set(temp.path(), "user.hig.root", b"root\0value").unwrap();
         xattr::set(&directory, "user.hig.directory", &[0, 1, 2, 0xff]).unwrap();
         xattr::set(&file, "user.hig.file", &[0xff, 0, 0x7f, 0x80]).unwrap();
-        xattr::set(&link, "user.hig.symlink", b"link attribute").unwrap();
+        #[cfg(target_os = "linux")]
+        let symlink_xattrs_supported =
+            match xattr::set(&link, "user.hig.symlink", b"link attribute") {
+                Ok(()) => true,
+                Err(error) if error.raw_os_error() == Some(libc::EPERM) => false,
+                Err(error) => panic!("failed to set symlink xattr: {error}"),
+            };
+        #[cfg(not(target_os = "linux"))]
+        let symlink_xattrs_supported = {
+            xattr::set(&link, "user.hig.symlink", b"link attribute").unwrap();
+            true
+        };
         init_repository(temp.path(), Vec::new()).unwrap();
         let snapshot = snapshot_repository(temp.path(), "xattrs".to_string(), None).unwrap();
 
@@ -7355,12 +7393,13 @@ mod tests {
                 value: vec![0xff, 0, 0x7f, 0x80],
             }]
         );
-        assert!(
+        assert_eq!(
             files["metadata/payload.link"]
                 .object
                 .extended_attributes
                 .iter()
-                .any(|attribute| attribute.name == b"user.hig.symlink")
+                .any(|attribute| attribute.name == b"user.hig.symlink"),
+            symlink_xattrs_supported
         );
         assert!(files.values().all(|state| {
             state
@@ -7392,12 +7431,13 @@ mod tests {
                 .unwrap(),
             [0xff, 0, 0x7f, 0x80]
         );
-        assert_eq!(
-            xattr::get(output.join("metadata/payload.link"), "user.hig.symlink")
-                .unwrap()
-                .unwrap(),
-            b"link attribute"
-        );
+        let restored_symlink_attribute =
+            xattr::get(output.join("metadata/payload.link"), "user.hig.symlink").unwrap();
+        if symlink_xattrs_supported {
+            assert_eq!(restored_symlink_attribute.unwrap(), b"link attribute");
+        } else {
+            assert_eq!(restored_symlink_attribute, None);
+        }
         fs::remove_dir_all(output).unwrap();
     }
 
