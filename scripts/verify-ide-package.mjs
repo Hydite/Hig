@@ -20,12 +20,14 @@ const packageRoot = path.join(extractRoot, "hig-mcp-server");
 const executableName = process.platform === "win32" ? "hig.exe" : "hig";
 const binary = path.join(packageRoot, "bin", executableName);
 const server = path.join(packageRoot, "bin", "hig-mcp-server.js");
-for (const file of [binary, server, path.join(packageRoot, "package.json"), path.join(packageRoot, "tools.md")]) {
+const manifestPath = path.join(packageRoot, "package.json");
+for (const file of [binary, server, manifestPath, path.join(packageRoot, "tools.md")]) {
   if (!fs.statSync(file).isFile()) throw new Error(`package file missing: ${file}`);
 }
 
+const packageVersion = JSON.parse(fs.readFileSync(manifestPath, "utf8")).version;
 const version = run(binary, ["--version"], { capture: true }).stdout.trim();
-if (!/^hig 1\.10\.0$/.test(version)) throw new Error(`unexpected CLI version: ${version}`);
+if (version !== `hig ${packageVersion}`) throw new Error(`unexpected CLI version: ${version}`);
 run(process.execPath, [server, "--smoke"], { env: { ...process.env, HIG_BIN: binary } });
 run(process.execPath, [path.join(root, "scripts", "mcp-integration-test.mjs")], {
   env: { ...process.env, HIG_BIN: binary, HIG_MCP_SERVER: server }
