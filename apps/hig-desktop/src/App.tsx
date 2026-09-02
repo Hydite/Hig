@@ -184,7 +184,7 @@ export default function App() {
         <div className="sidebar-status">
           <div className="status-line"><span className={snapshot?.daemonActive ? "status-dot ok" : "status-dot"} />{snapshot?.daemonActive ? t("daemon.online") : t("daemon.offline")}</div>
           <button className="status-line session-action" onClick={() => snapshot?.sessionActive ? void clearSession() : setSessionDialog(true)}><KeyRound size={14} />{snapshot?.sessionActive ? t("session.unlocked") : t("session.locked")}</button>
-          <small>v{snapshot?.version ?? "1.9.7"}</small>
+          <small>v{snapshot?.version ?? "1.10.1"}</small>
         </div>
       </aside>
 

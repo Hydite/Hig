@@ -69,7 +69,7 @@ try {
     const v197Bin = path.resolve(options.v197Bin);
     report.binaries.v196 = await inspectBinary(v196Bin, "1.9.6", options.v196Sha256);
     report.binaries.v197 = await inspectBinary(v197Bin, "1.9.7", options.v197Sha256);
-    assert.equal(report.binaries.current.version, "1.10.0", "current binary must report HIG 1.10.0");
+    assert.equal(report.binaries.current.version, "1.10.1", "current binary must report HIG 1.10.1");
 
     const order = [
       ["v196", v196Bin], ["current", currentBin], ["current", currentBin], ["v196", v196Bin],

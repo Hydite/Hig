@@ -151,7 +151,7 @@ try {
   });
   assert.equal(initialized.result.protocolVersion, "2024-11-05");
   assert.equal(initialized.result.serverInfo.name, "hig-mcp-server");
-  assert.equal(initialized.result.serverInfo.version, "1.10.0");
+  assert.equal(initialized.result.serverInfo.version, "1.10.1");
 
   const unsupported = await request("initialize", {
     protocolVersion: "2099-01-01",
@@ -172,7 +172,7 @@ try {
   }
 
   const version = await tool("hig_version");
-  assert.match(version.stdout, /^hig 1\.10\.0$/);
+  assert.match(version.stdout, /^hig 1\.10\.1$/);
 
   const archive = path.join(work, "mcp-roundtrip.hig");
   const unpacked = path.join(work, "unpacked");

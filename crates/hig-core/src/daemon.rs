@@ -1058,7 +1058,7 @@ fn accept_with_timeout(
 
 #[cfg(not(unix))]
 pub fn run_daemon_server(_cache_dir: &Path, _ttl_secs: u64) -> anyhow::Result<()> {
-    anyhow::bail!("daemon server is only supported on Unix platforms in v1.9.7")
+    anyhow::bail!("daemon server is only supported on Unix platforms in this build")
 }
 
 pub fn daemon_socket_path(cache_dir: &Path) -> PathBuf {

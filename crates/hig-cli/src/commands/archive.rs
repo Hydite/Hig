@@ -228,7 +228,7 @@ pub(crate) struct BenchArgs {
     pub(crate) quiet: bool,
     #[arg(
         long,
-        help = "Compare Hig against zip, tar+gzip, and tar+zstd, writing v1.9.7 benchmark artifacts"
+        help = "Compare Hig against zip, tar+gzip, and tar+zstd, writing v1.10.1 benchmark artifacts"
     )]
     pub(crate) compare: bool,
     #[arg(

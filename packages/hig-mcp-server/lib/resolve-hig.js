@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const defaultPackageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const packageVersion = JSON.parse(
+  fs.readFileSync(path.join(defaultPackageRoot, "package.json"), "utf8")
+).version;
 
 const PLATFORM_PACKAGES = new Map([
   ["darwin-arm64", { name: "@zorker/hig-darwin-universal", executable: "bin/hig" }],
@@ -22,7 +25,7 @@ export function resolveHigBinary(options = {}) {
 
   const platformPackage = platformPackageFor(process.platform, process.arch);
   if (platformPackage.glibc && !hasGlibcRuntime(process.report, process.platform)) {
-    throw new Error("HIG Linux packages require glibc; musl and other libc runtimes are not supported by v1.10.0.");
+    throw new Error(`HIG Linux packages require glibc; musl and other libc runtimes are not supported by v${packageVersion}.`);
   }
 
   try {
@@ -31,7 +34,7 @@ export function resolveHigBinary(options = {}) {
     return executable;
   } catch (error) {
     throw new Error(
-      `Missing native HIG package ${platformPackage.name}@1.10.0 for ${process.platform}/${process.arch}. `
+      `Missing native HIG package ${platformPackage.name}@${packageVersion} for ${process.platform}/${process.arch}. `
       + `Reinstall @zorker/hig with optional dependencies enabled or set HIG_BIN explicitly. Cause: ${error.message}`
     );
   }

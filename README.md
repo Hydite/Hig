@@ -13,9 +13,11 @@
 
 Hig is a fast, compact, project-aware archiver with secure encrypted archives, daemon-backed project watching, and a macOS desktop interface. It is designed for development workflows where repeated project snapshots matter: save a verified archive before risky edits, move a compact project state between machines, or keep a fast local recovery point.
 
-The first public engineering release is **v1.10.0**. It preserves the HIGV2
-archive format and security model while adding an independent HIG repository
-history layer for byte, chunk, path, and symbol-level recovery.
+The current stable engineering release is **v1.10.1**. See the
+[v1.10.1 release notes](docs/releases/hig-v1.10.1.md). The first public release,
+v1.10.0, established the HIGV2 archive format and security model while adding
+an independent HIG repository history layer for byte, chunk, path, and
+symbol-level recovery.
 
 Password-protected archives use Argon2id, ChaCha20-Poly1305 authenticated
 encryption, BLAKE3 integrity checks, and path traversal protection. The public
@@ -23,7 +25,7 @@ repository contains the format, CLI, repository, and IDE/MCP integration
 implementation. Private research and paper materials are intentionally
 excluded from this release.
 
-## Downloads
+## Retained v1.10.0 Downloads
 
 | Artifact | Path |
 | --- | --- |
@@ -69,7 +71,7 @@ Install the CLI and MCP server. npm selects the native package for macOS
 arm64/x86_64, Linux x86_64 glibc, or Windows x86_64 MSVC.
 
 ```bash
-npm install --global @zorker/hig@1.10.0
+npm install --global @zorker/hig@1.10.1
 hig --version
 hig-mcp-server --smoke
 ```
@@ -130,7 +132,7 @@ The daemon owns project watchers, task queues, session keys, cache state, and be
 
 ## Repository History
 
-HIG v1.10.0 provides an HIG-native content-addressed repository. It is not a
+HIG v1.10.1 provides an HIG-native content-addressed repository. It is not a
 Git wire-compatible implementation. The repository records immutable commits,
 FastCDC chunks, byte-range change indexes, rename-aware path history, a
 compression tree, and optional Tree-sitter semantic indexes.
@@ -171,7 +173,7 @@ The v1.9.6 LobeHub RC run selected `/private/tmp` at `538.21 MiB/s`, below the `
 - Desktop guide: [hig-docs/desktop-guide.md](hig-docs/desktop-guide.md)
 - Chinese README: [hig-docs/README.zh-CN.md](hig-docs/README.zh-CN.md)
 
-English is the source of truth for the v1.10.0 public release documentation.
+English is the source of truth for the v1.10.1 public release documentation.
 Other translations may lag behind detailed release notes.
 
 ## Developer

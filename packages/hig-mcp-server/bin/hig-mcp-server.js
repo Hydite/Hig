@@ -6,11 +6,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveHigBinary } from "../lib/resolve-hig.js";
 
-const VERSION = "1.10.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const packageRoot = path.resolve(__dirname, "..");
+const VERSION = JSON.parse(
+  fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")
+).version;
 
 const MAX_OUTPUT_BYTES = positiveIntegerEnv("HIG_MCP_MAX_OUTPUT_BYTES", 1_000_000, 64 * 1024 * 1024);
 const DEFAULT_TIMEOUT_MS = positiveIntegerEnv("HIG_MCP_TIMEOUT_MS", 20 * 60 * 1000, 24 * 60 * 60 * 1000);

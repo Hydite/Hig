@@ -100,7 +100,7 @@ function assertBinary(file, specification) {
   }
   if (specification.runtime === `${process.platform}-${process.arch}` || specification.runtime === process.platform) {
     const result = spawnSync(file, ["--version"], { encoding: "utf8" });
-    if (result.status !== 0 || result.stdout.trim() !== "hig 1.10.0") {
+    if (result.status !== 0 || result.stdout.trim() !== `hig ${version}`) {
       throw new Error(`native binary version check failed: ${result.stderr || result.stdout}`);
     }
   }

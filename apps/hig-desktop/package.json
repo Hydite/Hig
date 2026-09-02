@@ -1,7 +1,7 @@
 {
   "name": "hig-desktop",
   "private": true,
-  "version": "1.9.7",
+  "version": "1.10.1",
   "packageManager": "pnpm@11.20.0",
   "type": "module",
   "scripts": {

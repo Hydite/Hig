@@ -1007,7 +1007,7 @@ fn build_benchmark_summary(
             .map(|probe| probe.copy_256_mib_median)
     });
     BenchmarkSummary {
-        version: "1.9.7",
+        version: env!("CARGO_PKG_VERSION"),
         input_dir: input_dir.display().to_string(),
         corpus_name: match options.bench_suite {
             BenchSuite::Lobehub => "lobehub-source".to_string(),
@@ -1085,15 +1085,15 @@ fn build_benchmark_summary(
 fn artifact_paths(suite: BenchSuite) -> (PathBuf, PathBuf, PathBuf) {
     if suite == BenchSuite::Lobehub {
         (
-            PathBuf::from("artifacts/docs/hig-v1.9.7-lobehub-benchmark.md"),
-            PathBuf::from("artifacts/hig-v1.9.7-lobehub-summary.json"),
-            PathBuf::from("artifacts/docs/hig-v1.9.7-lobehub-profile.md"),
+            PathBuf::from("artifacts/docs/hig-v1.10.1-lobehub-benchmark.md"),
+            PathBuf::from("artifacts/hig-v1.10.1-lobehub-summary.json"),
+            PathBuf::from("artifacts/docs/hig-v1.10.1-lobehub-profile.md"),
         )
     } else {
         (
-            PathBuf::from("artifacts/docs/hig-v1.9.7-benchmark.md"),
-            PathBuf::from("artifacts/hig-v1.9.7-summary.json"),
-            PathBuf::from("artifacts/docs/hig-v1.9.7-profile.md"),
+            PathBuf::from("artifacts/docs/hig-v1.10.1-benchmark.md"),
+            PathBuf::from("artifacts/hig-v1.10.1-summary.json"),
+            PathBuf::from("artifacts/docs/hig-v1.10.1-profile.md"),
         )
     }
 }
@@ -2268,7 +2268,7 @@ fn run_lobehub_watch_compare(
         .join("; ");
 
     let summary = serde_json::json!({
-        "version": "1.9.7",
+        "version": env!("CARGO_PKG_VERSION"),
         "suite": "lobehub-watch",
         "seed": 0x4849_4757_4154_4348_u64,
         "source": source,
@@ -2335,22 +2335,22 @@ fn run_lobehub_watch_compare(
     });
     fs::create_dir_all("artifacts/docs")?;
     fs::write(
-        "artifacts/hig-v1.9.7-lobehub-watch-summary.json",
+        "artifacts/hig-v1.10.1-lobehub-watch-summary.json",
         serde_json::to_vec_pretty(&summary)?,
     )?;
     let markdown = render_lobehub_watch_markdown(&summary);
     fs::write(
-        "artifacts/docs/hig-v1.9.7-lobehub-watch-benchmark.md",
+        "artifacts/docs/hig-v1.10.1-lobehub-watch-benchmark.md",
         &markdown,
     )?;
     fs::write(
-        "artifacts/docs/hig-v1.9.7-lobehub-watch-profile.md",
+        "artifacts/docs/hig-v1.10.1-lobehub-watch-profile.md",
         markdown,
     )?;
     if options.report_mode == ReportMode::Json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
-        println!("benchmark: wrote artifacts/docs/hig-v1.9.7-lobehub-watch-benchmark.md");
+        println!("benchmark: wrote artifacts/docs/hig-v1.10.1-lobehub-watch-benchmark.md");
     }
     Ok(())
 }
@@ -2659,7 +2659,7 @@ fn directory_digest(root: &Path) -> anyhow::Result<[u8; 32]> {
 
 fn render_lobehub_watch_markdown(summary: &serde_json::Value) -> String {
     let mut output = format!(
-        "# Hig v1.9.7 LobeHub Watch Benchmark\n\n\
+        "# Hig v1.10.1 LobeHub Watch Benchmark\n\n\
 - Environment: `{}`\n\
 - Release gate status: `{}`\n\
 - Selected volume: `{}` (`{:.2} MiB/s` median 256MiB copy)\n\
@@ -3004,7 +3004,7 @@ fn render_markdown(
     summary: &BenchmarkSummary,
 ) -> String {
     let mut output = String::new();
-    output.push_str("# Hig v1.9.7 Benchmark\n\n");
+    output.push_str("# Hig v1.10.1 Benchmark\n\n");
     output.push_str(&format!("Input: `{}`\n\n", input_dir.display()));
     output.push_str("## Gate Summary\n\n");
     output.push_str("| gate | status |\n|---|---|\n");
@@ -3447,7 +3447,7 @@ fn render_lobehub_profile(
     summary: &BenchmarkSummary,
 ) -> String {
     let mut output = String::new();
-    output.push_str("# Hig v1.9.7 Lobehub Profile\n\n");
+    output.push_str("# Hig v1.10.1 Lobehub Profile\n\n");
     output.push_str("## Dataset\n\n");
     output.push_str(&format!("- Input: `{}`\n", input_dir.display()));
     output.push_str(&format!("- Files: `{}`\n", summary.file_count));
@@ -3882,15 +3882,15 @@ mod tests {
         let (benchmark, summary, profile) = artifact_paths(BenchSuite::Lobehub);
         assert_eq!(
             benchmark,
-            PathBuf::from("artifacts/docs/hig-v1.9.7-lobehub-benchmark.md")
+            PathBuf::from("artifacts/docs/hig-v1.10.1-lobehub-benchmark.md")
         );
         assert_eq!(
             summary,
-            PathBuf::from("artifacts/hig-v1.9.7-lobehub-summary.json")
+            PathBuf::from("artifacts/hig-v1.10.1-lobehub-summary.json")
         );
         assert_eq!(
             profile,
-            PathBuf::from("artifacts/docs/hig-v1.9.7-lobehub-profile.md")
+            PathBuf::from("artifacts/docs/hig-v1.10.1-lobehub-profile.md")
         );
     }
 

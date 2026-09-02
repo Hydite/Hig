@@ -1,8 +1,8 @@
 {
   "name": "@zorker/hig-darwin-universal",
-  "version": "1.10.0",
+  "version": "1.10.1",
   "private": true,
-  "description": "HIG v1.10.0 native CLI for macOS arm64 and x86_64.",
+  "description": "HIG v1.10.1 native CLI for macOS arm64 and x86_64.",
   "os": ["darwin"],
   "cpu": ["arm64", "x64"],
   "files": ["bin/hig", "README.md", "LICENSE"],

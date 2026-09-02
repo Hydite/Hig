@@ -1,8 +1,8 @@
 {
   "name": "@zorker/hig-linux-x64-gnu",
-  "version": "1.10.0",
+  "version": "1.10.1",
   "private": true,
-  "description": "HIG v1.10.0 native CLI for Linux x86_64 GNU.",
+  "description": "HIG v1.10.1 native CLI for Linux x86_64 GNU.",
   "os": ["linux"],
   "cpu": ["x64"],
   "libc": ["glibc"],

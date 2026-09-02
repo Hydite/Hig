@@ -15,7 +15,7 @@ assert.equal(hasGlibcRuntime({ getReport: () => ({ header: {} }) }, "linux"), fa
 assert.equal(hasGlibcRuntime(null, "linux"), false);
 assert.equal(hasGlibcRuntime(null, "darwin"), true);
 
-const packReport = { filename: "zorker-hig-1.10.0.tgz", integrity: "sha512-test" };
+const packReport = { filename: "zorker-hig-1.10.1.tgz", integrity: "sha512-test" };
 assert.deepEqual(parseNpmPackReport(JSON.stringify([packReport])), packReport);
 assert.deepEqual(parseNpmPackReport(JSON.stringify({ "@zorker/hig": packReport })), packReport);
 assert.throws(() => parseNpmPackReport("[]"), /unexpected report/);

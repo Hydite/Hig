@@ -33,7 +33,7 @@ append(process.env.HIG_TEST_EVENTS, { kind: "start", pid: process.pid, at: now()
 await new Promise((resolve) => setTimeout(resolve, Number(process.env.HIG_TEST_DELAY_MS || 0)));
 append(process.env.HIG_TEST_EVENTS, { kind: "end", pid: process.pid, at: now() });
 if (args[0] === "--version") {
-  process.stdout.write("hig 1.10.0\\n");
+  process.stdout.write("hig 1.10.1\\n");
 } else {
   process.stdout.write(JSON.stringify({ fake: true, mirror_roots: [] }) + "\\n");
 }

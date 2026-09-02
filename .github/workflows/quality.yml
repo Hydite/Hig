@@ -58,6 +58,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y acl
       - name: Format
         run: cargo fmt --all --check
+      - name: Release version consistency
+        run: node scripts/verify-release-version.mjs
       - name: Core and CLI tests
         run: cargo test -p hig-core -p hig-cli
       - name: Strict Clippy
@@ -189,21 +191,21 @@ jobs:
         run: node scripts/package-ide-mcp.mjs --binary "${{ matrix.binary }}" --platform "${{ matrix.platform }}" --output-dir artifacts/ci
       - name: Verify extracted native package
         shell: bash
-        run: node scripts/verify-ide-package.mjs "artifacts/ci/hig-v1.10.0-ide-mcp-${{ matrix.platform }}.tar.gz"
+        run: node scripts/verify-ide-package.mjs "artifacts/ci/hig-v1.10.1-ide-mcp-${{ matrix.platform }}.tar.gz"
       - name: Assemble native npm packages
         shell: bash
         run: node scripts/package-npm-release.mjs --binary "${{ matrix.binary }}" --platform "${{ matrix.platform }}" --output-dir artifacts/ci/npm
       - name: Verify installed native npm packages
         shell: bash
-        run: node scripts/verify-npm-package.mjs --main artifacts/ci/npm/zorker-hig-1.10.0.tgz --native "artifacts/ci/npm/zorker-${{ matrix.npm_package }}-1.10.0.tgz" --platform-package "${{ matrix.npm_package }}"
+        run: node scripts/verify-npm-package.mjs --main artifacts/ci/npm/zorker-hig-1.10.1.tgz --native "artifacts/ci/npm/zorker-${{ matrix.npm_package }}-1.10.1.tgz" --platform-package "${{ matrix.npm_package }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: hig-v1.10.0-ide-mcp-${{ matrix.platform }}
+          name: hig-v1.10.1-ide-mcp-${{ matrix.platform }}
           path: |
-            artifacts/ci/hig-v1.10.0-ide-mcp-${{ matrix.platform }}.tar.gz
-            artifacts/ci/hig-v1.10.0-ide-mcp-${{ matrix.platform }}.tar.gz.sha256
-            artifacts/ci/npm/zorker-hig-1.10.0.tgz
-            artifacts/ci/npm/zorker-${{ matrix.npm_package }}-1.10.0.tgz
+            artifacts/ci/hig-v1.10.1-ide-mcp-${{ matrix.platform }}.tar.gz
+            artifacts/ci/hig-v1.10.1-ide-mcp-${{ matrix.platform }}.tar.gz.sha256
+            artifacts/ci/npm/zorker-hig-1.10.1.tgz
+            artifacts/ci/npm/zorker-${{ matrix.npm_package }}-1.10.1.tgz
           if-no-files-found: error
 
   macos-universal-package:
@@ -245,17 +247,17 @@ jobs:
           HIG_BIN: ${{ github.workspace }}/target/release-universal/hig
         run: node scripts/recovery-vault-runbook-test.mjs
       - name: Verify extracted universal package
-        run: node scripts/verify-ide-package.mjs artifacts/ci/hig-v1.10.0-ide-mcp-macos-universal.tar.gz
+        run: node scripts/verify-ide-package.mjs artifacts/ci/hig-v1.10.1-ide-mcp-macos-universal.tar.gz
       - name: Assemble universal npm packages
         run: node scripts/package-npm-release.mjs --binary target/release-universal/hig --platform macos-universal --output-dir artifacts/ci/npm
       - name: Verify installed universal npm packages
-        run: node scripts/verify-npm-package.mjs --main artifacts/ci/npm/zorker-hig-1.10.0.tgz --native artifacts/ci/npm/zorker-hig-darwin-universal-1.10.0.tgz --platform-package hig-darwin-universal
+        run: node scripts/verify-npm-package.mjs --main artifacts/ci/npm/zorker-hig-1.10.1.tgz --native artifacts/ci/npm/zorker-hig-darwin-universal-1.10.1.tgz --platform-package hig-darwin-universal
       - uses: actions/upload-artifact@v4
         with:
-          name: hig-v1.10.0-ide-mcp-macos-universal
+          name: hig-v1.10.1-ide-mcp-macos-universal
           path: |
-            artifacts/ci/hig-v1.10.0-ide-mcp-macos-universal.tar.gz
-            artifacts/ci/hig-v1.10.0-ide-mcp-macos-universal.tar.gz.sha256
-            artifacts/ci/npm/zorker-hig-1.10.0.tgz
-            artifacts/ci/npm/zorker-hig-darwin-universal-1.10.0.tgz
+            artifacts/ci/hig-v1.10.1-ide-mcp-macos-universal.tar.gz
+            artifacts/ci/hig-v1.10.1-ide-mcp-macos-universal.tar.gz.sha256
+            artifacts/ci/npm/zorker-hig-1.10.1.tgz
+            artifacts/ci/npm/zorker-hig-darwin-universal-1.10.1.tgz
           if-no-files-found: error

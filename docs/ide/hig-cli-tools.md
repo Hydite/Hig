@@ -2,7 +2,7 @@
 
 ## Engineering Status
 
-Hig is at `v1.10.0` development. The CLI and Desktop App are usable for local engineering workflows:
+Hig is at `v1.10.1` development. The CLI and Desktop App are usable for local engineering workflows:
 
 - HIGV2 archive creation and extraction.
 - Project snapshot/index mode.
@@ -25,7 +25,7 @@ The macOS universal sidecar binary is:
 apps/hig-desktop/src-tauri/binaries/hig-universal-apple-darwin
 ```
 
-The Linux IDE package is named `hig-v1.10.0-ide-mcp-linux-x86_64-gnu.tar.gz`.
+The Linux IDE package is named `hig-v1.10.1-ide-mcp-linux-x86_64-gnu.tar.gz`.
 It contains a Linux x86_64 GNU `bin/hig` and the same Node MCP adapter. The
 validated runtime baseline is Ubuntu 24.04 x86_64 (glibc 2.39) with Node.js 18
 or later.
@@ -56,9 +56,9 @@ hig repo branch list /path/to/project --json
 hig repo branch create feature/refactor /path/to/project --from HEAD --json
 hig repo branch switch feature/refactor /path/to/project --json
 hig repo branch delete feature/refactor /path/to/project --json
-hig repo tag create v1.10.0 /path/to/project --from HEAD --json
+hig repo tag create v1.10.1 /path/to/project --from HEAD --json
 hig repo tag list /path/to/project --json
-hig repo tag delete v1.10.0 /path/to/project --json
+hig repo tag delete v1.10.1 /path/to/project --json
 hig repo log /path/to/project --json
 hig repo diff /path/to/project --from <commit> --to HEAD --json
 hig repo history /path/to/project --path src/lib.rs --json

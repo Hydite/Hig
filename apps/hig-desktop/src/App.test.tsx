@@ -19,7 +19,7 @@ vi.mock("./api", async () => {
 });
 
 const snapshot = {
-  version: "1.9.7",
+  version: "1.10.1",
   platform: "macos",
   daemonActive: true,
   sessionActive: false,

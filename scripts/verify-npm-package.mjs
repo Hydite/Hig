@@ -36,9 +36,9 @@ assert.equal(fs.existsSync(path.join(mainRoot, "bin", process.platform === "win3
   "main package must not bundle a native binary");
 
 const version = run(process.execPath, [launcher, "--version"], { capture: true, env: cleanEnv });
-assert.equal(version.stdout.trim(), "hig 1.10.0", `unexpected launcher version: ${version.stdout}`);
+assert.equal(version.stdout.trim(), "hig 1.10.1", `unexpected launcher version: ${version.stdout}`);
 const smoke = run(process.execPath, [server, "--smoke"], { capture: true, env: cleanEnv });
-assert.equal(smoke.stdout.trim(), "hig 1.10.0", `unexpected MCP smoke output: ${smoke.stdout}`);
+assert.equal(smoke.stdout.trim(), "hig 1.10.1", `unexpected MCP smoke output: ${smoke.stdout}`);
 
 const fixture = path.join(work, "fixture");
 const archive = path.join(work, "fixture.hig");

@@ -8,7 +8,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: npm-publish-v1.10.0
+  group: npm-publish-v1.10.1
   cancel-in-progress: false
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
         id: registry
         shell: bash
         run: |
-          present="$(node scripts/check-npm-package.mjs --package "@zorker/${{ matrix.npm_package }}" --version 1.10.0)"
+          present="$(node scripts/check-npm-package.mjs --package "@zorker/${{ matrix.npm_package }}" --version 1.10.1)"
           echo "present=${present}" >> "$GITHUB_OUTPUT"
       - name: Build native CLI
         if: steps.registry.outputs.present != 'true'
@@ -56,7 +56,7 @@ jobs:
       - name: Verify clean npm installation
         if: steps.registry.outputs.present != 'true'
         shell: bash
-        run: node scripts/verify-npm-package.mjs --main artifacts/npm/zorker-hig-1.10.0.tgz --native "artifacts/npm/zorker-${{ matrix.npm_package }}-1.10.0.tgz" --platform-package "${{ matrix.npm_package }}"
+        run: node scripts/verify-npm-package.mjs --main artifacts/npm/zorker-hig-1.10.1.tgz --native "artifacts/npm/zorker-${{ matrix.npm_package }}-1.10.1.tgz" --platform-package "${{ matrix.npm_package }}"
       - name: Publish native package
         if: steps.registry.outputs.present != 'true'
         shell: bash
@@ -64,7 +64,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           npm whoami
-          node scripts/publish-npm-tarball.mjs --tarball "artifacts/npm/zorker-${{ matrix.npm_package }}-1.10.0.tgz" --package "@zorker/${{ matrix.npm_package }}" --version 1.10.0
+          node scripts/publish-npm-tarball.mjs --tarball "artifacts/npm/zorker-${{ matrix.npm_package }}-1.10.1.tgz" --package "@zorker/${{ matrix.npm_package }}" --version 1.10.1
 
   macos-universal-package:
     name: Publish native npm package (macOS universal)
@@ -86,7 +86,7 @@ jobs:
       - name: Check whether native package is already published
         id: registry
         run: |
-          present="$(node scripts/check-npm-package.mjs --package @zorker/hig-darwin-universal --version 1.10.0)"
+          present="$(node scripts/check-npm-package.mjs --package @zorker/hig-darwin-universal --version 1.10.1)"
           echo "present=${present}" >> "$GITHUB_OUTPUT"
       - name: Build universal CLI
         if: steps.registry.outputs.present != 'true'
@@ -104,14 +104,14 @@ jobs:
         run: node scripts/package-npm-release.mjs --binary target/release-universal/hig --platform macos-universal --output-dir artifacts/npm
       - name: Verify clean npm installation
         if: steps.registry.outputs.present != 'true'
-        run: node scripts/verify-npm-package.mjs --main artifacts/npm/zorker-hig-1.10.0.tgz --native artifacts/npm/zorker-hig-darwin-universal-1.10.0.tgz --platform-package hig-darwin-universal
+        run: node scripts/verify-npm-package.mjs --main artifacts/npm/zorker-hig-1.10.1.tgz --native artifacts/npm/zorker-hig-darwin-universal-1.10.1.tgz --platform-package hig-darwin-universal
       - name: Publish native package
         if: steps.registry.outputs.present != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           npm whoami
-          node scripts/publish-npm-tarball.mjs --tarball artifacts/npm/zorker-hig-darwin-universal-1.10.0.tgz --package @zorker/hig-darwin-universal --version 1.10.0
+          node scripts/publish-npm-tarball.mjs --tarball artifacts/npm/zorker-hig-darwin-universal-1.10.1.tgz --package @zorker/hig-darwin-universal --version 1.10.1
 
   main-package:
     name: Publish @zorker/hig
@@ -130,12 +130,12 @@ jobs:
       - name: Check whether main package is already published
         id: registry
         run: |
-          present="$(node scripts/check-npm-package.mjs --package @zorker/hig --version 1.10.0)"
+          present="$(node scripts/check-npm-package.mjs --package @zorker/hig --version 1.10.1)"
           echo "present=${present}" >> "$GITHUB_OUTPUT"
       - name: Validate resolver and package contents
         run: |
           node scripts/npm-resolver-test.mjs
-          node scripts/verify-npm-registry.mjs --version 1.10.0
+          node scripts/verify-npm-registry.mjs --version 1.10.1
       - name: Pack main package
         if: steps.registry.outputs.present != 'true'
         run: |
@@ -147,4 +147,4 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           npm whoami
-          node scripts/publish-npm-tarball.mjs --tarball artifacts/npm/zorker-hig-1.10.0.tgz --package @zorker/hig --version 1.10.0
+          node scripts/publish-npm-tarball.mjs --tarball artifacts/npm/zorker-hig-1.10.1.tgz --package @zorker/hig --version 1.10.1

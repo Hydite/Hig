@@ -1,6 +1,6 @@
 {
   "name": "@zorker/hig",
-  "version": "1.10.0",
+  "version": "1.10.1",
   "description": "HIG project-aware archive CLI and constrained MCP server.",
   "type": "module",
   "bin": {
@@ -26,9 +26,9 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@zorker/hig-darwin-universal": "1.10.0",
-    "@zorker/hig-linux-x64-gnu": "1.10.0",
-    "@zorker/hig-win32-x64-msvc": "1.10.0"
+    "@zorker/hig-darwin-universal": "1.10.1",
+    "@zorker/hig-linux-x64-gnu": "1.10.1",
+    "@zorker/hig-win32-x64-msvc": "1.10.1"
   },
   "keywords": [
     "archive",

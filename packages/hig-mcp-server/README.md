@@ -7,14 +7,14 @@ constrained tools instead of hand-writing shell commands.
 ## npm Installation
 
 ```bash
-npm install --global @zorker/hig@1.10.0
+npm install --global @zorker/hig@1.10.1
 hig --version
 hig-mcp-server --smoke
 ```
 
 The main package installs one optional native package selected by npm for the
 current operating system and CPU. macOS arm64/x86_64, Linux x86_64 glibc, and
-Windows x86_64 MSVC are supported in v1.10.0. Set `HIG_BIN` to an explicit
+Windows x86_64 MSVC are supported in v1.10.1. Set `HIG_BIN` to an explicit
 native CLI path when using a separately managed binary.
 
 ## CLI Build Artifact
@@ -32,7 +32,7 @@ apps/hig-desktop/src-tauri/binaries/hig-universal-apple-darwin
 ```
 
 The Linux x86_64 GNU IDE package bundles its platform-native CLI at the same
-path, `bin/hig`. The v1.10.0 Linux package is validated on Ubuntu 24.04 x86_64
+path, `bin/hig`. The v1.10.1 Linux package is validated on Ubuntu 24.04 x86_64
 (glibc 2.39) and requires Node.js 18 or later to run the MCP adapter.
 
 The IDE MCP production package bundles a copy at:
