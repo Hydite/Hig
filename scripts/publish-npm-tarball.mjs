@@ -5,6 +5,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { npmInvocation } from "./lib/npm-command.mjs";
 
+const REGISTRY_PROPAGATION_ATTEMPTS = 72;
+const REGISTRY_PROPAGATION_DELAY_MS = 5000;
+
 const args = parseArgs(process.argv.slice(2));
 const tarball = path.resolve(required(args, "tarball"));
 const packageName = required(args, "package");
@@ -28,7 +31,12 @@ const publish = npmInvocation(["publish", tarball, "--access", "public", "--prov
 const published = spawnSync(publish.command, publish.args, { stdio: "inherit" });
 if (published.status !== 0) process.exit(published.status || 1);
 
-const publishedIntegrity = await registryIntegrity(view, specification, 12, 5000);
+const publishedIntegrity = await registryIntegrity(
+  view,
+  specification,
+  REGISTRY_PROPAGATION_ATTEMPTS,
+  REGISTRY_PROPAGATION_DELAY_MS
+);
 if (publishedIntegrity === null) {
   throw new Error(`published ${specification} but registry verification timed out`);
 }

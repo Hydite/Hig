@@ -4,8 +4,8 @@ import { npmInvocation } from "./lib/npm-command.mjs";
 
 const args = process.argv.slice(2);
 const version = required(args, "--version");
-const attempts = positiveInteger(args, "--attempts", 30);
-const delayMs = positiveInteger(args, "--delay-ms", 2000);
+const attempts = positiveInteger(args, "--attempts", 72);
+const delayMs = positiveInteger(args, "--delay-ms", 5000);
 const packages = [
   "@zorker/hig-darwin-universal",
   "@zorker/hig-linux-x64-gnu",
